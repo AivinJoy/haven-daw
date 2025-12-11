@@ -1,0 +1,25 @@
+# --- 1. Global Ignores ---
+node_modules/
+target/
+dist/
+.idea/
+.vscode/
+.DS_Store
+*.log
+.svelte-kit/
+build/
+.env
+.env.local
+
+# --- 2. Folders to EXCLUDE (The "Other" 4 folders) ---
+hellomusic/
+mp3player/
+music_playback/
+playpause/
+
+# --- 3. Rust Specific ---
+Cargo.lock
+**/*.rs.bk
+
+# --- 4. OS Specific ---
+Thumbs.db

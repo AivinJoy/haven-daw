@@ -1,0 +1,279 @@
+// src/decoder.rs
+
+use ringbuf::producer::Producer;
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
+use std::fs::File;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+use symphonia::core::audio::{SampleBuffer, SignalSpec};
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::default::get_probe;
+
+
+/// Spawn the decoding thread.
+pub fn spawn_decoder<P>(
+    path: String,
+    mut producer: P,
+    is_playing_decode: Arc<AtomicBool>,
+    source_channels: usize,
+    output_channels: usize,
+    source_sample_rate: u32,
+    output_sample_rate: u32,
+) -> JoinHandle<()>
+where
+    P: Producer<Item = f32> + Send + 'static,
+{
+    thread::spawn(move || {
+        let file = File::open(&path).expect("open file in decoder");
+        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let probed = get_probe()
+            .format(
+                &Default::default(),
+                mss,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .expect("probe format");
+        let mut format = probed.format;
+        let track = format.default_track().expect("default track");
+        let mut decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+            .expect("create decoder");
+
+        let spec = SignalSpec::new(
+            track
+                .codec_params
+                .sample_rate
+                .expect("sample_rate must be present"),
+            track
+                .codec_params
+                .channels
+                .expect("channels must be present"),
+        );
+        let mut sample_buf: Option<SampleBuffer<f32>> = None;
+
+        // --- RESAMPLER SETUP (if needed) ---
+        let mut resampler: Option<SincFixedIn<f32>> = None;
+        // accum: per-channel append-only buffers (we will use read cursors to avoid front-drain O(n))
+        let mut accum: Vec<Vec<f32>> = vec![Vec::new(); source_channels];
+        // per-channel read positions (how many samples consumed from each accum channel)
+        let mut read_pos: Vec<usize> = vec![0; source_channels];
+
+        let internal_chunk_size: usize = 1024; // must match rubato's chunk size
+
+        if source_sample_rate != output_sample_rate {
+            let ratio = output_sample_rate as f64 / source_sample_rate as f64;
+            let params = SincInterpolationParameters {
+                sinc_len: 256,
+                f_cutoff: 0.95,
+                interpolation: SincInterpolationType::Cubic,
+                oversampling_factor: 256,
+                window: WindowFunction::BlackmanHarris2,
+            };
+
+            let r = SincFixedIn::<f32>::new(
+                ratio,
+                2.0, // bandwidth
+                params,
+                internal_chunk_size,
+                source_channels,
+            )
+            .expect("Failed to create SincFixedIn resampler");
+
+            println!(
+                "🎚️ Resampler initialized: ratio = {:.5}, in_rate = {}, out_rate = {}",
+                ratio, source_sample_rate, output_sample_rate
+            );
+            resampler = Some(r);
+        } else {
+            println!("No resampling needed.");
+        }
+
+        // Preallocate per-channel chunk buffers to avoid realloc every iteration.
+        let mut channel_chunk: Vec<Vec<f32>> =
+            vec![vec![0.0_f32; internal_chunk_size]; source_channels];
+
+        // temp buffer reused for the interleaved output before pushing to producer
+        // We'll reserve capacity when we know num_frames (set to 0 here; reserved later)
+        let mut temp_buf: Vec<f32> = Vec::new();
+
+        // --- MAIN DECODING LOOP ---
+        loop {
+            // 1. Handle Pause
+            while !is_playing_decode.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            // 2. Read and Decode Packet
+            let packet = match format.next_packet() {
+                Ok(packet) => packet,
+                Err(_) => break, // End of file
+            };
+
+            let decoded = match decoder.decode(&packet) {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    eprintln!("Decode error: {:?}", e);
+                    continue;
+                }
+            };
+
+            let buf = sample_buf.get_or_insert_with(|| {
+                SampleBuffer::<f32>::new(decoded.capacity() as u64, spec.clone())
+            });
+            buf.copy_interleaved_ref(decoded);
+            let samples = buf.samples();
+
+            // 3. Process and Push Samples
+            if let Some(resampler) = &mut resampler {
+                // --- RESAMPLING PATH ---
+                // De-interleave incoming interleaved samples into accum (per-frame loop avoids modulo)
+                let num_frames_in = samples.len() / source_channels;
+                // Reserve capacity to reduce reallocations
+                for ch in 0..source_channels {
+                    accum[ch].reserve(num_frames_in);
+                }
+
+                for frame in 0..num_frames_in {
+                    let base = frame * source_channels;
+                    for ch in 0..source_channels {
+                        accum[ch].push(samples[base + ch]);
+                    }
+                }
+
+                // Process as many full chunks as we can
+                loop {
+                    // Check if we have enough samples for a full chunk in channel 0
+                    if accum[0].len() - read_pos[0] < internal_chunk_size {
+                        break; // Need more samples
+                    }
+
+                    // Prepare channel_chunk by copying the next internal_chunk_size samples from each accum channel
+                    for ch in 0..source_channels {
+                        // Safety: we checked accum[0] already; assume other channels are aligned
+                        let start = read_pos[ch];
+                        let end = start + internal_chunk_size;
+                        let src = &accum[ch][start..end];
+                        channel_chunk[ch].copy_from_slice(src);
+                        read_pos[ch] += internal_chunk_size;
+                    }
+
+                    // Occasionally reclaim memory to avoid unbounded growth and repeated large front-drains.
+                    // We reclaim when read_pos grows large (amortized cost).
+                    const RECLAIM_THRESHOLD: usize = 4096;
+                    for ch in 0..source_channels {
+                        if read_pos[ch] >= RECLAIM_THRESHOLD {
+                            // drain the already-consumed prefix
+                            accum[ch].drain(..read_pos[ch]);
+                            read_pos[ch] = 0;
+                        }
+                    }
+
+                    // Call rubato. API preserved as original: process(&chunk, None)
+                    let out_buffer = match resampler.process(&channel_chunk, None) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("Resampling failed: {:?}", e);
+                            break;
+                        }
+                    };
+
+                    let num_frames = out_buffer[0].len();
+                    // Reserve/clear temp_buf
+                    temp_buf.clear();
+                    temp_buf.reserve(num_frames * output_channels);
+
+                    // Re-interleave and push to producer, mapping to device output channels.
+                    for frame in 0..num_frames {
+                        if source_channels == 2 && output_channels == 1 {
+                            let s = (out_buffer[0][frame] + out_buffer[1][frame]) * 0.5;
+                            temp_buf.push(s.clamp(-1.0, 1.0));
+                        } else if source_channels == 1 && output_channels == 2 {
+                            let s = out_buffer[0][frame].clamp(-1.0, 1.0);
+                            temp_buf.push(s);
+                            temp_buf.push(s);
+                        } else if source_channels == output_channels {
+                            for ch in 0..source_channels {
+                                temp_buf.push(out_buffer[ch][frame].clamp(-1.0, 1.0));
+                            }
+                        } else {
+                            // Other mismatches: simple safe strategy
+                            let common = output_channels.min(source_channels);
+                            for ch in 0..common {
+                                temp_buf.push(out_buffer[ch][frame].clamp(-1.0, 1.0));
+                            }
+                            if output_channels > common {
+                                let last = out_buffer[common - 1][frame].clamp(-1.0, 1.0);
+                                for _ in common..output_channels {
+                                    temp_buf.push(last);
+                                }
+                            }
+                        }
+                    }
+
+                    // Push the entire processed chunk in one go
+                    push_slice_looping(&mut producer, &temp_buf, &is_playing_decode);
+                }
+            } else {
+                // --- NO RESAMPLING PATH ---
+                let num_frames = samples.len() / source_channels;
+                temp_buf.clear();
+                temp_buf.reserve(num_frames * output_channels);
+
+                if source_channels == 2 && output_channels == 1 {
+                    for chunk in samples.chunks_exact(2) {
+                        let mono_sample = (chunk[0] + chunk[1]) * 0.5;
+                        temp_buf.push(mono_sample.clamp(-1.0, 1.0));
+                    }
+                } else if source_channels == 1 && output_channels == 2 {
+                    for &sample in samples {
+                        let s = sample.clamp(-1.0, 1.0);
+                        temp_buf.push(s);
+                        temp_buf.push(s);
+                    }
+                } else {
+                    // This handles source_channels == output_channels and other mismatches
+                    for &sample in samples {
+                        temp_buf.push(sample.clamp(-1.0, 1.0));
+                    }
+                }
+
+                // Push the entire decoded buffer in one go
+                push_slice_looping(&mut producer, &temp_buf, &is_playing_decode);
+            }
+        }
+    })
+}
+
+/// Pushes an entire slice of samples into the producer,
+/// looping and sleeping if the buffer is full.
+fn push_slice_looping<P>(producer: &mut P, mut slice: &[f32], is_playing: &Arc<AtomicBool>)
+where
+    P: Producer<Item = f32>,
+{
+    while !slice.is_empty() {
+        // Push as much of the slice as we can
+        let pushed = producer.push_slice(slice);
+        // Advance the slice
+        slice = &slice[pushed..];
+
+        // If we pushed 0 samples, the buffer is full.
+        if pushed == 0 {
+            // Check if we should stop trying
+            if !is_playing.load(Ordering::Relaxed) {
+                break;
+            }
+            // Wait for a moment before trying again
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}

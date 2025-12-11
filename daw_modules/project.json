@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "master_gain": 1.0,
+  "tracks": [
+    {
+      "path": "song2.mp3",
+      "gain": 1.0,
+      "pan": -1.0,
+      "muted": false,
+      "solo": true
+    }
+  ]
+}
