@@ -54,6 +54,8 @@ Before running the project, ensure you have the following installed:
 To start the app in development mode (with hot-reloading):
 
 ```bash
+cd haven 
+
 npm run tauri dev
 
 The Frontend will load at localhost:1420.

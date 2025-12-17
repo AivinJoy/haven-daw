@@ -17,6 +17,9 @@ mp3player/
 music_playback/
 playpause/
 
+daw_modules/*.wav
+daw_modules/*mp3
+daw_modules/*txt
 # --- 3. Rust Specific ---
 Cargo.lock
 **/*.rs.bk

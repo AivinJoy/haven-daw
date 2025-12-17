@@ -133,7 +133,7 @@
             {/each}
             
             <div 
-                class="absolute top-0 bottom-0 w-0 border-l border-red-500 z-20 transition-transform duration-75 ease-linear"
+                class="absolute top-0 bottom-0 w-0 border-l border-red-500 z-20"
                 style="transform: translateX({currentTime * PIXELS_PER_SECOND * zoomMultiplier}px);"
             >
                 <div class="absolute top-0 -left-[5px] w-0 h-0 border-l-[5px] border-l-transparent border-r-[5px] border-r-transparent border-t-8 border-t-red-500"></div>

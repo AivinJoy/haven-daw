@@ -33,32 +33,9 @@ impl Waveform {
     ) -> Self {
         // --- STEP 1: Detect Start of Audio (Skip Silence) ---
         // Threshold: -46dB (0.005). Anything quieter is treated as "dead air".
-        let silence_threshold = 0.005; 
-        let mut start_offset = 0;
-        
-        // Scan frame by frame to keep channel alignment
-        for (i, frame) in samples.chunks(channels).enumerate() {
-            let mut is_silent = true;
-            for sample in frame {
-                if sample.abs() > silence_threshold {
-                    is_silent = false;
-                    break;
-                }
-            }
-            if !is_silent {
-                start_offset = i * channels;
-                break;
-            }
-        }
 
         // Slice the samples to remove the start silence
-        let effective_samples = &samples[start_offset..];
-
-        // Debug Log
-        if start_offset > 0 {
-            let trimmed = (start_offset / channels) as f64 / sample_rate as f64;
-            println!("✂️ [Waveform] Trimmed {:.4}s of silence from start.", trimmed);
-        }
+        let effective_samples = samples;
 
         // --- STEP 2: Standard Build Logic ---
         let mut lvl0_min = vec![Vec::<f32>::new(); channels];
