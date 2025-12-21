@@ -1,3 +1,4 @@
+<!-- haven\src\lib\components\Timeline.svelte -->
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
   import { ZoomIn, ZoomOut } from 'lucide-svelte';
@@ -103,6 +104,23 @@
       isScrubbing = false;
   }
 
+  async function handleClipMove(event: CustomEvent) {
+      const { trackId, newStartTime } = event.detail;
+      
+      console.log(`🎵 Moving Track ${trackId} to ${newStartTime.toFixed(2)}s`);
+
+      try {
+          // Backend uses 0-based index, frontend uses 1-based ID
+          // Ensure this matches your logic (track.id - 1)
+          await invoke('set_track_start', { 
+              trackIndex: trackId - 1, 
+              startTime: newStartTime 
+          });
+      } catch (e) {
+          console.error("Failed to move clip:", e);
+      }
+  }
+
 </script>
 
 <svelte:window onmousemove={onScrubMove} onmouseup={stopScrub} />
@@ -121,8 +139,8 @@
             
             {#each gridLines as line}
                 <div 
-                    class={`absolute bottom-0 border-l ${line.is_bar_start ? 'h-full border-white/30 z-10' : 'h-2 border-white/10 z-0'}`}
-                    style="left: {line.time * PIXELS_PER_SECOND * zoomMultiplier}px;"
+                  class={`absolute bottom-0 border-l ${line.is_bar_start ? 'h-full border-white/30 z-10' : 'h-2 border-white/10 z-0'}`}
+                  style="transform: translateX({line.time * PIXELS_PER_SECOND * zoomMultiplier}px);"
                 >
                     {#if line.is_bar_start}
                         <span class="absolute top-0 left-1.5 text-[10px] text-white/70 font-mono font-bold select-none">
@@ -150,18 +168,19 @@
   <div 
       bind:this={trackContainer} 
       bind:clientWidth={containerWidth}
-      onscroll={handleScroll} 
+      onscroll={handleScroll}
       class="flex-1 relative overflow-auto custom-scrollbar"
   >
     <div class="relative" style="width: {maxDurationSeconds * PIXELS_PER_SECOND * zoomMultiplier}px; min-height: 100%;">
 
         <div class="absolute inset-0 flex pointer-events-none h-full">
             {#each gridLines as line}
-                <div 
-                    class={`absolute top-0 bottom-0 w-px ${line.is_bar_start ? 'bg-white/10' : 'bg-white/5'}`}
-                    style="left: {line.time * PIXELS_PER_SECOND * zoomMultiplier}px;"
-                ></div>
+              <div 
+                class={`absolute top-0 bottom-0 w-px ${line.is_bar_start ? 'bg-white/10' : 'bg-white/5'}`}
+                style="transform: translateX({line.time * PIXELS_PER_SECOND * zoomMultiplier}px);"
+              ></div>
             {/each}
+
         </div>
 
         <div class="absolute inset-0 flex flex-col pt-4 px-0"> 
@@ -172,7 +191,9 @@
                         bind:track={tracks[index]} 
                         index={index} 
                         zoom={zoomMultiplier} 
-                        currentTime={currentTime} 
+                        currentTime={currentTime}
+                        bpm={bpm}
+                        on:change={handleClipMove} 
                     />
                 </div>
             {/each}

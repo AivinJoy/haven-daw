@@ -389,7 +389,7 @@ impl DawController {
             // [CTRL + S] => SAVE
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 if let Some(audio) = &self.audio {
-                    if let Err(e) = audio.save_session("project.json") {
+                    if let Err(e) = audio.save_session("project.json".to_string()) {
                         println!("Error saving: {}", e);
                     }
                 }
@@ -400,7 +400,7 @@ impl DawController {
             KeyCode::Char('b') | KeyCode::Char('B') => {
                 if let Some(audio) = &self.audio {
                     // 1. Auto-save to ensure we export current state
-                    let _ = audio.save_session("project.json");
+                    let _ = audio.save_session("project.json".to_string());
 
                     // 2. Load manifest from disk
                     if let Ok(manifest) = ProjectManifest::load_from_disk("project.json") {
@@ -416,7 +416,7 @@ impl DawController {
             // [CTRL + O] => OPEN / LOAD
             KeyCode::Char('o') | KeyCode::Char('O') => {
                 if let Some(audio) = &self.audio {
-                    if let Err(e) = audio.load_session("project.json") {
+                    if let Err(e) = audio.load_session("project.json".to_string()) {
                         println!("Error loading: {}", e);
                     } else {
                         self.force_redraw = true;
@@ -491,53 +491,7 @@ impl DawController {
         }
     }
 
-    fn adjust_track1_gain(&mut self, delta: f32) {
-        if let Some(audio) = &self.audio {
-            audio.adjust_track_gain(0, delta);
-        }
-    }
-
-    fn adjust_track2_gain(&mut self, delta: f32) {
-        if let Some(audio) = &self.audio {
-            audio.adjust_track_gain(1, delta);
-        }
-    }
-
-    fn adjust_track1_pan(&mut self, delta: f32) {
-        if let Some(audio) = &self.audio {
-            audio.adjust_track_pan(0, delta);
-        }
-    }
-
-    fn adjust_track2_pan(&mut self, delta: f32) {
-        if let Some(audio) = &self.audio {
-            audio.adjust_track_pan(1, delta);
-        }
-    }
-
-    fn reset_track1_gain(&mut self) {
-        if let Some(audio) = &self.audio {
-            audio.reset_track_gain(0);
-        }
-    }
-
-    fn reset_track2_gain(&mut self) {
-        if let Some(audio) = &self.audio {
-            audio.reset_track_gain(1);
-        }
-    }
-
-    fn reset_track1_pan(&mut self) {
-        if let Some(audio) = &self.audio {
-            audio.reset_track_pan(0);
-        }
-    }
-
-    fn reset_track2_pan(&mut self) {
-        if let Some(audio) = &self.audio {
-            audio.reset_track_pan(1);
-        }
-    }
+    
 
     fn render_track_status(&mut self) {
         if let Some(audio) = &self.audio {
@@ -576,25 +530,6 @@ impl DawController {
             KeyCode::Char('d') | KeyCode::Char('D') => self.solo_track(1), // solo track 2
             KeyCode::Char('c') | KeyCode::Char('C') => self.clear_solo(),  // clear solo
 
-            // Track 1 gain: Z/X, reset: Q
-            KeyCode::Char('z') | KeyCode::Char('Z') => self.adjust_track1_gain(-0.1),
-            KeyCode::Char('x') | KeyCode::Char('X') => self.adjust_track1_gain(0.1),
-            KeyCode::Char('q') | KeyCode::Char('Q') => self.reset_track1_gain(),
-
-            // Track 2 gain: B/N, reset: W
-            KeyCode::Char('b') | KeyCode::Char('B') => self.adjust_track2_gain(-0.1),
-            KeyCode::Char('n') | KeyCode::Char('N') => self.adjust_track2_gain(0.1),
-            KeyCode::Char('w') | KeyCode::Char('W') => self.reset_track2_gain(),
-
-            // Track 1 pan: A/F, reset: E
-            KeyCode::Char('a') | KeyCode::Char('A') => self.adjust_track1_pan(-0.1),
-            KeyCode::Char('f') | KeyCode::Char('F') => self.adjust_track1_pan(0.1),
-            KeyCode::Char('e') | KeyCode::Char('E') => self.reset_track1_pan(),
-
-            // Track 2 pan: G/H, reset: R
-            KeyCode::Char('g') | KeyCode::Char('G') => self.adjust_track2_pan(-0.1),
-            KeyCode::Char('h') | KeyCode::Char('H') => self.adjust_track2_pan(0.1),
-            KeyCode::Char('j') | KeyCode::Char('J') => self.reset_track2_pan(),
             _ => {}
         }
     }

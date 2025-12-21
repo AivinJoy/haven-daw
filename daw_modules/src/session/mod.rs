@@ -48,12 +48,14 @@ impl Session {
             pan: t.pan,
             muted: t.muted,
             solo: t.solo,
+            start_time: t.start_time.as_secs_f64(),
         }).collect();
 
         // 2. Create Manifest
         let manifest = ProjectManifest {
             version: 1,
             master_gain,
+            bpm: eng.transport.tempo.bpm as f32,
             tracks,
         };
 
@@ -72,6 +74,7 @@ impl Session {
         // (We don't have a clear_tracks() method yet, so we iterate and remove, or just drop)
         // Ideally, Engine should support `clear()`. For now, we rely on the fact that `tracks` is a Vec.
         eng.clear_tracks();
+        eng.transport.tempo.bpm = manifest.bpm as f64;
         
         // Clear history on load, otherwise undo might try to modify deleted tracks
         self.command_manager = CommandManager::new(100);
@@ -87,6 +90,7 @@ impl Session {
                 track.pan = t_state.pan;
                 track.muted = t_state.muted;
                 track.solo = t_state.solo;
+                track.start_time = std::time::Duration::from_secs_f64(t_state.start_time);
             }
         }
 

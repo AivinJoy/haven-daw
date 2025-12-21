@@ -1,5 +1,7 @@
+<!-- haven\src\lib\components\DraggableTrackItem.svelte -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { createEventDispatcher, onMount } from 'svelte';
   import WaveformClip from './WaveformClip.svelte';
 
   // Props
@@ -7,67 +9,94 @@
   let { 
     track = $bindable(), 
     index,
-    zoom,
-    currentTime
+    zoom = 1,
+    currentTime = 0,
+    bpm = 120
   } = $props();
 
   const PIXELS_PER_SECOND = 50;
+  const dispatch = createEventDispatcher();
 
   // Local Drag State
   let isDragging = $state(false);
-  let dragStartX = 0;
-  let dragStartTime = 0;
+  let startMouseX = 0;      // Where the mouse was on screen (pixels)
+  let initialStartTime = 0; // Where the track was in time (seconds)
 
   function onMouseDown(event: MouseEvent) {
     if (event.button !== 0) return; // Only left click
     
-    event.preventDefault(); // Prevent text selection
-    event.stopPropagation(); // Stop bubbling
+    event.preventDefault(); 
+    event.stopPropagation(); 
 
     isDragging = true;
-    dragStartX = event.clientX;
-    dragStartTime = track.startTime || 0;
+    
+    // 1. Capture the starting state
+    startMouseX = event.clientX; 
+    initialStartTime = track.startTime || 0;
+    
+    // 2. Add listeners globally (fixes dragging outside the div)
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
   }
 
-  function onWindowMouseMove(event: MouseEvent) {
+  function handleMouseMove(event: MouseEvent) {
     if (!isDragging) return;
 
-    const deltaPx = event.clientX - dragStartX;
+    // A. Calculate Delta
+    const deltaPx = event.clientX - startMouseX;
     const deltaSecs = deltaPx / (PIXELS_PER_SECOND * zoom);
     
-    // Calculate new start time (cannot be less than 0)
-    let newTime = Math.max(0, dragStartTime + deltaSecs);
+    // B. Calculate Raw Time
+    let newTime = Math.max(0, initialStartTime + deltaSecs);
+
+    // C. Grid Snapping (Musical Time)
+    // C. Grid Snapping (PIXEL-ALIGNED)
+    if (!event.shiftKey) {
+        const beatDuration = 60 / bpm;
+        const beatPx = beatDuration * PIXELS_PER_SECOND * zoom;
     
-    // Update visual state immediately
+        // current pixel position
+        const rawPx = newTime * PIXELS_PER_SECOND * zoom;
+    
+        // snap in pixel space
+        const snappedPx = Math.round(rawPx / beatPx) * beatPx;
+    
+        // convert back to time
+        newTime = snappedPx / (PIXELS_PER_SECOND * zoom);
+    }
+
+    
+    // D. Update Audio State (High Precision Float)
     track.startTime = newTime;
   }
 
-  async function onWindowMouseUp() {
-    if (!isDragging) return;
-    
-    isDragging = false;
 
-    // Sync with Rust Backend
-    try {
-        await invoke('set_track_start', { 
-            trackIndex: index, 
-            startTime: track.startTime 
-        });
-        console.log(`Moved Track ${index} to ${track.startTime.toFixed(3)}s`);
-    } catch (e) {
-        console.error("Failed to move track:", e);
-    }
+  async function handleMouseUp() {
+    if (isDragging) {
+          isDragging = false;
+          window.removeEventListener('mousemove', handleMouseMove);
+          window.removeEventListener('mouseup', handleMouseUp);
+          
+          // --- NEW: Dispatch Change Event ---
+          // This tells the parent "I moved to this new time!"
+          dispatch('change', { 
+              trackId: track.id, 
+              newStartTime: track.startTime 
+          });
+      }
   }
-</script>
 
-<svelte:window onmousemove={onWindowMouseMove} onmouseup={onWindowMouseUp} />
+  let leftPx = $derived((track.startTime || 0) * PIXELS_PER_SECOND * zoom);
+  let widthPx = $derived((track.duration || 0) * PIXELS_PER_SECOND * zoom);
+</script>
 
 <div 
     class="absolute h-full flex items-center cursor-grab active:cursor-grabbing hover:brightness-110 transition-filter"
     style="
-        left: {(track.startTime || 0) * PIXELS_PER_SECOND * zoom}px;
-        width: {(track.duration || 0) * PIXELS_PER_SECOND * zoom}px;
+        transform: translateX({leftPx}px);
+        width: {widthPx}px;
         z-index: {isDragging ? 50 : 10}; 
+        will-change: transform;
     "
     onmousedown={onMouseDown}
     role="button"

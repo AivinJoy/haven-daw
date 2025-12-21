@@ -6,7 +6,7 @@
   const dispatch = createEventDispatcher();
 
   // Receive tracks prop (bindable if you want the list itself to change, but usually internal props bind)
-  let { tracks = [] } = $props();
+  let { tracks = []} = $props();
 
   function requestAddTrack() {
     dispatch('requestAdd');
@@ -29,7 +29,17 @@
 
   <div class="flex-1 overflow-y-auto p-4 scrollbar-hide space-y-4">
     {#each tracks as track, i (track.id)}
-        <TrackControl bind:track={tracks[i]} index={i} />
+        <TrackControl 
+            index={i}
+            id={track.id}
+            name={track.name}
+            color={track.color}
+            
+            bind:gain={tracks[i].gain}
+            bind:pan={tracks[i].pan}
+            bind:muted={tracks[i].muted}
+            bind:solo={tracks[i].solo}
+        />
     {/each}
   </div>
 </div>

@@ -1,11 +1,8 @@
-// src/session/serialization.rs
-
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use anyhow::Result;
 
-/// Represents a single track in the save file.
 #[derive(Serialize, Deserialize)]
 pub struct TrackState {
     pub path: String,
@@ -13,13 +10,14 @@ pub struct TrackState {
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
+    pub start_time: f64,
 }
 
-/// Represents the entire project save file.
 #[derive(Serialize, Deserialize)]
 pub struct ProjectManifest {
     pub version: u32,
     pub master_gain: f32,
+    pub bpm: f32, // <--- NEW: Save the Global Tempo
     pub tracks: Vec<TrackState>,
 }
 

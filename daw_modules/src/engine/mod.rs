@@ -95,8 +95,6 @@ impl Engine {
         }
     }
 
-    // src/engine/mod.rs
-
     pub fn render(&mut self, out: &mut [f32]) {
         out.fill(0.0);
 
@@ -118,7 +116,7 @@ impl Engine {
 
         for track in &mut self.tracks {
             // Determine if this specific track should make sound
-            let should_play = if any_solo {
+            let is_audible = if any_solo {
                 // Solo Mode: Ignore Mute, only play if THIS track is soloed
                 track.solo
             } else {
@@ -126,16 +124,19 @@ impl Engine {
                 !track.muted
             };
 
-            // Also check if track is technically playing/active
-            if !should_play || track.gain <= 0.001 {
-                continue;
-            }
+            let effectively_audible = is_audible && track.gain > 0.001;
 
             // Note: We access track.state inside render_track or check it here
             // Assuming render_into handles the "is state == Playing" check, 
             // but we can check here to save a function call:
             if matches!(track.state(), TrackState::Playing) {
-                 self.mixer.render_track(track, frames, channels, current_pos, sr);
+                 self.mixer.render_track(
+                    track, 
+                    frames, 
+                    channels, 
+                    current_pos,
+                    sr, 
+                    effectively_audible);
             }
         }
 

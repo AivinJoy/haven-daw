@@ -8,14 +8,14 @@ use cpal::Stream;
 
 use crate::audio::setup_output_device;
 use crate::engine::Engine;
-use crate::session::{Session, commands::{SetTrackGain, SetTrackPan, SetTrackMute}}; // Import Session & Commands
+use crate::session::{Session, commands::{SetTrackGain, SetTrackPan, SetTrackMute}}; 
 use crate::engine::time::GridLine;
 
 /// Owns Engine + CPAL stream and exposes a simple control API.
 pub struct AudioRuntime {
     engine: Arc<Mutex<Engine>>,
     master_gain: Arc<Mutex<f32>>,
-    session: Mutex<Session>, // New: The Session Manager
+    session: Mutex<Session>,
     _stream: Stream,
 }
 
@@ -24,6 +24,16 @@ pub struct TrackSnapshot {
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
+}
+
+pub struct FrontendTrackInfo {
+    pub id: u32,
+    pub path: String,
+    pub gain: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub solo: bool,
+    pub start_time: f64,
 }
 
 pub struct EngineSnapshot {
@@ -38,6 +48,7 @@ impl AudioRuntime {
         let channels = output.output_channels;
 
         let master_gain = Arc::new(Mutex::new(1.0_f32));
+        // Initialize Engine with default master gain
         let mut engine = Engine::new(sample_rate, channels);
 
         if let Some(path) = initial_track {
@@ -46,7 +57,7 @@ impl AudioRuntime {
         }
 
         let engine = Arc::new(Mutex::new(engine));
-        let session = Mutex::new(Session::new()); // Initialize Session
+        let session = Mutex::new(Session::new());
 
         // Build CPAL stream that pulls from Engine::render
         let device = output.device;
@@ -59,12 +70,11 @@ impl AudioRuntime {
             &config,
             move |data: &mut [f32], _| {
                 if let Ok(mut eng) = engine_cb.lock() {
-                    eng.render(data);
+                    // Sync master gain from Runtime -> Engine before render
                     if let Ok(g) = gain_cb.lock() {
-                        for s in data.iter_mut() {
-                            *s *= *g;
-                        }
+                        eng.master_gain = *g;
                     }
+                    eng.render(data);
                 } else {
                     data.fill(0.0);
                 }
@@ -164,9 +174,11 @@ impl AudioRuntime {
         Ok(())
     }
 
+    // --- GLOBAL SETTINGS ---
+
     pub fn set_master_gain(&self, gain: f32) {
-        if let Ok(mut eng) = self.engine.lock() {
-            eng.master_gain = gain.clamp(0.0, 2.0);
+        if let Ok(mut g) = self.master_gain.lock() {
+            *g = gain.clamp(0.0, 2.0);
         }
     }
 
@@ -178,10 +190,37 @@ impl AudioRuntime {
         }
     }
 
-    // --- TRACK CONTROLS (Using Commands) ---
+    pub fn set_bpm(&self, bpm: f32) {
+        if let Ok(mut eng) = self.engine.lock() {
+            eng.set_bpm(bpm);
+        }
+    }
+
+    pub fn bpm(&self) -> f32 {
+        if let Ok(eng) = self.engine.lock() {
+            eng.transport.tempo.bpm as f32
+        } else {
+            120.0
+        }
+    }
+
+    pub fn get_grid_lines(&self, start: Duration, end: Duration, resolution: u32) -> Vec<GridLine> {
+        if let Ok(eng) = self.engine.lock() {
+            eng.transport.tempo.get_grid_lines(start, end, resolution)
+        } else {
+            Vec::new()
+        }
+    }
+
+    // --- TRACK CONTROLS ---
+
+    pub fn set_track_start_time(&self, track_index: usize, start_time: f64) {
+        if let Ok(mut eng) = self.engine.lock() {
+            eng.set_track_start_time(track_index, start_time);
+        }
+    }
 
     pub fn toggle_mute(&self, track_index: usize) {
-        // 1. Get info needed for the command
         let (track_id, current_mute) = {
             let eng = self.engine.lock().unwrap();
             if let Some(t) = eng.tracks().get(track_index) {
@@ -189,7 +228,6 @@ impl AudioRuntime {
             } else { return; }
         };
 
-        // 2. Create and Apply Command
         let cmd = Box::new(SetTrackMute {
             track_id,
             new_state: !current_mute,
@@ -201,8 +239,7 @@ impl AudioRuntime {
         }
     }
 
-    // src/audio_runtime.rs
-
+    // Non-destructive solo logic
     pub fn toggle_solo(&self, track_index: usize) {
         if let Ok(mut eng) = self.engine.lock() {
             if let Some(track) = eng.tracks_mut().get_mut(track_index) {
@@ -212,8 +249,6 @@ impl AudioRuntime {
         }
     }
 
-    // Rename the old solo_track to this (or just replace it)
-    // We remove the logic that iterated and muted everyone else.
     pub fn solo_track(&self, track_index: usize) {
         self.toggle_solo(track_index);
     }
@@ -222,99 +257,14 @@ impl AudioRuntime {
         if let Ok(mut eng) = self.engine.lock() {
             for track in eng.tracks_mut().iter_mut() {
                 track.solo = false;
-                track.muted = false;
+                // Note: We don't clear muted here, only solo
             }
             println!("Solo cleared");
         }
     }
 
-    pub fn adjust_track_gain(&self, track_index: usize, delta: f32) {
-        // 1. Get info
-        let (track_id, old_gain) = {
-            let eng = self.engine.lock().unwrap();
-            if let Some(t) = eng.tracks().get(track_index) {
-                (t.id, t.gain)
-            } else { return; }
-        };
-
-        // 2. Create Command
-        let new_gain = (old_gain + delta).clamp(0.0, 2.0);
-        let cmd = Box::new(SetTrackGain {
-            track_id,
-            old_gain,
-            new_gain,
-        });
-
-        // 3. Apply
-        if let Ok(mut session) = self.session.lock() {
-            let _ = session.apply(&self.engine, cmd);
-            println!("Track {} gain: {:.0}%", track_index, new_gain * 100.0);
-        }
-    }
-
-    pub fn adjust_track_pan(&self, track_index: usize, delta: f32) {
-        let (track_id, old_pan) = {
-            let eng = self.engine.lock().unwrap();
-            if let Some(t) = eng.tracks().get(track_index) {
-                (t.id, t.pan)
-            } else { return; }
-        };
-
-        let new_pan = (old_pan + delta).clamp(-1.0, 1.0);
-        let cmd = Box::new(SetTrackPan {
-            track_id,
-            old_pan,
-            new_pan,
-        });
-
-        if let Ok(mut session) = self.session.lock() {
-            let _ = session.apply(&self.engine, cmd);
-            println!("Track {} pan: {:.2}", track_index, new_pan);
-        }
-    }
-
-    pub fn reset_track_gain(&self, track_index: usize) {
-        let (track_id, old_gain) = {
-            let eng = self.engine.lock().unwrap();
-            if let Some(t) = eng.tracks().get(track_index) {
-                (t.id, t.gain)
-            } else { return; }
-        };
-
-        let cmd = Box::new(SetTrackGain {
-            track_id,
-            old_gain,
-            new_gain: 1.0,
-        });
-
-        if let Ok(mut session) = self.session.lock() {
-            let _ = session.apply(&self.engine, cmd);
-            println!("Track {} gain reset", track_index);
-        }
-    }
-
-    pub fn reset_track_pan(&self, track_index: usize) {
-         let (track_id, old_pan) = {
-            let eng = self.engine.lock().unwrap();
-            if let Some(t) = eng.tracks().get(track_index) {
-                (t.id, t.pan)
-            } else { return; }
-        };
-
-        let cmd = Box::new(SetTrackPan {
-            track_id,
-            old_pan,
-            new_pan: 0.0,
-        });
-
-        if let Ok(mut session) = self.session.lock() {
-            let _ = session.apply(&self.engine, cmd);
-            println!("Track {} pan reset", track_index);
-        }
-    }
-
+    // Absolute Gain Setter (for Sliders)
     pub fn set_track_gain(&self, track_index: usize, gain: f32) {
-        // 1. Get current gain
         let (track_id, old_gain) = {
             let eng = self.engine.lock().unwrap();
             if let Some(t) = eng.tracks().get(track_index) {
@@ -322,19 +272,18 @@ impl AudioRuntime {
             } else { return; }
         };
 
-        // 2. Create Command (Reuse existing SetTrackGain logic)
-        let cmd = Box::new(crate::session::commands::SetTrackGain {
+        let cmd = Box::new(SetTrackGain {
             track_id,
             old_gain,
             new_gain: gain.clamp(0.0, 2.0),
         });
 
-        // 3. Apply
         if let Ok(mut session) = self.session.lock() {
             let _ = session.apply(&self.engine, cmd);
         }
     }
 
+    // Absolute Pan Setter
     pub fn set_track_pan(&self, track_index: usize, pan: f32) {
         let (track_id, old_pan) = {
             let eng = self.engine.lock().unwrap();
@@ -343,7 +292,7 @@ impl AudioRuntime {
             } else { return; }
         };
 
-        let cmd = Box::new(crate::session::commands::SetTrackPan {
+        let cmd = Box::new(SetTrackPan {
             track_id,
             old_pan,
             new_pan: pan.clamp(-1.0, 1.0),
@@ -354,6 +303,118 @@ impl AudioRuntime {
         }
     }
 
+    // Relative Adjusters (Kept for Keyboard Shortcuts in daw_controller)
+    pub fn adjust_track_gain(&self, track_index: usize, delta: f32) {
+        let (track_id, old_gain) = {
+            let eng = self.engine.lock().unwrap();
+            if let Some(t) = eng.tracks().get(track_index) {
+                (t.id, t.gain)
+            } else { return; }
+        };
+        let new_gain = (old_gain + delta).clamp(0.0, 2.0);
+        let cmd = Box::new(SetTrackGain { track_id, old_gain, new_gain });
+        if let Ok(mut session) = self.session.lock() {
+            let _ = session.apply(&self.engine, cmd);
+        }
+    }
+
+    pub fn adjust_track_pan(&self, track_index: usize, delta: f32) {
+        let (track_id, old_pan) = {
+            let eng = self.engine.lock().unwrap();
+            if let Some(t) = eng.tracks().get(track_index) {
+                (t.id, t.pan)
+            } else { return; }
+        };
+        let new_pan = (old_pan + delta).clamp(-1.0, 1.0);
+        let cmd = Box::new(SetTrackPan { track_id, old_pan, new_pan });
+        if let Ok(mut session) = self.session.lock() {
+            let _ = session.apply(&self.engine, cmd);
+        }
+    }
+
+    // FIX: Corrected Reset Methods (No Delta, Just Reset)
+    pub fn reset_track_gain(&self, track_index: usize) {
+        self.set_track_gain(track_index, 1.0);
+    }
+
+    pub fn reset_track_pan(&self, track_index: usize) {
+        self.set_track_pan(track_index, 0.0);
+    }
+
+    // --- SAVE / LOAD / EXPORT (Primary for Main.rs) ---
+
+    pub fn save_project(&self, path: String) -> Result<(), String> {
+        let session = self.session.lock().map_err(|_| "Lock error")?;
+        let master_gain = self.master_gain();
+        session.save_project(&self.engine, &path, master_gain)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn load_project(&self, path: String) -> Result<(), String> {
+        let mut session = self.session.lock().map_err(|_| "Lock error")?;
+        let new_master_gain = session.load_project(&self.engine, &path)
+            .map_err(|e| e.to_string())?;
+            
+        if let Ok(mut g) = self.master_gain.lock() {
+            *g = new_master_gain;
+        }
+        Ok(())
+    }
+
+    pub fn export_project(&self, path: String) -> Result<(), String> {
+        // FIX: Rename session to _session to suppress unused variable warning
+        let _session = self.session.lock().map_err(|_| "Lock error")?;
+        let eng = self.engine.lock().unwrap();
+
+        let tracks: Vec<crate::session::serialization::TrackState> = eng.tracks().iter().map(|t| {
+            crate::session::serialization::TrackState {
+                path: t.name.clone(),
+                gain: t.gain,
+                pan: t.pan,
+                muted: t.muted,
+                solo: t.solo,
+                start_time: t.start_time.as_secs_f64(),
+            }
+        }).collect();
+
+        let manifest = crate::session::serialization::ProjectManifest {
+            version: 1,
+            master_gain: eng.master_gain,
+            bpm: eng.transport.tempo.bpm as f32,
+            tracks,
+        };
+
+        crate::session::export::export_project_to_wav(&manifest, &path)
+            .map_err(|e| e.to_string())
+    }
+
+    // --- COMPATIBILITY WRAPPERS (For daw_controller.rs) ---
+    
+    pub fn save_session(&self, path: String) -> anyhow::Result<()> {
+        self.save_project(path).map_err(|e| anyhow::anyhow!(e))
+    }
+
+    pub fn load_session(&self, path: String) -> anyhow::Result<()> {
+        self.load_project(path).map_err(|e| anyhow::anyhow!(e))
+    }
+
+    pub fn get_tracks_list(&self) -> Vec<FrontendTrackInfo> {
+        if let Ok(eng) = self.engine.lock() {
+            eng.tracks().iter().map(|t| FrontendTrackInfo {
+                id: t.id.0,
+                path: t.name.clone(),
+                gain: t.gain,
+                pan: t.pan,
+                muted: t.muted,
+                solo: t.solo,
+                start_time: t.start_time.as_secs_f64(),
+            }).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    // --- DEBUG ---
     pub fn debug_snapshot(&self) -> Option<EngineSnapshot> {
         if let Ok(eng) = self.engine.lock() {
             let tracks = eng
@@ -371,52 +432,4 @@ impl AudioRuntime {
             None
         }
     }
-
-    pub fn set_track_start_time(&self, track_index: usize, start_time: f64) {
-        if let Ok(mut eng) = self.engine.lock() {
-            eng.set_track_start_time(track_index, start_time);
-        }
-    }
-
-    // ... inside impl AudioRuntime ...
-
-    pub fn save_session(&self, filename: &str) -> anyhow::Result<()> {
-        let master_gain = self.master_gain();
-        // Lock session and call save
-        if let Ok(session) = self.session.lock() {
-            session.save_project(&self.engine, filename, master_gain)?;
-            println!("💾 Project saved to {}", filename);
-        }
-        Ok(())
-    }
-
-    pub fn load_session(&self, filename: &str) -> anyhow::Result<()> {
-        // Lock session and call load
-        if let Ok(mut session) = self.session.lock() {
-             // Load returns the saved master gain
-            let new_master_gain = session.load_project(&self.engine, filename)?;
-            
-            // Update master gain
-            if let Ok(mut g) = self.master_gain.lock() {
-                *g = new_master_gain;
-            }
-            println!("📂 Project loaded from {}", filename);
-        }
-        Ok(())
-    }
-
-    pub fn set_bpm(&self, bpm: f32) {
-        if let Ok(mut eng) = self.engine.lock() {
-            eng.set_bpm(bpm);
-        }
-    }
-
-    pub fn get_grid_lines(&self, start: Duration, end: Duration, resolution: u32) -> Vec<GridLine> {
-        if let Ok(eng) = self.engine.lock() {
-            eng.transport.tempo.get_grid_lines(start, end, resolution)
-        } else {
-            Vec::new()
-        }
-    }
-
 }

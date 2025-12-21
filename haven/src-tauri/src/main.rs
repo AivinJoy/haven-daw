@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
-use tauri::State;
+use tauri::{State, Emitter};
 
 // Import modules
 use daw_modules::audio_runtime::AudioRuntime;
@@ -196,6 +196,138 @@ fn get_grid_lines(
     Ok(audio.get_grid_lines(start_dur, end_dur, resolution))
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadedTrack {
+    id: u32,
+    name: String,
+    path: String,
+    color: String,
+    duration: f64,
+    start_time: f64,
+    waveform: ImportResult, // Reusing existing ImportResult
+    gain: f32,
+    pan: f32,
+    muted: bool,
+    solo: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectState {
+    tracks: Vec<LoadedTrack>,
+    bpm: f32,
+    master_gain: f32,
+}
+
+
+#[tauri::command]
+fn save_project(path: String, state: State<AppState>) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    audio.save_project(path)
+}
+
+#[tauri::command]
+fn export_project(path: String, state: State<AppState>) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    audio.export_project(path)
+}
+
+#[tauri::command]
+async fn load_project(
+    app: tauri::AppHandle, 
+    path: String, 
+    state: State<'_, AppState>, // <--- FIX: Added <'_, ...>
+) -> Result<ProjectState, String> {
+    
+    // We clone the inner Runtime so we don't hold the State lock across await points
+    // (This is a best practice in async Rust to prevent deadlocks)
+    let audio_runtime = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+
+    let bpm = audio_runtime.bpm();
+    let master_gain = audio_runtime.master_gain();
+    
+    // A. Restore Backend State
+    // Note: Since load_project is blocking, we wrap it if we want true non-blocking,
+    // but for now, just calling it here is fine since we are in an async command.
+    audio_runtime.load_project(path.clone())?;
+    
+    // B. Fetch the list of tracks now in the engine
+    let tracks_info = audio_runtime.get_tracks_list();
+    
+    // Drop the lock here so we don't hold it while doing the heavy loop below
+    drop(audio_runtime); 
+
+    let mut results = Vec::new();
+    let total = tracks_info.len();
+
+    let colors = [
+        "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
+        "bg-emerald-500", "bg-orange-500", "bg-pink-500"
+    ];
+
+    // C. Re-Analyze Audio for Visualization
+    for (i, info) in tracks_info.iter().enumerate() {
+        
+        // 1. Calculate Percentage & Emit
+        let percent = ((i as f64) / (total as f64)) * 100.0;
+        let _ = app.emit("load-progress", format!("Loading Track {}/{}", i + 1, total));
+        let _ = app.emit("load-percent", percent);
+
+        // 2. Decode
+        // Note: decode_to_vec is heavy. In a perfect world, we'd spawn_blocking this.
+        // But since this entire function is async, the UI should remain responsive enough for updates.
+        let (samples, sr, channels) = bpm::adapter::decode_to_vec(&info.path)
+            .map_err(|e| format!("Failed to decode {}: {}", info.path, e))?;
+        
+        // 3. Build Waveform
+        let wf = Waveform::build_from_samples(&samples, sr, channels, 512);
+        
+        // 4. Bins
+        let pixels_per_second = 100.0;
+        let spp = (sr as f64) / pixels_per_second;
+        let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
+
+        let color = colors[i % colors.len()].to_string();
+        
+        let name = std::path::Path::new(&info.path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        results.push(LoadedTrack {
+            id: info.id + 1, // Visual ID (1-based)
+            name,
+            path: info.path.clone(),
+            color,
+            duration: wf.duration_secs,
+            start_time: info.start_time,
+            waveform: ImportResult {
+                mins: mins.to_vec(),
+                maxs: maxs.to_vec(),
+                duration: wf.duration_secs,
+                bpm: None, 
+            },
+            gain: info.gain,
+            pan: info.pan,
+            muted: info.muted,
+            solo: info.solo
+        });
+    }
+    
+    // Finish
+    let _ = app.emit("load-percent", 100.0);
+    let _ = app.emit("load-progress", "Finalizing...");
+    
+    Ok(ProjectState {
+        tracks: results,
+        bpm,
+        master_gain,
+    })
+}
+// Add these to the invoke_handler list!
+
 fn main() {
     let runtime = AudioRuntime::new(None).expect("Failed to init Audio Engine");
 
@@ -222,6 +354,9 @@ fn main() {
             toggle_mute,
             toggle_solo,
             set_master_gain,
+            save_project,
+            load_project,
+            export_project
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

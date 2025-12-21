@@ -1,13 +1,16 @@
+<!-- haven\src\routes\+page.svelte -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { open } from '@tauri-apps/plugin-dialog';
+  import { open as openDialog, save } from '@tauri-apps/plugin-dialog';
   import { onDestroy } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
 
   import LandingModal from '$lib/components/LandingModal.svelte';
   import TrackList from '$lib/components/TrackList.svelte';
   import Header from '$lib/components/Header.svelte';
   import TopToolbar from '$lib/components/TopToolbar.svelte';
   import Timeline from '$lib/components/Timeline.svelte';
+  import Loader from '$lib/components/Loader.svelte';
 
   // --- STATE ---
   let view: 'landing' | 'studio' = $state('landing');
@@ -17,15 +20,17 @@
   
   // --- GLOBAL BPM STATE ---
   let bpm = $state(120); 
+  let projectName = $state("untitled Project");
 
-  // Sync BPM with Backend whenever it changes
-  $effect(() => {
-      if (bpm > 0) {
-          invoke('set_bpm', { bpm: bpm }).catch(e => console.error("Failed to set BPM:", e));
-      }
+  let loadProgress = $state(0);
+  listen('load-progress', (e) => loadingMessage = e.payload as string);
+  listen('load-percent', (e) => loadProgress = e.payload as number);
+
+  let isLoading = $state(false);
+  let loadingMessage = $state("Processing...");
+  listen('load-progress', (event) => {
+    loadingMessage = event.payload as string;
   });
-
-  let animationFrameId: number;
 
   // --- TYPE DEFINITION (UPDATED) ---
   type Track = {
@@ -44,6 +49,104 @@
 
   // --- TRACKS STATE ---
   let tracks = $state<Track[]>([]);
+  let animationFrameId: number;
+
+  // Sync BPM with Backend whenever it changes
+  $effect(() => {
+      if (bpm > 0) {
+          invoke('set_bpm', { bpm: bpm }).catch(e => console.error("Failed to set BPM:", e));
+      }
+  });
+
+  async function handleLoad() {
+      try {
+          const path = await openDialog({
+              filters: [{ name: 'Haven Project', extensions: ['hvn'] }]
+          });
+          
+          if (path && typeof path === 'string') {
+              isLoading = true;
+              loadingMessage = "initializing...";
+              
+              // 1. Backend: Load Engine State & Re-Analyze Waveforms
+              const projectState = await invoke<{
+                tracks: Track[],
+                bpm: number,
+                masterGain: number
+              }>('load_project', { path });
+              
+              bpm = projectState.bpm;
+
+              const fileName = path.split(/[\\/]/).pop();
+              if (fileName) projectName = fileName.replace('.hvn', '');
+              
+              // 2. Frontend: Update State
+              tracks = projectState.tracks;
+              
+              // 3. Update View
+              view = 'studio';
+              showModal = false;
+              
+              console.log("✅ Project Loaded:", tracks.length, "tracks");
+          }
+      } catch (e) {
+          console.error("Load failed:", e);
+          alert("Failed to load: " + e);
+      } finally {
+          isLoading = false;
+      }
+  }
+
+  async function handleSave() {
+      try {
+          let filename = projectName.trim() || "Untitled Project";
+          if (!filename.endsWith('.hvn')) filename += '.hvn';
+          const path = await save({
+                defaultPath: filename,  
+                filters: [{ name: 'Haven Project', extensions: ['hvn'] }]
+          });
+          
+          if (path) {
+              isLoading = true;
+              loadingMessage = "Saving Project...";
+              await invoke('save_project', { path });
+              const newName = path.split(/[\\/]/).pop();
+              if (newName) projectName = newName.replace('.hvn', '');
+          }
+      } catch (e) {
+          console.error("Save failed:", e);
+      } finally {
+          isLoading = false;
+      }
+  }
+
+  async function handleExport() {
+        try {
+                let filename = projectName.trim() || "Untitled Project";
+                if (!filename.endsWith('.wav')) filename += '.wav';
+                const path = await save({
+                    defaultPath: filename,
+                    filters: [{ name: 'WAV Audio', extensions: ['wav'] }]
+                });
+            
+                if (path) {
+                    if (isPlaying) { await invoke('pause'); isPlaying = false; }
+
+                    isLoading = true;
+                    loadingMessage = "Rendering Audio...";
+                    if (isPlaying) {
+                      await invoke('pause');
+                      isPlaying = false;
+                    }
+                    await invoke('export_project', { path });
+                    alert("Export Complete!");
+                }
+            } catch (e) {
+                console.error("Export failed:", e);
+            } finally {
+                isLoading = false;
+            }
+  }
 
   // --- HANDLERS ---
   async function handleInitialSelection(event: CustomEvent<string>) {
@@ -78,12 +181,16 @@
 
     if (type === 'import' || type === 'upload') {
         try {
-            const selected = await open({
+            const selected = await openDialog({
                 multiple: false,
                 filters: [{ name: 'Audio', extensions: ['wav', 'mp3', 'flac', 'ogg'] }]
             });
 
             if (selected && typeof selected === 'string') {
+
+                isLoading = true;
+                loadingMessage = "Importing Track..."
+
                 const result = await invoke<{
                     mins: number[], 
                     maxs: number[], 
@@ -110,6 +217,8 @@
             }
         } catch (e) {
             console.error("Import failed:", e);
+        } finally {
+            isLoading = false;
         }
     } 
     else if (type === 'record') {
@@ -164,6 +273,7 @@
       }
   }
 
+
   function handleKeydown(e: KeyboardEvent) {
       if (view !== 'studio') return;
 
@@ -192,6 +302,10 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
+{#if isLoading}
+    <Loader message={loadingMessage} progress={loadProgress} />
+{/if}    
+
 <main class="h-screen w-screen bg-[#0f0f16] text-white overflow-hidden relative font-sans flex flex-col">
   
   {#if view === 'landing' || showModal}
@@ -201,7 +315,7 @@
   {/if}
 
   {#if view === 'studio'}
-    <Header/>
+    <Header bind:projectName={projectName}/>
     
     <TopToolbar 
         isPlaying={isPlaying} 
@@ -209,7 +323,13 @@
         bind:bpm={bpm} 
         on:play={togglePlayback} 
         on:pause={togglePlayback}
-        on:rewind={rewind} 
+        on:rewind={rewind}
+        on:record={() => addNewTrack('record')}
+        
+        on:new={() => window.location.reload()}
+        on:load={handleLoad}
+        on:save={handleSave}
+        on:export={handleExport} 
     />
 
     <div class="flex-1 flex overflow-hidden relative">
