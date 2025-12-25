@@ -11,6 +11,7 @@
   import TopToolbar from '$lib/components/TopToolbar.svelte';
   import Timeline from '$lib/components/Timeline.svelte';
   import Loader from '$lib/components/Loader.svelte';
+  import { recordingManager } from '$lib/managers/RecordingManager';
 
   // --- STATE ---
   let view: 'landing' | 'studio' = $state('landing');
@@ -32,19 +33,35 @@
     loadingMessage = event.payload as string;
   });
 
+  let isRecordingMode = $state(false);
+
+  type Clip = {
+      id: string;         // Unique ID for the clip (e.g., "clip_1_123")
+      trackId: number;    // Which track this belongs to
+      name: string;
+      path: string;       // File path (Source of truth)
+      startTime: number;  // Where it sits on the timeline
+      duration: number;
+      offset: number;     // (For trimming later)
+      waveform: { mins: number[], maxs: number[] };
+      color: string;
+  };
   // --- TYPE DEFINITION (UPDATED) ---
   type Track = {
     id: number;
     name: string;
     color: string;
-    duration?: number;
-    startTime?: number; 
-    waveform?: { mins: number[], maxs: number[] };
+    clips: Clip[];
+    // duration?: number;
+    // startTime?: number; 
+    // waveform?: { mins: number[], maxs: number[] };
     // NEW FIELDS FOR MIXER:
     gain: number;
     pan: number;
     muted: boolean;
     solo: boolean;
+    isRecording?: boolean;
+    savePath?: string;
   };
 
   // --- TRACKS STATE ---
@@ -163,7 +180,8 @@
 
   // --- CORE LOGIC: ADD TRACK + BACKEND IMPORT ---
   async function addNewTrack(type: string) {
-    const id = tracks.length + 1;
+    const maxId = tracks.length > 0 ? Math.max(...tracks.map(t => t.id)) : 0;
+    const id = maxId + 1;
     
     const colors = [
         'bg-brand-blue', 'bg-brand-red', 'bg-purple-500', 
@@ -179,7 +197,36 @@
         solo: false
     };
 
-    if (type === 'import' || type === 'upload') {
+    if (type === 'record') {
+        // 1. Setup File Path (In real app, use a project folder)
+        tracks = tracks.map(t => ({ ...t, isRecording: false }));
+        const filename = `Recording_${id}.wav`;
+        const savePath = await invoke<string>('get_temp_path', { filename }); 
+
+        // 2. Add "Placeholder" Track (Red, growing)
+        tracks = [...tracks, { 
+            id, 
+            name: "Recording...", 
+            color: "bg-red-500", 
+            // startTime: currentTime, 
+            // duration: 0, 
+            clips: [],
+            ...defaultMixer,
+            isRecording: true, // Flag for custom styling if needed
+            savePath: savePath
+        }];
+        try {
+            await invoke('create_track');
+            console.log("✅ Backend track created.");
+        } catch (e) {
+            console.error("Failed to create backend track:", e);
+        }
+        // ----------------------------------------
+
+        console.log("Track Armed. Press Record button to start.");
+
+    }
+    else if (type === 'import' || type === 'upload') {
         try {
             const selected = await openDialog({
                 multiple: false,
@@ -204,15 +251,26 @@
                     console.log("Detected BPM:", result.bpm);
                     bpm = Math.round(result.bpm); 
                 }
+
+                const newClip: Clip = {
+                    id: `clip_${Date.now()}`,
+                    trackId: id,
+                    name: filename,
+                    path: selected,
+                    startTime: 0,
+                    duration: result.duration,
+                    offset: 0,
+                    waveform: { mins: result.mins, maxs: result.maxs },
+                    color: color
+                };
                 
                 tracks = [...tracks, { 
                     id, 
                     name: filename, 
                     color, 
-                    duration: result.duration, 
-                    startTime: 0, 
-                    waveform: { mins: result.mins, maxs: result.maxs },
-                    ...defaultMixer // Spread mixer defaults
+                    clips: [newClip],
+                    ...defaultMixer, // Spread mixer defaults
+                    isRecording: false
                 }];
             }
         } catch (e) {
@@ -221,23 +279,150 @@
             isLoading = false;
         }
     } 
-    else if (type === 'record') {
-        const name = `Recording ${id}`;
-        tracks = [...tracks, { id, name, color, startTime: 0, ...defaultMixer }];
-    } 
     else {
         const name = `Track ${id}`;
-        tracks = [...tracks, { id, name, color, startTime: 0, ...defaultMixer }];
+        tracks = [...tracks, { id, name, color, clips: [],  ...defaultMixer, isRecording: false }];
     }
   }
 
+  // --- NEW HELPER: Exclusive Arming ---
+  function armTrack(trackId: number) {
+      // Set isRecording = true ONLY for the matching ID, false for everyone else
+      tracks = tracks.map(t => ({
+          ...t,
+          isRecording: t.id === trackId
+      }));
+      console.log(`🎙️ Track ${trackId} Armed`);
+  }
+
+  async function startRecordingLogic() {
+      // Find the armed track
+      const trackIndex = tracks.findIndex(t => t.isRecording === true);
+      if (trackIndex === -1) { alert("No track armed!"); return; }
+
+      const trackId = tracks[trackIndex].id; // Get the real ID (e.g., 1, 2, 3)
+
+      try {
+          // 1. Generate Path
+          const timestamp = Date.now();
+          const filename = `Recording_${trackId}_${timestamp}.wav`;
+          const savePath = await invoke<string>('get_temp_path', { filename });
+
+          isRecordingMode = true;
+          
+          // 2. Create a "Ghost" Clip for visualization
+          const newClip: Clip = {
+              id: `clip_${timestamp}`,
+              trackId: trackId,
+              name: "Recording...",
+              path: savePath,
+              startTime: currentTime, // Start at playhead
+              duration: 0,
+              offset: 0,
+              waveform: { mins: [], maxs: [] }, 
+              color: "bg-red-500"
+          };
+
+          // 3. Push to Track
+          tracks[trackIndex].clips.push(newClip);
+          tracks[trackIndex].savePath = savePath;
+          tracks = tracks; // Reactivity
+
+          // 4. Start Engine
+          if (!isPlaying) {
+             await invoke('play');
+             isPlaying = true;
+             pollPosition();
+          }
+
+          // 5. Start Manager (FIXED ARGUMENTS)
+          // We pass: path, trackId, startTime, callback
+          await recordingManager.start(
+              savePath, 
+              trackId, 
+              currentTime, 
+              (newDuration) => {
+                  // Update the *Last* clip in the list
+                  const tIdx = tracks.findIndex(t => t.id === trackId);
+                  if (tIdx !== -1) {
+                      const clips = tracks[tIdx].clips;
+                      if (clips.length > 0) {
+                          clips[clips.length - 1].duration = newDuration;
+                          tracks = tracks; 
+                      }
+                  }
+              }
+          );
+
+      } catch (e) {
+          console.error("Failed to start:", e);
+          isRecordingMode = false;
+      }
+  }
+
+  // --- 4. UPDATED STOP LOGIC ---
+  async function stopRecordingLogic() {
+      await invoke('pause');
+      isPlaying = false;
+      cancelAnimationFrame(animationFrameId);
+      
+      isRecordingMode = false;
+      const result = await recordingManager.stop();
+
+      if (result) {
+          const tIdx = tracks.findIndex(t => t.isRecording);
+          
+          if (tIdx !== -1) {
+              const clips = tracks[tIdx].clips;
+              const lastClipIdx = clips.length - 1;
+
+              if (lastClipIdx >= 0) {
+                  // Finalize the clip data
+                  // We update the specific clip with the new Waveform data
+                  tracks[tIdx].clips[lastClipIdx] = {
+                      ...tracks[tIdx].clips[lastClipIdx],
+                      name: `Take ${clips.length}`,
+                      color: "bg-brand-red",
+                      duration: result.duration,
+                      waveform: { mins: result.mins, maxs: result.maxs } 
+                  };
+                  
+                  // Cleanup recording state
+                  tracks[tIdx].savePath = undefined;
+                  
+                  // CRITICAL: Trigger Svelte Reactivity
+                  tracks = [...tracks]; 
+                  
+                  console.log("🌊 Visuals updated for track", tracks[tIdx].id);
+              }
+          }
+      }
+  }
+  
+
   // --- PLAYBACK LOOP ---
   async function togglePlayback() {
+      if (isRecordingMode) { await stopRecordingLogic(); return; }
+
+      // Get max duration of project
+      let maxDur = 0;
+      tracks.forEach(t => {
+          t.clips.forEach(c => {
+              if (c.startTime + c.duration > maxDur) maxDur = c.startTime + c.duration;
+          });
+      });
+
       if (isPlaying) {
           await invoke('pause');
           isPlaying = false;
           cancelAnimationFrame(animationFrameId);
       } else {
+          // AUTO-REWIND FIX
+          // If we are within 0.1s of the end (or past it), restart from 0
+          if (currentTime >= maxDur - 0.1 && maxDur > 0) {
+              await seekTo(0);
+          }
+          
           await invoke('play');
           isPlaying = true;
           pollPosition();
@@ -271,6 +456,21 @@
           isPlaying = false;
           cancelAnimationFrame(animationFrameId);
       }
+  }
+
+  // --- NEW: Handle Track Selection (Arming) ---
+  function handleTrackSelect(event: CustomEvent<number>) {
+      const selectedId = event.detail;
+
+      // Update tracks state: 
+      // Set isRecording = true for the clicked track
+      // Set isRecording = false for ALL other tracks
+      tracks = tracks.map(t => ({
+          ...t,
+          isRecording: t.id === selectedId
+      }));
+
+      console.log(`🎙️ Track ${selectedId} Armed for Recording`);
   }
 
 
@@ -320,12 +520,19 @@
     <TopToolbar 
         isPlaying={isPlaying} 
         currentTime={currentTime}
-        bind:bpm={bpm} 
+        bind:bpm={bpm}
+        isRecording={isRecordingMode} 
         on:play={togglePlayback} 
         on:pause={togglePlayback}
         on:rewind={rewind}
-        on:record={() => addNewTrack('record')}
-        
+        on:record={() => {
+            if (isRecordingMode) {
+                stopRecordingLogic();
+            } else {
+                startRecordingLogic();
+            }    
+        }}
+        on:record-add={() => addNewTrack('record')}
         on:new={() => window.location.reload()}
         on:load={handleLoad}
         on:save={handleSave}
@@ -333,7 +540,8 @@
     />
 
     <div class="flex-1 flex overflow-hidden relative">
-        <TrackList {tracks} on:requestAdd={handleAddRequest} />
+        <TrackList {tracks} on:requestAdd={handleAddRequest}
+            on:select={handleTrackSelect} />
         
         <Timeline {tracks} currentTime={currentTime} bpm={bpm} 
         on:seek={(e) => seekTo(e.detail)}/> 

@@ -1,3 +1,4 @@
+<!-- haven\src\lib\components\TrackList.svelte -->
 <script lang="ts">
   import { Plus } from 'lucide-svelte';
   import TrackControl from './TrackControl.svelte';
@@ -10,6 +11,10 @@
 
   function requestAddTrack() {
     dispatch('requestAdd');
+  }
+
+  function selectTrack(id: number) {
+    dispatch('select', id);
   }
 </script>
 
@@ -28,18 +33,39 @@
   </div>
 
   <div class="flex-1 overflow-y-auto p-4 scrollbar-hide space-y-4">
-    {#each tracks as track, i (track.id)}
-        <TrackControl 
-            index={i}
-            id={track.id}
-            name={track.name}
-            color={track.color}
-            
-            bind:gain={tracks[i].gain}
-            bind:pan={tracks[i].pan}
-            bind:muted={tracks[i].muted}
-            bind:solo={tracks[i].solo}
-        />
+    {#each tracks as track (track.id)}
+        <div 
+            class={`rounded-xl transition-all border-2 cursor-pointer relative overflow-hidden ${
+                track.isRecording 
+                ? 'border-brand-red/60 bg-brand-red/5 shadow-[0_0_15px_rgba(239,68,68,0.1)]' 
+                : 'border-transparent hover:bg-white/5 hover:border-white/5'
+            }`}
+            onclick={() => selectTrack(track.id)}
+            role="button"
+            tabindex="0"
+            onkeydown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault(); 
+                    selectTrack(track.id);
+                }
+            }}
+        >
+            {#if track.isRecording}
+                <div class="absolute left-0 top-0 bottom-0 w-1 bg-brand-red shadow-[0_0_10px_#ef4444]"></div>
+            {/if}
+
+            <TrackControl 
+                index={track.id} 
+                id={track.id}
+                name={track.name}
+                color={track.color}
+                
+                bind:gain={track.gain}
+                bind:pan={track.pan}
+                bind:muted={track.muted}
+                bind:solo={track.solo}
+            />
+        </div>
     {/each}
   </div>
 </div>

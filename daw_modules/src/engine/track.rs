@@ -8,14 +8,15 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ringbuf::traits::Split;
+use ringbuf::traits::{Split, Consumer};
 use ringbuf::HeapRb;
 use ringbuf::wrap::caching::Caching;
 use ringbuf::storage::Heap;
 use ringbuf::SharedRb;
-use ringbuf::traits::Consumer;
+// use ringbuf::traits::Consumer;
 
 use crate::decoder::{spawn_decoder_with_ctrl, DecoderCmd};
+use crate::bpm::adapter;
 
 /// Identifier for a track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -90,38 +91,106 @@ impl DecoderHandle {
     }
 
     /// Read up to `frames` of interleaved f32 into `dst`. Returns frames actually written.
-    pub fn read_interleaved(&mut self, dst: &mut [f32], frames: usize, channels: usize) -> usize {
+    /// Read samples and ADD them to the destination buffer (Mixing).
+    /// Returns the number of frames actually mixed.
+    pub fn mix_interleaved(&mut self, dst: &mut [f32], frames: usize, channels: usize) -> usize {
         let samples_needed = frames * channels;
-        let mut written = 0usize;
+        let mut mixed_count = 0usize;
 
-        while written < samples_needed {
-            match self.consumer.try_pop() {
-                Some(s) => {
-                    dst[written] = s;
-                    written += 1;
-                }
-                None => {
-                    break; // non‑blocking: stop when buffer is empty
-                }
+        // Loop through the buffer and ADD the sample from the decoder
+        // This allows multiple clips to overlap without cutting each other off
+        for i in 0..samples_needed {
+            if let Some(sample) = self.consumer.try_pop() {
+                dst[i] += sample; 
+                mixed_count += 1;
+            } else {
+                break; // Buffer empty
             }
         }
 
-        let full_samples = written - (written % channels);
-        if full_samples < written {
-            for i in full_samples..written {
-                dst[i] = 0.0;
+        mixed_count / channels
+    }
+    /// This keeps the ring buffer in sync when the track is muted.
+    pub fn consume(&mut self, frames: usize, channels: usize) {
+        let samples_needed = frames * channels;
+        for _ in 0..samples_needed {
+            if self.consumer.try_pop().is_none() {
+                break;
             }
         }
-        full_samples / channels
+    }
+}
+
+pub struct Clip {
+    pub path: String,
+    pub start_time: Duration, // Position on timeline
+    pub offset: Duration,     // Start offset in the file (trimming)
+    pub duration: Duration,   // Duration on timeline
+    decoder: DecoderHandle,
+}
+
+impl Clip {
+    pub fn new(path: String, start_time: Duration, output_sr: u32, output_ch: usize) -> anyhow::Result<Self> {
+        
+        // 1. Probe to get metadata AND Calculate Duration
+        // We need the exact duration to prevent "Seek out of range" errors.
+        let (samples, source_sr, source_ch) = match adapter::decode_to_vec(&path) {
+            Ok((s, sr, ch)) => (s, sr, ch),
+            Err(e) => {
+                println!("⚠️ Clip Probe Failed, using fallback: {}", e);
+                (Vec::new(), 44100, 2) // Fallback
+            }
+        };
+
+        // Calculate Duration: Total Samples / Channels / Sample Rate
+        let duration_secs = if source_sr > 0 && source_ch > 0 {
+            samples.len() as f64 / source_ch as f64 / source_sr as f64
+        } else {
+            0.0
+        };
+        let duration = Duration::from_secs_f64(duration_secs);
+
+        println!("📎 Clip: {} | Dur: {:.2}s | {}Hz {}ch", path, duration_secs, source_sr, source_ch);
+
+        // 2. Create Decoder
+        let decoder = DecoderHandle::new_for_engine(
+            path.clone(), 
+            source_ch, 
+            output_ch, 
+            source_sr, 
+            output_sr
+        )?;
+
+        decoder.set_playing(false);
+
+        Ok(Self {
+            path,
+            start_time,
+            offset: Duration::ZERO,
+            duration, // <--- FIX: Use Actual Duration
+            decoder,
+        })
     }
 
-    #[allow(dead_code)]
-    pub fn output_sample_rate(&self) -> u32 {
-        self.output_sample_rate
+    pub fn set_playing(&self, playing: bool) {
+        self.decoder.set_playing(playing);
     }
-    #[allow(dead_code)]
-    pub fn output_channels(&self) -> usize {
-        self.output_channels
+
+    pub fn seek(&mut self, global_pos: Duration) {
+        if global_pos >= self.start_time {
+            let offset_into_clip = global_pos - self.start_time + self.offset;
+            
+            // --- FIX: Guard against seeking past the end of the file ---
+            if offset_into_clip > self.duration {
+                // We are past the end of the clip. Do nothing.
+                return;
+            }
+            // -----------------------------------------------------------
+
+            self.decoder.seek(offset_into_clip);
+        } else {
+            self.decoder.seek(self.offset);
+        }
     }
 }
 
@@ -133,42 +202,56 @@ pub struct Track {
     pub pan: f32, // -1.0 left, 0 center, +1.0 right
     pub muted: bool,
     pub solo: bool,
-
-    // --- Track Start Time (for Drag & Drop) ---
-    pub start_time: Duration,
-
     state: TrackState,
-    decoder: DecoderHandle,
+    pub clips: Vec<Clip>,
+    // --- Track Start Time (for Drag & Drop) ---
 }
 
 impl Track {
     /// `engine_sample_rate` and `engine_channels` should match the output device.
     pub fn new(
         id: TrackId,
-        path: String,
-        engine_sample_rate: u32,
-        engine_channels: usize,
-    ) -> anyhow::Result<Self> {
-        let decoder = DecoderHandle::new_for_engine(
-            path.clone(),
-            engine_channels, 
-            engine_channels,
-            engine_sample_rate,
-            engine_sample_rate,
-        )?;
-
-        Ok(Self {
+        name: String,
+    ) -> Self {
+        Self {
             id,
-            name: path,
+            name,
             gain: 1.0,
             pan: 0.0,
             muted: false,
             solo: false,
-            start_time: Duration::ZERO,
             state: TrackState::Stopped,
-            decoder,
-        })
+            clips: Vec::new(),
+        }
     }
+
+    // Helper to add a clip (used by Engine)
+    pub fn add_clip(
+        &mut self, 
+        path: String, 
+        start_time: Duration, 
+        sr: u32, 
+        ch: usize,
+        current_time: Option<Duration> // <--- NEW ARGUMENT
+    ) -> anyhow::Result<()> {
+        
+        // 1. Create the clip
+        let mut clip = Clip::new(path, start_time, sr, ch)?;
+
+        // 3. Sync Position: If we know the current engine time, seek the clip immediately!
+        if let Some(time) = current_time {
+            clip.seek(time);
+        }
+        
+        // 2. Sync State: If track is playing, set clip to playing
+        if matches!(self.state, TrackState::Playing) {
+             clip.set_playing(true);
+        }
+
+        self.clips.push(clip);
+        Ok(())
+    }
+    
 
     pub fn state(&self) -> TrackState {
         self.state
@@ -176,18 +259,25 @@ impl Track {
 
     pub fn set_state(&mut self, st: TrackState) {
         self.state = st;
-        self.decoder
-            .set_playing(matches!(st, TrackState::Playing));
+        for clip in &self.clips {
+            clip.set_playing(matches!(st, TrackState::Playing));
+        }
+            
     }
 
     pub fn seek(&mut self, global_pos: Duration) {
-        // Seek relative to track start
-        let track_pos = global_pos.saturating_sub(self.start_time);
-        self.decoder.seek(track_pos);
+        // Seek ALL clips so they are ready when the playhead hits them
+        for clip in &mut self.clips {
+            clip.seek(global_pos);
+        }
     }
 
-    pub fn is_active(&self) -> bool {
-        matches!(self.state, TrackState::Playing) && self.gain > 0.0
+    // pub fn is_active(&self) -> bool {
+    //     matches!(self.state, TrackState::Playing) && self.gain > 0.0
+    // }
+    // --- FIX: Check Transport State only, NOT Gain/Mute ---
+    pub fn is_playing(&self) -> bool {
+        matches!(self.state, TrackState::Playing)
     }
 
     /// Pull `frames` of interleaved f32 into `dst`.
@@ -201,60 +291,86 @@ impl Track {
     ) -> usize {
         dst.fill(0.0);
 
-        if !self.is_active() {
+        if !self.is_playing(){
             return 0;
         }
 
         // 1. Calculate time overlap
-        let start_secs = self.start_time.as_secs_f64();
-        let current_secs = engine_time.as_secs_f64();
+        
+        // let current_secs = engine_time.as_secs_f64();
         let buffer_duration = (dst.len() / channels) as f64 / sample_rate as f64;
-        let end_secs = current_secs + buffer_duration;
+        let start_secs = engine_time.as_secs_f64();
+        let end_secs = start_secs + buffer_duration;
 
-        // If the track hasn't started yet in this block
-        if end_secs <= start_secs {
-            return 0; 
-        }
+        let mut active_clips = 0;
 
-        // 2. Calculate Offset (Silence before track starts within this block)
-        let mut offset_frames = 0;
-        if current_secs < start_secs {
-            let silence_duration = start_secs - current_secs;
-            offset_frames = (silence_duration * sample_rate as f64).round() as usize;
-        }
+        // Determine if we should actually mix audio or just discard it
+        // Note: Solo logic is usually handled by the caller (Mixer) setting 'muted' effectively,
+        // or passing a flag. Here we rely on self.muted being set correctly.
+        let is_audible = !self.muted && self.gain > 0.0;
 
-        if offset_frames * channels >= dst.len() {
-            return 0;
-        }
+        // 1. Loop through all clips and mix them
+        // 1. Loop through all clips and mix them
+        for clip in &mut self.clips {
+            let clip_start = clip.start_time.as_secs_f64();
+            let clip_end = clip_start + clip.duration.as_secs_f64(); // <--- FIX: Use duration
 
-        // 3. Read Audio into the remaining part of the buffer
-        let audio_dst = &mut dst[(offset_frames * channels)..];
-        let frames_to_read = audio_dst.len() / channels;
-        let written_frames = self.decoder.read_interleaved(audio_dst, frames_to_read, channels);
+            // --- FIX: Check if we are entirely past the clip ---
+            // If the buffer starts AFTER the clip ends, skip it.
+            if start_secs >= clip_end {
+                continue;
+            }
+            // If the buffer ends BEFORE the clip starts, skip it.
+            if end_secs <= clip_start {
+                continue;
+            }
+            // ---------------------------------------------------
 
-        // 4. Apply Gain/Pan only to the audio part
-        let gain = self.gain;
-        let pan = self.pan.clamp(-1.0, 1.0);
-        let (pan_l, pan_r) = if channels >= 2 {
-            let angle = (pan + 1.0) * 0.25 * std::f32::consts::PI;
-            (angle.cos(), angle.sin())
-        } else {
-            (1.0, 1.0)
-        };
+            // Calculate buffer offset (silence before clip starts in this block)
+            let mut offset_frames = 0;
+            if start_secs < clip_start {
+                let diff = clip_start - start_secs;
+                offset_frames = (diff * sample_rate as f64).round() as usize;
+            }
+            
+            if offset_frames * channels >= dst.len() { continue; }
 
-        for f in 0..written_frames {
-            if channels == 1 {
-                audio_dst[f] *= gain;
+            let mix_dst = &mut dst[(offset_frames * channels)..];
+            let frames_to_mix = mix_dst.len() / channels;
+
+            if is_audible {
+                clip.decoder.mix_interleaved(mix_dst, frames_to_mix, channels);
+                active_clips += 1;
             } else {
-                let base = f * channels;
-                audio_dst[base] *= gain * pan_l;
-                audio_dst[base + 1] *= gain * pan_r;
-                for ch in 2..channels {
-                    audio_dst[base + ch] *= gain;
+                clip.decoder.consume(frames_to_mix, channels);
+            }
+        }
+
+        // Apply Gain/Pan only if we actually mixed something
+        if active_clips > 0 && is_audible {
+            let gain = self.gain;
+            let pan = self.pan.clamp(-1.0, 1.0);
+            
+            let (pan_l, pan_r) = if channels >= 2 {
+                let angle = (pan + 1.0) * 0.25 * std::f32::consts::PI;
+                (angle.cos(), angle.sin())
+            } else {
+                (1.0, 1.0)
+            };
+
+            for i in (0..dst.len()).step_by(channels) {
+                if channels >= 2 {
+                    dst[i] *= gain * pan_l;   
+                    dst[i+1] *= gain * pan_r; 
+                    for c in 2..channels {
+                        dst[i+c] *= gain;
+                    }
+                } else {
+                    dst[i] *= gain;
                 }
             }
         }
 
-        offset_frames + written_frames
+        dst.len() / channels
     }
 }

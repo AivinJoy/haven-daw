@@ -54,15 +54,16 @@ impl Recorder {
         let record_samples_clone = record_samples.clone();
 
         // Writer thread: write WAV + update waveform + sample counter
-        let path_clone = path.clone();
+        let writer = FileWriter::new(&path, input_sample_rate, channels)?;
+
+        // 5. Spawn Writer Thread
         let writer_handle = thread::spawn(move || {
-            let writer =
-                FileWriter::new(&path_clone, input_sample_rate, channels)
-                    .expect("Failed to create writer");
-            writer
-                .run_with_waveform(cons_rec, wf_clone, channels, record_samples_clone)
-                .expect("Writer failed");
+            // Run the writer loop. We handle errors inside the thread gracefully.
+            if let Err(e) = writer.run_with_waveform(cons_rec, wf_clone, channels, record_samples_clone) {
+                eprintln!("Audio Recorder Thread Error: {}", e);
+            }
         });
+
 
         // Monitor output (initially muted)
         let monitor = Monitor::new(cons_mon)?;

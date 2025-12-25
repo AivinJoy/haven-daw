@@ -26,14 +26,21 @@ pub struct TrackSnapshot {
     pub solo: bool,
 }
 
+pub struct FrontendClipInfo {
+    pub path: String,
+    pub start_time: f64,
+    pub duration: f64,
+    pub offset: f64,
+}
+
 pub struct FrontendTrackInfo {
     pub id: u32,
-    pub path: String,
+    pub name: String,
     pub gain: f32,
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
-    pub start_time: f64,
+    pub clips: Vec<FrontendClipInfo>,
 }
 
 pub struct EngineSnapshot {
@@ -174,6 +181,37 @@ impl AudioRuntime {
         Ok(())
     }
 
+    // --- ADD THIS NEW METHOD ---
+    pub fn create_empty_track(&self) -> anyhow::Result<()> {
+        if let Ok(mut eng) = self.engine.lock() {
+            let id = eng.add_empty_track(); 
+            
+            // FIX: If the engine is currently playing/recording, 
+            // force the new track to wake up and play.
+            if eng.transport.playing {
+                if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id == id) {
+                    track.set_state(crate::engine::track::TrackState::Playing);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn add_clip(&self, track_index: usize, path: String, start_time: f64) -> anyhow::Result<()> {
+        println!("➡️ Backend: Attempting to add clip to Track Index {}", track_index); // <--- DEBUG LOG
+        
+        if let Ok(mut eng) = self.engine.lock() {
+            match eng.add_clip(track_index, path.clone(), start_time) {
+                Ok(_) => println!("✅ Backend: Successfully added clip: {}", path),
+                Err(e) => {
+                    println!("❌ Backend: Failed to add clip! Error: {}", e);
+                    return Err(e); // Pass error up
+                }
+            }
+        }
+        Ok(())
+    }
+
     // --- GLOBAL SETTINGS ---
 
     pub fn set_master_gain(&self, gain: f32) {
@@ -213,12 +251,6 @@ impl AudioRuntime {
     }
 
     // --- TRACK CONTROLS ---
-
-    pub fn set_track_start_time(&self, track_index: usize, start_time: f64) {
-        if let Ok(mut eng) = self.engine.lock() {
-            eng.set_track_start_time(track_index, start_time);
-        }
-    }
 
     pub fn toggle_mute(&self, track_index: usize) {
         let (track_id, current_mute) = {
@@ -367,13 +399,23 @@ impl AudioRuntime {
         let eng = self.engine.lock().unwrap();
 
         let tracks: Vec<crate::session::serialization::TrackState> = eng.tracks().iter().map(|t| {
+            
+            // 1. Map the clips first
+            let clips = t.clips.iter().map(|c| crate::session::serialization::ClipState {
+                path: c.path.clone(),
+                start_time: c.start_time.as_secs_f64(),
+                offset: c.offset.as_secs_f64(),
+                duration: c.duration.as_secs_f64(),
+            }).collect();
+
+            // 2. Create the TrackState
             crate::session::serialization::TrackState {
-                path: t.name.clone(),
+                name: t.name.clone(), // Used to be 'path', now 'name'
                 gain: t.gain,
                 pan: t.pan,
                 muted: t.muted,
                 solo: t.solo,
-                start_time: t.start_time.as_secs_f64(),
+                clips, // Add the list of clips
             }
         }).collect();
 
@@ -400,19 +442,29 @@ impl AudioRuntime {
 
     pub fn get_tracks_list(&self) -> Vec<FrontendTrackInfo> {
         if let Ok(eng) = self.engine.lock() {
-            eng.tracks().iter().map(|t| FrontendTrackInfo {
-                id: t.id.0,
-                path: t.name.clone(),
-                gain: t.gain,
-                pan: t.pan,
-                muted: t.muted,
-                solo: t.solo,
-                start_time: t.start_time.as_secs_f64(),
+            eng.tracks().iter().map(|t| {
+                // Map the clips
+                let clips = t.clips.iter().map(|c| FrontendClipInfo {
+                    path: c.path.clone(),
+                    start_time: c.start_time.as_secs_f64(),
+                    duration: c.duration.as_secs_f64(),
+                    offset: c.offset.as_secs_f64(),
+                }).collect();
+
+                FrontendTrackInfo {
+                    id: t.id.0,
+                    name: t.name.clone(),
+                    gain: t.gain,
+                    pan: t.pan,
+                    muted: t.muted,
+                    solo: t.solo,
+                    clips, // <--- Add the clips here
+                }
             }).collect()
         } else {
             Vec::new()
         }
-    }
+    }       
 
     // --- DEBUG ---
     pub fn debug_snapshot(&self) -> Option<EngineSnapshot> {

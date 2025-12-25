@@ -1,6 +1,7 @@
+<!-- haven\src\lib\components\TopToolbar.svelte -->
 <script lang="ts">
   import { 
-    Menu, Undo, Redo, Timer, Play, Pause, Circle, 
+    Menu, Undo, Redo, Timer, Play, Pause, Circle, Square, 
     SlidersHorizontal, Volume2, Save, Share, SkipBack 
   } from 'lucide-svelte';
   import { createEventDispatcher } from 'svelte';
@@ -119,7 +120,11 @@
         </button>
         
         <button onclick={toggleRecord} class={`w-10 h-10 rounded-full flex items-center justify-center transition-all ${isRecording ? 'bg-brand-red text-white shadow-lg shadow-brand-red/50 animate-pulse' : 'bg-white/5 hover:bg-white/10 text-brand-red'}`}>
-             <Circle size={14} class="fill-current" />
+            {#if isRecording}
+                <Square size={14} class="fill-current" />
+            {:else}    
+                <Circle size={14} class="fill-current" />
+            {/if}    
         </button>
     </div>
 

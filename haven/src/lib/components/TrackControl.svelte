@@ -12,7 +12,7 @@
     gain = $bindable(),
     pan = $bindable(),
     muted = $bindable(),
-    solo = $bindable() 
+    solo = $bindable()
   } = $props();
 
   // --- LOCAL STATE ---

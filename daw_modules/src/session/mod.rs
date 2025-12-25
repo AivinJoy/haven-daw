@@ -6,7 +6,7 @@ pub mod export;
 
 use crate::engine::Engine;
 use commands::{Command, CommandManager};
-use serialization::{ProjectManifest, TrackState}; // <--- USE THIS
+use serialization::{ProjectManifest, TrackState, ClipState}; // <--- USE THIS
 use std::sync::{Arc, Mutex};
 use anyhow::Result;
 
@@ -42,13 +42,24 @@ impl Session {
         let eng = engine.lock().unwrap();
 
         // 1. Gather state from Engine tracks
-        let tracks: Vec<TrackState> = eng.tracks().iter().map(|t| TrackState {
-            path: t.name.clone(), // We assume name holds the file path
-            gain: t.gain,
-            pan: t.pan,
-            muted: t.muted,
-            solo: t.solo,
-            start_time: t.start_time.as_secs_f64(),
+        let tracks: Vec<TrackState> = eng.tracks().iter().map(|t| {
+            // FIX: Use a code block { } to define variables before returning the struct
+            let clips = t.clips.iter().map(|c| ClipState {
+                path: c.path.clone(), 
+                start_time: c.start_time.as_secs_f64(),
+                offset: c.offset.as_secs_f64(),
+                duration: c.duration.as_secs_f64(),
+            }).collect();
+
+            // Return the struct at the end of the block
+            TrackState {
+                name: t.name.clone(), 
+                gain: t.gain,
+                pan: t.pan,
+                muted: t.muted,
+                solo: t.solo,
+                clips, 
+            }    
         }).collect();
 
         // 2. Create Manifest
@@ -65,32 +76,39 @@ impl Session {
     }
 
     pub fn load_project(&mut self, engine: &Arc<Mutex<Engine>>, path: &str) -> Result<f32> {
-        // 1. Load Manifest from disk
         let manifest = ProjectManifest::load_from_disk(path)?;
-
         let mut eng = engine.lock().unwrap();
 
-        // 2. Clear existing engine state
-        // (We don't have a clear_tracks() method yet, so we iterate and remove, or just drop)
-        // Ideally, Engine should support `clear()`. For now, we rely on the fact that `tracks` is a Vec.
         eng.clear_tracks();
         eng.transport.tempo.bpm = manifest.bpm as f64;
-        
-        // Clear history on load, otherwise undo might try to modify deleted tracks
         self.command_manager = CommandManager::new(100);
 
-        // 3. Rebuild Tracks
+        // FIX: Capture these values BEFORE the loop starts
+        let sample_rate = eng.sample_rate;
+        let channels = eng.channels;
+
         for t_state in manifest.tracks {
-            // This spawns new decoders
-            let id = eng.add_track(t_state.path)?;
+            let id = eng.add_empty_track();
             
-            // Apply settings
             if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id == id) {
+                track.name = t_state.name;
                 track.gain = t_state.gain;
                 track.pan = t_state.pan;
                 track.muted = t_state.muted;
                 track.solo = t_state.solo;
-                track.start_time = std::time::Duration::from_secs_f64(t_state.start_time);
+                
+                for clip_state in t_state.clips {
+                    let start = std::time::Duration::from_secs_f64(clip_state.start_time);
+                    
+                    // FIX: Use the captured 'sample_rate' and 'channels' variables here
+                    let _ = track.add_clip(
+                        clip_state.path, 
+                        start, 
+                        sample_rate, 
+                        channels,
+                        None
+                    );
+                }
             }
         }
 

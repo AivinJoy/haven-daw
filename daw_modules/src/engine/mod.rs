@@ -42,15 +42,6 @@ impl Engine {
         }
     }
 
-    // --- NEW: Method to set track start time ---
-    pub fn set_track_start_time(&mut self, track_index: usize, start_time_secs: f64) {
-        if let Some(track) = self.tracks.get_mut(track_index) {
-            track.start_time = Duration::from_secs_f64(start_time_secs.max(0.0));
-            // Re-seek to ensure decoder is in sync with new position relative to global transport
-            track.seek(self.transport.position);
-        }
-    }
-
     pub fn set_bpm(&mut self, bpm: f32) {
         self.transport.tempo.bpm = bpm as f64;
     }
@@ -59,10 +50,36 @@ impl Engine {
         self.tracks.clear();
     }
 
-    pub fn add_track(&mut self, path: String) -> anyhow::Result<TrackId> {
+    // --- NEW: Create a generic empty track ---
+    pub fn add_empty_track(&mut self) -> TrackId {
         let id = TrackId(self.tracks.len() as u32);
-        let track = Track::new(id, path, self.sample_rate, self.channels)?;
+        // Use the new Track::new(id, name) signature
+        let track = Track::new(id, format!("Track {}", id.0 + 1));
         self.tracks.push(track);
+        id
+    }
+
+    // --- NEW: Add a Clip to an existing Track ---
+    pub fn add_clip(&mut self, track_index: usize, path: String, start_time_secs: f64) -> anyhow::Result<()> {
+        let sample_rate = self.sample_rate;
+        let channels = self.channels;
+        let start_time = Duration::from_secs_f64(start_time_secs);
+
+        // Ensure this is still here!
+        let current_pos = Some(self.transport.position); 
+
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            track.add_clip(path, start_time, sample_rate, channels, current_pos)?;
+        }
+        Ok(())
+    }
+
+    // --- UPDATED: Wrapper for backward compatibility ---
+    // Creates a track and adds the file as the first clip at 0.0s
+    pub fn add_track(&mut self, path: String) -> anyhow::Result<TrackId> {
+        let id = self.add_empty_track();
+        // Add the file as a clip starting at 0.0
+        self.add_clip(id.0 as usize, path, 0.0)?;
         Ok(id)
     }
 

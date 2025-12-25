@@ -236,27 +236,31 @@ pub fn export_project_to_wav(manifest: &ProjectManifest, output_path: &str) -> R
         sample_format: SampleFormat::Int,
     };
     let mut writer = WavWriter::create(output_path, spec)?;
-
-    let mut voices = Vec::new();
+    let mut voices_with_solo: Vec<(ExportVoice, bool)> = Vec::new();
     for t_state in &manifest.tracks {
-        // FIX: Correctly passing start_time from manifest
-        if let Ok(mut v) = ExportVoice::new(&t_state.path, sample_rate, t_state.start_time) {
-            v.gain = t_state.gain;
-            v.pan = t_state.pan;
-            v.muted = t_state.muted; 
-            voices.push(v);
-        } else {
-             eprintln!("⚠️ Failed to load {}", t_state.path);
+        for clip in &t_state.clips {
+            if let Ok(mut v) = ExportVoice::new(&clip.path, sample_rate, clip.start_time) {
+                v.gain = t_state.gain;
+                v.pan = t_state.pan;
+                v.muted = t_state.muted; 
+                
+                // Store voice + track solo state
+                voices_with_solo.push((v, t_state.solo));
+            } else {
+                 eprintln!("⚠️ Failed to load clip {}", clip.path);
+            }
         }
     }
 
     // Solo Logic
     let any_solo = manifest.tracks.iter().any(|t| t.solo);
     if any_solo {
-        for (i, v) in voices.iter_mut().enumerate() {
-            if i < manifest.tracks.len() {
-                if !manifest.tracks[i].solo { v.muted = true; } 
-                else { v.muted = false; }
+        for (v, is_track_solo) in &mut voices_with_solo {
+            // If global solo is active, mute anything that isn't soloed
+            if !*is_track_solo {
+                v.muted = true;
+            } else {
+                v.muted = false; // Unmute soloed tracks (overrides mute button)
             }
         }
     }
@@ -267,9 +271,13 @@ pub fn export_project_to_wav(manifest: &ProjectManifest, output_path: &str) -> R
     let max_frames = 44100 * 600; 
 
     loop {
-        if voices.iter().all(|v| v.is_finished()) || total_frames > max_frames { break; }
+        if voices_with_solo.iter().all(|(v, _)| v.is_finished()) || total_frames > max_frames { 
+            break; 
+        }
         mix_buffer.fill(0.0);
-        for v in &mut voices { v.add_to_mix(&mut mix_buffer, block_size)?; }
+        for (v, _) in &mut voices_with_solo { 
+            v.add_to_mix(&mut mix_buffer, block_size)?; 
+        }
 
         if (manifest.master_gain - 1.0).abs() > 0.001 {
             for s in &mut mix_buffer { *s *= manifest.master_gain; }

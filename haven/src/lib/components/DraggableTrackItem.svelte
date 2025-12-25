@@ -7,8 +7,7 @@
   // Props
   // We use $bindable() for 'track' so the parent list updates instantly visually
   let { 
-    track = $bindable(), 
-    index,
+    clip = $bindable(), 
     zoom = 1,
     currentTime = 0,
     bpm = 120
@@ -32,7 +31,7 @@
     
     // 1. Capture the starting state
     startMouseX = event.clientX; 
-    initialStartTime = track.startTime || 0;
+    initialStartTime = clip.startTime || 0;
     
     // 2. Add listeners globally (fixes dragging outside the div)
     window.addEventListener('mousemove', handleMouseMove);
@@ -67,7 +66,7 @@
 
     
     // D. Update Audio State (High Precision Float)
-    track.startTime = newTime;
+    clip.startTime = newTime;
   }
 
 
@@ -80,14 +79,15 @@
           // --- NEW: Dispatch Change Event ---
           // This tells the parent "I moved to this new time!"
           dispatch('change', { 
-              trackId: track.id, 
-              newStartTime: track.startTime 
+              trackId: clip.trackId,
+              clipId: clip.id, 
+              newStartTime: clip.startTime 
           });
       }
   }
 
-  let leftPx = $derived((track.startTime || 0) * PIXELS_PER_SECOND * zoom);
-  let widthPx = $derived((track.duration || 0) * PIXELS_PER_SECOND * zoom);
+  let leftPx = $derived((clip.startTime || 0) * PIXELS_PER_SECOND * zoom);
+  let widthPx = $derived((clip.duration || 0) * PIXELS_PER_SECOND * zoom);
 </script>
 
 <div 
@@ -103,12 +103,12 @@
     tabindex="0"
 >
      <WaveformClip 
-        color={track.color} 
-        waveform={track.waveform} 
+        color={clip.color} 
+        waveform={clip.waveform} 
         currentTime={currentTime}
-        startTime={track.startTime || 0} 
-        duration={track.duration}
+        startTime={clip.startTime || 0} 
+        duration={clip.duration}
         zoom={zoom} 
-        name={track.name}
+        name={clip.name}
      />
 </div>

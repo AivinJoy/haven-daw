@@ -75,6 +75,8 @@ where
         })
     }
 
+    // In src/decoder/mod.rs -> impl Decoder -> fn run
+
     fn run(mut self) -> Result<(), anyhow::Error> {
         let file = File::open(&self.path)?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -102,43 +104,73 @@ where
                 self.output_channels)?;
         let mut stage_planar: Vec<Vec<f32>> = vec![Vec::with_capacity(4096); self.output_channels];
 
-        loop {
-            while let Ok(cmd) = self.cmd_rx.try_recv() {
-                match cmd {
-                    DecoderCmd::Seek(target) => {
-                        let seconds = target.as_secs();
-                        let frac = target.subsec_nanos() as f64 / 1_000_000_000f64;
-                        let time = symphonia::core::units::Time::new(seconds, frac);
-                        format.seek(
-                            SeekMode::Accurate,
-                            SeekTo::Time {
-                                time,
-                                track_id: Some(track_id),
-                            },
-                        )?;
+        // Flag to track "End of File"
+        let mut eof_reached = false;
 
-                        sample_buf = None;
-                        for ch in &mut stage_planar {
-                            ch.clear();
+        loop {
+            // --- FIX 1: Handle Disconnects (Exit Thread) ---
+            // Use a loop to process all pending commands
+            loop {
+                match self.cmd_rx.try_recv() {
+                    Ok(cmd) => match cmd {
+                        DecoderCmd::Seek(target) => {
+                            let seconds = target.as_secs();
+                            let frac = target.subsec_nanos() as f64 / 1_000_000_000f64;
+                            let time = symphonia::core::units::Time::new(seconds, frac);
+                            
+                            // Try to seek
+                            if let Err(e) = format.seek(
+                                SeekMode::Accurate,
+                                SeekTo::Time {
+                                    time,
+                                    track_id: Some(track_id),
+                                },
+                            ) {
+                                eprintln!("Seek error: {}", e);
+                            } else {
+                                // Seek Success -> Reset EOF
+                                eof_reached = false; 
+                            }
+
+                            // Clear buffers on seek
+                            sample_buf = None;
+                            for ch in &mut stage_planar { ch.clear(); }
+                            if let Some(r) = &mut resampler { r.reset(); }
+                            self.post_seek_fade_samples =
+                                dsp::fade_samples_ms(self.output_sample_rate, 10) * self.output_channels;
                         }
-                        if let Some(r) = &mut resampler {
-                            r.reset();
-                        }
-                        self.post_seek_fade_samples =
-                            dsp::fade_samples_ms(self.output_sample_rate, 10) * self.output_channels;
-                    }
+                    },
+                    // No more commands right now -> Break inner loop, continue decoding
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break, 
+                    // Controller Disconnected -> APP CLOSED -> Return to exit thread
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(()), 
                 }
             }
 
-            let packet = match format.next_packet() {
-                Ok(p) => p,
-                Err(SymphoniaError::ResetRequired) => break,
-                Err(_) => break,
-            };
-
-            if packet.track_id() != track_id {
+            // 2. If at EOF, just wait.
+            if eof_reached {
+                thread::sleep(Duration::from_millis(10));
                 continue;
             }
+
+            // 3. Decode Next Packet
+            let packet = match format.next_packet() {
+                Ok(p) => p,
+                Err(SymphoniaError::ResetRequired) => {
+                    eof_reached = true; 
+                    continue;
+                }
+                Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    eof_reached = true; // Mark EOF
+                    continue; 
+                }
+                Err(_) => {
+                    eof_reached = true; // Treat error as EOF
+                    continue; 
+                }
+            };
+
+            if packet.track_id() != track_id { continue; }
 
             match decoder.decode(&packet) {
                 Ok(decoded) => {
@@ -155,89 +187,36 @@ where
 
                     if resampler.is_some() {
                         if decoded_ch == self.output_channels {
-                            dsp::append_interleaved_to_planar(
-                                src_interleaved,
-                                &mut stage_planar,
-                                self.output_channels,
-                            );
+                            dsp::append_interleaved_to_planar(src_interleaved, &mut stage_planar, self.output_channels);
                         } else {
-                            let mixed = dsp::updown_mix_interleaved(
-                                src_interleaved,
-                                decoded_ch,
-                                self.output_channels,
-                            );
-                            dsp::append_interleaved_to_planar(
-                                &mixed,
-                                &mut stage_planar,
-                                self.output_channels,
-                            );
+                            let mixed = dsp::updown_mix_interleaved(src_interleaved, decoded_ch, self.output_channels);
+                            dsp::append_interleaved_to_planar(&mixed, &mut stage_planar, self.output_channels);
                         }
 
-                        while let Some(mut out_block) =
-                            resample::try_process_exact(resampler.as_mut().unwrap(), &mut stage_planar)
-                        {
+                        while let Some(mut out_block) = resample::try_process_exact(resampler.as_mut().unwrap(), &mut stage_planar) {
                             let interleaved_out = dsp::interleave(out_block.as_mut_slice());
-                            output::push_with_fade(
-                                &mut self.producer,
-                                &interleaved_out,
-                                &mut self.post_seek_fade_samples,
-                            );
+                            output::push_with_fade(&mut self.producer, &interleaved_out, &mut self.post_seek_fade_samples);
                         }
                     } else {
                         if decoded_ch == self.output_channels {
-                            output::push_with_fade(
-                                &mut self.producer,
-                                src_interleaved,
-                                &mut self.post_seek_fade_samples,
-                            );
+                            output::push_with_fade(&mut self.producer, src_interleaved, &mut self.post_seek_fade_samples);
                         } else {
-                            let mixed = dsp::updown_mix_interleaved(
-                                src_interleaved,
-                                decoded_ch,
-                                self.output_channels,
-                            );
-                            output::push_with_fade(
-                                &mut self.producer,
-                                &mixed,
-                                &mut self.post_seek_fade_samples,
-                            );
+                            let mixed = dsp::updown_mix_interleaved(src_interleaved, decoded_ch, self.output_channels);
+                            output::push_with_fade(&mut self.producer, &mixed, &mut self.post_seek_fade_samples);
                         }
                     }
                 }
                 Err(SymphoniaError::IoError(_)) => continue,
                 Err(SymphoniaError::DecodeError(_)) => continue,
-                Err(_) => break,
+                Err(_) => {
+                    eof_reached = true;
+                }
             }
 
             if !self.is_playing.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-
-        if let Some(r) = &mut resampler {
-            if let Some(mut planar) = resample::drain_remaining_planar(&mut stage_planar) {
-                if let Some(mut out) = resample::process_partial_some(r, planar.as_mut_slice())? {
-                    let interleaved_out = dsp::interleave(out.as_mut_slice());
-                    output::push_with_fade(
-                        &mut self.producer,
-                        &interleaved_out,
-                        &mut self.post_seek_fade_samples,
-                    );
-                }
-            }
-            if let Some(mut out) = resample::process_partial_none::<f32>(r)? {
-                if !out.is_empty() && !out[0].is_empty() {
-                    let interleaved_out = dsp::interleave(out.as_mut_slice());
-                    output::push_with_fade(
-                        &mut self.producer,
-                        &interleaved_out,
-                        &mut self.post_seek_fade_samples,
-                    );
-                }
-            }
-        }
-
-        Ok(())
     }
 }
 

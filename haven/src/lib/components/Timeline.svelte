@@ -184,17 +184,18 @@
         </div>
 
         <div class="absolute inset-0 flex flex-col pt-4 px-0"> 
-            {#each tracks as track, index}
+            {#each tracks as track, trackIndex}
                 <div class="w-full h-24 mb-2 relative border-b border-white/5 flex items-center px-0">
                     <div class={`absolute inset-0 transition-colors duration-300 ${track.color}`} style="opacity: 0.05;"></div>
-                    <DraggableTrackItem 
-                        bind:track={tracks[index]} 
-                        index={index} 
-                        zoom={zoomMultiplier} 
-                        currentTime={currentTime}
-                        bpm={bpm}
-                        on:change={handleClipMove} 
-                    />
+                    {#each track.clips as clip, clipIndex}
+                        <DraggableTrackItem 
+                            bind:clip={tracks[trackIndex].clips[clipIndex]} 
+                            zoom={zoomMultiplier} 
+                            currentTime={currentTime}
+                            bpm={bpm}
+                            on:change={handleClipMove} 
+                        />
+                    {/each}    
                 </div>
             {/each}
         </div>
