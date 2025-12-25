@@ -13,7 +13,16 @@
     dispatch('requestAdd');
   }
 
-  function selectTrack(id: number) {
+
+  // Helper to handle click
+  function selectTrack(id: number, e: MouseEvent | KeyboardEvent) {
+    // 1. STOP if clicking a button or slider (Input/Button)
+    // This prevents the row selection from interfering with Mute/Solo/Pan dragging
+    const target = e.target as HTMLElement;
+    if (target.tagName === 'BUTTON' || target.tagName === 'INPUT' || target.closest('button') || target.closest('input')) {
+        return;
+    }
+
     dispatch('select', id);
   }
 </script>
@@ -32,38 +41,40 @@
     </button>
   </div>
 
-  <div class="flex-1 overflow-y-auto p-4 scrollbar-hide space-y-4">
-    {#each tracks as track (track.id)}
+  <div class="flex-1 overflow-y-auto pt-4 px-4 scrollbar-hide">
+    {#each tracks as track, i (track.id)}
         <div 
-            class={`rounded-xl transition-all border-2 cursor-pointer relative overflow-hidden ${
+            class={`w-full h-24 mb-2 rounded-xl transition-all cursor-pointer relative overflow-hidden outline-none ${
                 track.isRecording 
-                ? 'border-brand-red/60 bg-brand-red/5 shadow-[0_0_15px_rgba(239,68,68,0.1)]' 
-                : 'border-transparent hover:bg-white/5 hover:border-white/5'
+                ? 'bg-white/5 border-transparent' // SELECTED: Subtle background, no border conflict
+                : 'border-transparent hover:bg-white/5 hover:border-white/5' // UNSELECTED
             }`}
-            onclick={() => selectTrack(track.id)}
+            onclick={(e) => selectTrack(track.id, e)}
             role="button"
             tabindex="0"
             onkeydown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault(); 
-                    selectTrack(track.id);
+                    selectTrack(track.id, e);
                 }
             }}
         >
             {#if track.isRecording}
-                <div class="absolute left-0 top-0 bottom-0 w-1 bg-brand-red shadow-[0_0_10px_#ef4444]"></div>
+                <div class="absolute left-0 top-0 bottom-0 w-1  shadow-[0_0_10px_#ef4444]"></div>
             {/if}
 
             <TrackControl 
-                index={track.id} 
+                index={i} 
                 id={track.id}
                 name={track.name}
                 color={track.color}
                 
-                bind:gain={track.gain}
-                bind:pan={track.pan}
-                bind:muted={track.muted}
-                bind:solo={track.solo}
+                bind:gain={tracks[i].gain}
+                bind:pan={tracks[i].pan}
+                bind:muted={tracks[i].muted}
+                bind:solo={tracks[i].solo}
+                isRecording={track.isRecording}
+                source={track.source}
             />
         </div>
     {/each}

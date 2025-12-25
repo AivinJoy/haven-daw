@@ -62,6 +62,7 @@
     solo: boolean;
     isRecording?: boolean;
     savePath?: string;
+    source: 'mic' | 'media';
   };
 
   // --- TRACKS STATE ---
@@ -184,10 +185,17 @@
     const id = maxId + 1;
     
     const colors = [
-        'bg-brand-blue', 'bg-brand-red', 'bg-purple-500', 
-        'bg-emerald-500', 'bg-orange-500', 'bg-pink-500'
+        'bg-brand-blue', 
+        'bg-brand-red', 
+        'bg-purple-500', 
+        'bg-emerald-500', 
+        'bg-orange-500', 
+        'bg-pink-500',
+        'bg-cyan-500',   // Added extra variety
+        'bg-indigo-500', // Added extra variety
+        'bg-rose-500'    // Added extra variety
     ];
-    const color = colors[(id - 1) % colors.length];
+    const color = colors[Math.floor(Math.random() * colors.length)];
 
     // Default mixer values
     const defaultMixer = {
@@ -207,13 +215,14 @@
         tracks = [...tracks, { 
             id, 
             name: "Recording...", 
-            color: "bg-red-500", 
+            color: color, 
             // startTime: currentTime, 
             // duration: 0, 
             clips: [],
             ...defaultMixer,
             isRecording: true, // Flag for custom styling if needed
-            savePath: savePath
+            savePath: savePath,
+            source: 'mic'
         }];
         try {
             await invoke('create_track');
@@ -270,7 +279,8 @@
                     color, 
                     clips: [newClip],
                     ...defaultMixer, // Spread mixer defaults
-                    isRecording: false
+                    isRecording: false,
+                    source: 'media'
                 }];
             }
         } catch (e) {
@@ -281,7 +291,7 @@
     } 
     else {
         const name = `Track ${id}`;
-        tracks = [...tracks, { id, name, color, clips: [],  ...defaultMixer, isRecording: false }];
+        tracks = [...tracks, { id, name, color, clips: [],  ...defaultMixer, isRecording: false, source: 'media' }];
     }
   }
 
@@ -301,6 +311,7 @@
       if (trackIndex === -1) { alert("No track armed!"); return; }
 
       const trackId = tracks[trackIndex].id; // Get the real ID (e.g., 1, 2, 3)
+      const trackColor = tracks[trackIndex].color;
 
       try {
           // 1. Generate Path
@@ -320,7 +331,7 @@
               duration: 0,
               offset: 0,
               waveform: { mins: [], maxs: [] }, 
-              color: "bg-red-500"
+              color: trackColor
           };
 
           // 3. Push to Track
@@ -371,6 +382,7 @@
 
       if (result) {
           const tIdx = tracks.findIndex(t => t.isRecording);
+          const trackColor = tracks[tIdx].color;
           
           if (tIdx !== -1) {
               const clips = tracks[tIdx].clips;
@@ -382,7 +394,7 @@
                   tracks[tIdx].clips[lastClipIdx] = {
                       ...tracks[tIdx].clips[lastClipIdx],
                       name: `Take ${clips.length}`,
-                      color: "bg-brand-red",
+                      color: trackColor,
                       duration: result.duration,
                       waveform: { mins: result.mins, maxs: result.maxs } 
                   };
@@ -544,7 +556,8 @@
             on:select={handleTrackSelect} />
         
         <Timeline {tracks} currentTime={currentTime} bpm={bpm} 
-        on:seek={(e) => seekTo(e.detail)}/> 
+        on:seek={(e) => seekTo(e.detail)}
+        on:select={handleTrackSelect}/> 
 
     </div>
 

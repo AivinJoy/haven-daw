@@ -1,3 +1,4 @@
+<!-- haven\src\lib\components\TrackControl.svelte -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { Mic, Headphones, MoreVertical, Volume2 } from 'lucide-svelte';
@@ -12,7 +13,9 @@
     gain = $bindable(),
     pan = $bindable(),
     muted = $bindable(),
-    solo = $bindable()
+    solo = $bindable(),
+    isRecording = false,
+    source = 'media'
   } = $props();
 
   // --- LOCAL STATE ---
@@ -40,7 +43,12 @@
     'bg-purple-500': '#a855f7',
     'bg-emerald-500': '#10b981',
     'bg-orange-500': '#f97316',
-    'bg-pink-500': '#ec4899'
+    'bg-pink-500': '#ec4899',
+    // --- FIX: Added missing colors so they don't default to Blue ---
+    'bg-cyan-500': '#06b6d4',
+    'bg-indigo-500': '#6366f1',
+    'bg-rose-500': '#f43f5e'
+    // -------------------------------------------------------------
   };
   let trackColorHex = $derived(colorMap[color] || '#3b82f6');
 
@@ -109,15 +117,15 @@
   }
 </script>
 
-{#snippet MusicIconType({ color }: {color: string})}
-    {#if color.includes('red')}
-        <Mic size={14} class="text-red-400" />
+{#snippet MusicIconType({ src }: { src: string })}
+    {#if src === 'mic'}
+        <Mic size={14} style="color: {trackColorHex}" />
     {:else}
-        <Headphones size={14} class={color.replace('bg-', 'text-').replace('-500', '-400')} />
+        <Headphones size={14} style="color: {trackColorHex}" />
     {/if}
 {/snippet}
 
-<div class="group relative w-full h-24 glass-panel border-l-[3px] rounded-lg border-l-transparent hover:bg-white/5 transition-all mb-2 flex flex-col justify-center px-3 gap-2 overflow-hidden shrink-0 shadow-[0_4px_20px_rgba(0,0,0,0.3)]">
+<div class="group relative w-full h-full glass-panel border-l-[3px] rounded-lg border-l-transparent hover:bg-white/5 transition-all mb-2 flex flex-col justify-center px-3 gap-2 overflow-hidden shrink-0 shadow-[0_4px_20px_rgba(0,0,0,0.3)]">
   
   <div class={`absolute left-0 top-0 bottom-0 w-1 ${color} opacity-80 shadow-[0_0_15px_${color.replace('bg-', '')}]`}></div>
 
@@ -125,7 +133,7 @@
     <span class="text-white/30 font-mono text-[10px] select-none shrink-0">{id.toString().padStart(2, '0')}</span>
     
     <div class="opacity-80 shrink-0">
-        {@render MusicIconType({ color: color })}
+        {@render MusicIconType({ src: source })}
     </div>
 
     <input 

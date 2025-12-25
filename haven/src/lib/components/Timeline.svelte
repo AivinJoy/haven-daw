@@ -64,7 +64,7 @@
   });
 
   let maxDurationSeconds = $derived(
-    Math.max(...tracks.map((t: any) => (t.startTime || 0) + (t.duration || 0)), 10)
+    Math.max(...tracks.map((t: any) => (t.startTime || 0) + (t.duration || 0)), 300)
   );
 
   function zoomIn() { zoomMultiplier = Math.min(zoomMultiplier * 1.5, 8); }
@@ -102,6 +102,10 @@
 
   function stopScrub() {
       isScrubbing = false;
+  }
+
+  function handleTrackClick(trackId: number) {
+      dispatch('select', trackId);
   }
 
   async function handleClipMove(event: CustomEvent) {
@@ -185,8 +189,12 @@
 
         <div class="absolute inset-0 flex flex-col pt-4 px-0"> 
             {#each tracks as track, trackIndex}
-                <div class="w-full h-24 mb-2 relative border-b border-white/5 flex items-center px-0">
-                    <div class={`absolute inset-0 transition-colors duration-300 ${track.color}`} style="opacity: 0.05;"></div>
+                <div class="w-full h-24 mb-2 relative border-b border-white/5 flex items-center px-0"
+                    onmousedown={() => handleTrackClick(track.id)}
+                    role="button"
+                    tabindex="0"
+                >    
+                    <div class={`absolute inset-0 transition-colors duration-300 ${track.color}`} style={`opacity: ${track.isRecording ? 0.08 : 0};`}></div>
                     {#each track.clips as clip, clipIndex}
                         <DraggableTrackItem 
                             bind:clip={tracks[trackIndex].clips[clipIndex]} 

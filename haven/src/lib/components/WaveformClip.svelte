@@ -1,3 +1,4 @@
+<!-- haven\src\lib\components\WaveformClip.svelte -->
 <script lang="ts">
   import { onMount } from 'svelte';
 
@@ -31,8 +32,13 @@
     'bg-purple-500':  '#a855f7',
     'bg-emerald-500': '#10b981',
     'bg-orange-500':  '#f97316',
-    'bg-pink-500':    '#ec4899'
+    'bg-pink-500':    '#ec4899',
+    'bg-cyan-500':    '#06b6d4', // Added
+    'bg-indigo-500':  '#6366f1', // Added
+    'bg-rose-500':    '#f43f5e'  // Added
   };
+
+  const waveColor = $derived(colorPalette[color] || '#3b82f6');
 
   const renderStaticWaveform = (width: number, height: number, waveColor: string) => {
       if (!waveform || !waveform.mins) return null;
@@ -150,7 +156,14 @@
 >
   <canvas bind:this={canvas} class="absolute top-0 left-0 h-full z-10 opacity-90"></canvas>
   
-  <span class="absolute top-1 left-2 text-[10px] font-bold font-sans text-black/60 z-20 truncate max-w-[95%] mix-blend-hard-light drop-shadow-sm pointer-events-none">
-    {name}
-  </span>
+  <span class="absolute top-1 left-2 text-[10px] ... text-black/60 ...">
+   {name}
+</span>
+
+<span 
+    class="absolute top-1 left-2 text-[10px] font-bold font-sans z-20 truncate max-w-[95%] pointer-events-none"
+    style="color: {waveColor}; filter: brightness(0.6) saturate(1.5);"
+>
+   {name}
+</span>
 </div>
