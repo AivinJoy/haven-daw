@@ -280,6 +280,15 @@ impl Track {
         matches!(self.state, TrackState::Playing)
     }
 
+    pub fn move_clip(&mut self, clip_index: usize, new_start: Duration) {
+        if let Some(clip) = self.clips.get_mut(clip_index) {
+            clip.start_time = new_start;
+            // Optionally seek immediately if the clip is currently playing 
+            // so the change is audible instantly without restart
+            // clip.seek(...) 
+        }
+    }
+
     /// Pull `frames` of interleaved f32 into `dst`.
     /// Handles start_time offset logic.
     pub fn render_into(

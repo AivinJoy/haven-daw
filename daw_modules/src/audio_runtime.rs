@@ -212,6 +212,13 @@ impl AudioRuntime {
         Ok(())
     }
 
+    pub fn move_clip(&self, track_index: usize, clip_index: usize, new_start: f64) -> anyhow::Result<()> {
+        if let Ok(mut eng) = self.engine.lock() {
+            eng.move_clip(track_index, clip_index, new_start)?;
+        }
+        Ok(())
+    }
+
     // --- GLOBAL SETTINGS ---
 
     pub fn set_master_gain(&self, gain: f32) {

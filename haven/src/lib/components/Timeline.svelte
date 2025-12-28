@@ -108,7 +108,7 @@
       dispatch('select', trackId);
   }
 
-  async function handleClipMove(event: CustomEvent) {
+  async function handleClipMove(event: CustomEvent, clipIndex:number) {
       const { trackId, newStartTime } = event.detail;
       
       console.log(`🎵 Moving Track ${trackId} to ${newStartTime.toFixed(2)}s`);
@@ -116,9 +116,10 @@
       try {
           // Backend uses 0-based index, frontend uses 1-based ID
           // Ensure this matches your logic (track.id - 1)
-          await invoke('set_track_start', { 
+          await invoke('move_clip', { 
               trackIndex: trackId - 1, 
-              startTime: newStartTime 
+              clipIndex: clipIndex,
+              newTime: newStartTime 
           });
       } catch (e) {
           console.error("Failed to move clip:", e);
@@ -201,7 +202,7 @@
                             zoom={zoomMultiplier} 
                             currentTime={currentTime}
                             bpm={bpm}
-                            on:change={handleClipMove} 
+                            on:change={(e) => handleClipMove(e, clipIndex)} 
                         />
                     {/each}    
                 </div>

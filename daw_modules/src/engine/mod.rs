@@ -112,6 +112,15 @@ impl Engine {
         }
     }
 
+    pub fn move_clip(&mut self, track_index: usize, clip_index: usize, new_start: f64) -> anyhow::Result<()> {
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            track.move_clip(clip_index, std::time::Duration::from_secs_f64(new_start));
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Track index {} out of bounds", track_index))
+        }
+    }
+
     pub fn render(&mut self, out: &mut [f32]) {
         out.fill(0.0);
 

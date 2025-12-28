@@ -130,10 +130,18 @@ fn analyze_file(path: String) -> Result<ImportResult, String> {
 }
 
 #[tauri::command]
-fn set_track_start(track_index: usize, start_time: f64, _state: State<AppState>) -> Result<(), String> {
-    // TODO: Implement 'move_clip' instead, as tracks no longer have a single start time.
-    // For now, we do nothing to allow compilation.
-    println!("⚠️ Moving tracks is temporarily disabled. Implement 'move_clip' for Track {} to {}s", track_index, start_time);
+fn move_clip(
+    track_index: usize, 
+    clip_index: usize, 
+    new_time: f64, 
+    state: State<AppState>
+) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    
+    // Call the runtime logic we just added
+    audio.move_clip(track_index, clip_index, new_time)
+        .map_err(|e| e.to_string())?;
+        
     Ok(())
 }
 
@@ -469,7 +477,7 @@ fn main() {
             get_recording_status,
             set_bpm,
             get_grid_lines,
-            set_track_start,
+            move_clip,
             seek,
             set_track_gain,
             set_track_pan,
