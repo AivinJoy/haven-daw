@@ -78,6 +78,10 @@ impl Recorder {
         })
     }
 
+    pub fn is_monitor_enabled(&self) -> bool {
+        self.monitor.is_enabled()
+    }
+
     pub fn stop(mut self) {
         // Drop input to stop capture
         drop(self.input);

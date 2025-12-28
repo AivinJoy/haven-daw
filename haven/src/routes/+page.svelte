@@ -63,6 +63,7 @@
     isRecording?: boolean;
     savePath?: string;
     source: 'mic' | 'media';
+    monitor: boolean;
   };
 
   // --- TRACKS STATE ---
@@ -202,7 +203,8 @@
         gain: 1.0,
         pan: 0.0,
         muted: false,
-        solo: false
+        solo: false,
+        monitor: false
     };
 
     if (type === 'record') {
@@ -365,9 +367,38 @@
               }
           );
 
+          if (tracks[trackIndex].monitor) {
+              try {
+                  // The recorder defaults to monitor OFF. We toggle it ON here if needed.
+                  await invoke('toggle_monitor_cmd');
+                  console.log("🔊 Monitor Enabled for recording");
+              } catch (e) {
+                  console.error("Failed to enable monitor:", e);
+              }
+          }
+
       } catch (e) {
           console.error("Failed to start:", e);
           isRecordingMode = false;
+      }
+  }
+
+  async function handleToggleMonitor(event: CustomEvent<number>) {
+      const trackId = event.detail;
+      const tIdx = tracks.findIndex(t => t.id === trackId);
+      if (tIdx === -1) return;
+
+      // 1. Toggle UI State
+      tracks[tIdx].monitor = !tracks[tIdx].monitor;
+      console.log(`Track ${trackId} Monitor: ${tracks[tIdx].monitor ? 'ON' : 'OFF'}`);
+
+      // 2. If we are currently Recording AND this is the active track, toggle Backend
+      if (isRecordingMode && tracks[tIdx].isRecording) {
+          try {
+              await invoke('toggle_monitor_cmd');
+          } catch (e) {
+              console.error("Failed to toggle monitor:", e);
+          }
       }
   }
 
@@ -553,7 +584,8 @@
 
     <div class="flex-1 flex overflow-hidden relative">
         <TrackList {tracks} on:requestAdd={handleAddRequest}
-            on:select={handleTrackSelect} />
+            on:select={handleTrackSelect}
+            on:toggleMonitor={handleToggleMonitor} />
         
         <Timeline {tracks} currentTime={currentTime} bpm={bpm} 
         on:seek={(e) => seekTo(e.detail)}

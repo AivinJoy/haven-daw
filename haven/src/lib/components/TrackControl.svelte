@@ -1,7 +1,7 @@
 <!-- haven\src\lib\components\TrackControl.svelte -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { Mic, Headphones, MoreVertical, Volume2 } from 'lucide-svelte';
+  import { Mic, Headphones, MoreVertical, Volume2, Ear } from 'lucide-svelte';
 
   // --- PROPS ---
   let { 
@@ -15,7 +15,9 @@
     muted = $bindable(),
     solo = $bindable(),
     isRecording = false,
-    source = 'media'
+    source = 'media',
+    monitor = false,
+    onmonitor = () => {}
   } = $props();
 
   // --- LOCAL STATE ---
@@ -143,6 +145,15 @@
     />
 
     <div class="flex items-center gap-1 shrink-0 ml-auto">
+        {#if source === 'mic'}
+            <button 
+                onclick={() => onmonitor()} 
+                class={`w-6 h-6 rounded flex items-center justify-center border transition-all ${monitor ? 'bg-emerald-500/20 border-emerald-500 text-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'border-white/10 text-white/40 hover:border-white/30 hover:text-white/70'}`}
+                title="Input Monitor (Hear yourself)"
+            >
+                <Ear size={14} />
+            </button>
+        {/if}
         <button 
             onclick={toggleMute}
             class={`w-6 h-6 rounded text-[9px] font-bold border transition-all ${muted ? 'bg-red-500/20 border-red-500 text-red-500 shadow-[0_0_8px_rgba(220,38,38,0.4)]' : 'border-white/10 text-white/40 hover:border-white/30 hover:text-white/70'}`}

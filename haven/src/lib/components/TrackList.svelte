@@ -4,13 +4,17 @@
   import TrackControl from './TrackControl.svelte';
   import { createEventDispatcher } from 'svelte';
 
-  const dispatch = createEventDispatcher();
+  const dispatch = createEventDispatcher<{
+    requestAdd: null;        // No payload
+    select: number;          // Payload is Track ID
+    toggleMonitor: number;   // Payload is Track ID
+  }>();
 
   // Receive tracks prop (bindable if you want the list itself to change, but usually internal props bind)
   let { tracks = []} = $props();
 
   function requestAddTrack() {
-    dispatch('requestAdd');
+    dispatch('requestAdd', null);
   }
 
 
@@ -75,6 +79,9 @@
                 bind:solo={tracks[i].solo}
                 isRecording={track.isRecording}
                 source={track.source}
+
+                monitor={track.monitor}
+                onmonitor={() => dispatch('toggleMonitor', track.id)}
             />
         </div>
     {/each}

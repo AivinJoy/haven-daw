@@ -151,7 +151,8 @@ struct RecordingState {
     duration: f64,
     // We send a simplified volume level (RMS) or a small chunk of waveform points
     // For now, let's send the current RMS (volume) for the meter
-    current_rms: f32, 
+    current_rms: f32,
+    is_monitoring: bool, 
 }
 
 #[tauri::command]
@@ -166,6 +167,42 @@ fn start_recording(path: String, state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_recording_status(state: State<AppState>) -> Result<RecordingState, String> {
+    let rec_guard = state.recorder.lock().map_err(|_| "Failed to lock recorder")?;
+    
+    if let Some(rec) = rec_guard.as_ref() {
+        let duration = rec.get_record_time().as_secs_f64();
+        let current_rms = 0.5; // Placeholder RMS
+        
+        Ok(RecordingState {
+            is_recording: true,
+            duration,
+            current_rms,
+            is_monitoring: rec.is_monitor_enabled(), // <--- Fetch real state
+        })
+    } else {
+        Ok(RecordingState {
+            is_recording: false,
+            duration: 0.0,
+            current_rms: 0.0,
+            is_monitoring: false, // Default off
+        })
+    }
+}
+
+#[tauri::command]
+fn toggle_monitor_cmd(state: State<AppState>) -> Result<bool, String> {
+    let mut rec_guard = state.recorder.lock().map_err(|_| "Failed to lock recorder")?;
+    if let Some(rec) = rec_guard.as_mut() {
+        rec.toggle_monitor().map_err(|e| e.to_string())?;
+        Ok(rec.is_monitor_enabled())
+    } else {
+        // If not recording, we can't toggle the hardware monitor yet.
+        Ok(false)
+    }
+}
+
+#[tauri::command]
 fn stop_recording(state: State<AppState>) -> Result<(), String> {
     let mut rec_guard = state.recorder.lock().map_err(|_| "Failed to lock recorder")?;
     if let Some(rec) = rec_guard.take() {
@@ -174,36 +211,7 @@ fn stop_recording(state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn get_recording_status(state: State<AppState>) -> Result<RecordingState, String> {
-    let rec_guard = state.recorder.lock().map_err(|_| "Failed to lock recorder")?;
-    
-    if let Some(rec) = rec_guard.as_ref() {
-        // Fetch data from the active recorder
-        let duration = rec.get_record_time().as_secs_f64();
-        
-        // Retrieve live waveform data
-        // For efficiency, we can just grab the latest volume peak or a simple average
-        // (Assuming you update LiveWaveform to expose `current_rms` or similar)
-        // If LiveWaveform isn't ready, we return 0.0
-        
-        // NOTE: You might need to add a simple `get_latest_rms()` to your Recorder struct
-        // For now, let's return a placeholder if you haven't implemented RMS yet.
-        let current_rms = 0.5; // TODO: Fetch real RMS from rec.live_waveform
-        
-        Ok(RecordingState {
-            is_recording: true,
-            duration,
-            current_rms,
-        })
-    } else {
-        Ok(RecordingState {
-            is_recording: false,
-            duration: 0.0,
-            current_rms: 0.0,
-        })
-    }
-}
+
 
 #[tauri::command]
 fn seek(pos: f64, state: State<AppState>) -> Result<(), String> {
@@ -473,6 +481,7 @@ fn main() {
             create_track,
             get_position,
             start_recording,
+            toggle_monitor_cmd,
             stop_recording,
             get_recording_status,
             set_bpm,
