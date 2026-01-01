@@ -1,134 +1,232 @@
 <!-- haven\src\lib\components\Timeline.svelte -->
 <script lang="ts">
-  import { createEventDispatcher } from 'svelte';
-  import { ZoomIn, ZoomOut } from 'lucide-svelte';
-  import { invoke } from '@tauri-apps/api/core';
-  import DraggableTrackItem from './DraggableTrackItem.svelte';
+    import { createEventDispatcher } from 'svelte';
+    import { ZoomIn, ZoomOut } from 'lucide-svelte';
+    import { invoke } from '@tauri-apps/api/core';
+    import DraggableTrackItem from './DraggableTrackItem.svelte';
+    import ContextMenu from './ContextMenu.svelte';
 
-  const dispatch = createEventDispatcher();
+    const dispatch = createEventDispatcher();
 
-  let { tracks = [], currentTime = 0, bpm = 120 } = $props();
+    let { tracks = $bindable([]), currentTime = 0, bpm = 120 } = $props();
 
-  const PIXELS_PER_SECOND = 50; 
+    const PIXELS_PER_SECOND = 50; 
 
-  interface GridLineData {
-      time: number;
-      is_bar_start: boolean;
-      bar_number: number;
-  }
+    interface GridLineData {
+        time: number;
+        is_bar_start: boolean;
+        bar_number: number;
+    }
+
+    let zoomMultiplier = $state(1); 
+    let gridLines: GridLineData[] = $state([]); 
+
+    let rulerContainer: HTMLDivElement;
+    let trackContainer: HTMLDivElement;
+    let containerWidth = $state(0);
+
+    // --- PLAYHEAD DRAG STATE ---
+    let isScrubbing = false;
+
+    // --- GRID ENGINE ---
+    async function updateGrid() {
+        if (!trackContainer || containerWidth === 0) return;
+
+        const resolution = zoomMultiplier >= 0.67 ? 4 : 1;
+        const scrollPx = trackContainer.scrollLeft;
+        const startTime = Math.max(0, (scrollPx / zoomMultiplier / PIXELS_PER_SECOND) - 5);
+        const endTime = ((scrollPx + containerWidth) / zoomMultiplier / PIXELS_PER_SECOND) + 5;
+
+        try {
+            gridLines = await invoke<GridLineData[]>('get_grid_lines', { 
+                start: startTime, 
+                end: endTime, 
+                resolution: resolution 
+            });
+        } catch (e) {
+            console.error("Grid error:", e);
+        }
+    }
+
+    function handleScroll() {
+        if (rulerContainer && trackContainer) {
+            rulerContainer.scrollLeft = trackContainer.scrollLeft;
+            updateGrid(); 
+        }
+    }
+
+    $effect(() => {
+        if (zoomMultiplier || bpm || containerWidth || tracks) {
+            updateGrid();
+            if (rulerContainer && trackContainer) {
+                rulerContainer.scrollLeft = trackContainer.scrollLeft;
+            }
+        }
+    });
+
+    let maxDurationSeconds = $derived(
+      Math.max(...tracks.map((t: any) => (t.startTime || 0) + (t.duration || 0)), 300)
+    );
+
+    function zoomIn() { zoomMultiplier = Math.min(zoomMultiplier * 1.5, 8); }
+    function zoomOut() { zoomMultiplier = Math.max(zoomMultiplier / 1.5, 0.2); }
+
+    // --- SEEKING LOGIC ---
+
+    // 1. Click on Ruler (Jump)
+    function handleRulerClick(event: MouseEvent) {
+        if (!rulerContainer) return;
+        const rect = rulerContainer.getBoundingClientRect();
+        const clickX = event.clientX - rect.left + rulerContainer.scrollLeft;
+        const time = clickX / (PIXELS_PER_SECOND * zoomMultiplier);
+
+        dispatch('seek', Math.max(0, time));
+    }
+
+    // 2. Drag Playhead (Scrub)
+    function startScrub(event: MouseEvent) {
+        event.preventDefault();
+        isScrubbing = true;
+    }
+
+    function onScrubMove(event: MouseEvent) {
+        if (!isScrubbing || !trackContainer) return;
+
+        const rect = trackContainer.getBoundingClientRect();
+        // Calculate time based on mouse position relative to the scrolling container
+        const offsetX = event.clientX - rect.left + trackContainer.scrollLeft;
+        const time = Math.max(0, offsetX / (PIXELS_PER_SECOND * zoomMultiplier));
+
+        // Dispatch immediately for smooth UI updates (optional: throttle this if backend lags)
+        dispatch('seek', time);
+    }
+
+    function stopScrub() {
+        isScrubbing = false;
+    }
+
+    function handleTrackClick(trackId: number) {
+        dispatch('select', trackId);
+    }
+
+      // --- CONTEXT MENU STATE ---
+    let showMenu = $state(false);
+    let menuPos = $state({ x: 0, y: 0 });
+    let activeContext = $state<{ trackIndex: number } | null>(null);
+
+    function handleClipContextMenu(event: CustomEvent, trackIndex: number, clipIndex: number) {
+        const { x, y } = event.detail;
+        // We only store the trackIndex. We will use 'currentTime' (Playhead) for the split.
+        activeContext = { trackIndex };
+        menuPos = { x, y }; 
+        showMenu = true;
+    }
+
+    // --- CORE: Optimistic Split Logic ---
+    async function executeSplit(trackIndex: number, splitTime: number) {
+    if (trackIndex < 0 || trackIndex >= tracks.length) return;
+    const track = tracks[trackIndex];
+        
+    const clipIndex = track.clips.findIndex((c: any) =>
+      splitTime >= c.startTime && splitTime < c.startTime + c.duration
+    );
+    if (clipIndex === -1) return;
+        
+    const original = track.clips[clipIndex];
+    const relative = splitTime - original.startTime;
+        
+    // Prevent edge splits (0 duration clips)
+    if (relative <= 0.001 || relative >= original.duration - 0.001) return;
+        
+    const leftClip = { ...original, duration: relative };
+    const rightClip = {
+      ...original,
+      id: `clip-${Date.now()}-split`,
+      startTime: splitTime,
+      offset: (original.offset ?? 0) + relative,
+      duration: original.duration - relative
+    };
   
-  let zoomMultiplier = $state(1); 
-  let gridLines: GridLineData[] = $state([]); 
+    // Replace original with left, insert right after it
+    track.clips.splice(clipIndex, 1, leftClip, rightClip);
   
-  let rulerContainer: HTMLDivElement;
-  let trackContainer: HTMLDivElement;
-  let containerWidth = $state(0);
+    // Force reactivity
+    tracks = [...tracks];
+  
+    try {
+      await invoke("split_clip", { trackIndex, time: splitTime });
+    } catch (e) {
+      console.error("Backend split failed", e);
+      // Optional: refresh from backend state if you want to rollback safely
+    }
+    }
+    
 
-  // --- PLAYHEAD DRAG STATE ---
-  let isScrubbing = false;
+    // --- KEYBOARD SHORTCUT (S Key) ---
+    function handleKeyDown(e: KeyboardEvent) {
+      const el = e.target as HTMLElement | null;
+      const typing =
+        el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+      if (typing) return;
 
-  // --- GRID ENGINE ---
-  async function updateGrid() {
-      if (!trackContainer || containerWidth === 0) return;
-
-      const resolution = zoomMultiplier >= 0.67 ? 4 : 1;
-      const scrollPx = trackContainer.scrollLeft;
-      const startTime = Math.max(0, (scrollPx / zoomMultiplier / PIXELS_PER_SECOND) - 5);
-      const endTime = ((scrollPx + containerWidth) / zoomMultiplier / PIXELS_PER_SECOND) + 5;
-
-      try {
-          gridLines = await invoke<GridLineData[]>('get_grid_lines', { 
-              start: startTime, 
-              end: endTime, 
-              resolution: resolution 
-          });
-      } catch (e) {
-          console.error("Grid error:", e);
+      if (e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        e.stopPropagation();
+        tracks.forEach((t: any, idx: number) => {
+          const hasClip = t.clips.some((c: any) => currentTime >= c.startTime && currentTime < c.startTime + c.duration);
+          if (hasClip) executeSplit(idx, currentTime);
+        });
       }
-  }
+    }
 
-  function handleScroll() {
-      if (rulerContainer && trackContainer) {
-          rulerContainer.scrollLeft = trackContainer.scrollLeft;
-          updateGrid(); 
-      }
-  }
 
-  $effect(() => {
-      if (zoomMultiplier || bpm || containerWidth || tracks) {
-          updateGrid();
-          if (rulerContainer && trackContainer) {
-              rulerContainer.scrollLeft = trackContainer.scrollLeft;
-          }
-      }
-  });
+    // --- CONTEXT MENU ACTION ---
+    async function performSplit() {
+        if (!activeContext) return;
+        const { trackIndex } = activeContext;
 
-  let maxDurationSeconds = $derived(
-    Math.max(...tracks.map((t: any) => (t.startTime || 0) + (t.duration || 0)), 300)
-  );
+        // FIX: Always use 'currentTime' (Playhead Position), ignore mouse click time.
+        await executeSplit(trackIndex, currentTime);
 
-  function zoomIn() { zoomMultiplier = Math.min(zoomMultiplier * 1.5, 8); }
-  function zoomOut() { zoomMultiplier = Math.max(zoomMultiplier / 1.5, 0.2); }
+        showMenu = false;
+    }
 
-  // --- SEEKING LOGIC ---
+    async function handleClipMove(event: CustomEvent, clipIndex:number) {
+        const { trackId, newStartTime } = event.detail;
 
-  // 1. Click on Ruler (Jump)
-  function handleRulerClick(event: MouseEvent) {
-      if (!rulerContainer) return;
-      const rect = rulerContainer.getBoundingClientRect();
-      const clickX = event.clientX - rect.left + rulerContainer.scrollLeft;
-      const time = clickX / (PIXELS_PER_SECOND * zoomMultiplier);
-      
-      dispatch('seek', Math.max(0, time));
-  }
+        console.log(`🎵 Moving Track ${trackId} to ${newStartTime.toFixed(2)}s`);
 
-  // 2. Drag Playhead (Scrub)
-  function startScrub(event: MouseEvent) {
-      event.preventDefault();
-      isScrubbing = true;
-  }
-
-  function onScrubMove(event: MouseEvent) {
-      if (!isScrubbing || !trackContainer) return;
-      
-      const rect = trackContainer.getBoundingClientRect();
-      // Calculate time based on mouse position relative to the scrolling container
-      const offsetX = event.clientX - rect.left + trackContainer.scrollLeft;
-      const time = Math.max(0, offsetX / (PIXELS_PER_SECOND * zoomMultiplier));
-      
-      // Dispatch immediately for smooth UI updates (optional: throttle this if backend lags)
-      dispatch('seek', time);
-  }
-
-  function stopScrub() {
-      isScrubbing = false;
-  }
-
-  function handleTrackClick(trackId: number) {
-      dispatch('select', trackId);
-  }
-
-  async function handleClipMove(event: CustomEvent, clipIndex:number) {
-      const { trackId, newStartTime } = event.detail;
-      
-      console.log(`🎵 Moving Track ${trackId} to ${newStartTime.toFixed(2)}s`);
-
-      try {
-          // Backend uses 0-based index, frontend uses 1-based ID
-          // Ensure this matches your logic (track.id - 1)
-          await invoke('move_clip', { 
-              trackIndex: trackId - 1, 
-              clipIndex: clipIndex,
-              newTime: newStartTime 
-          });
-      } catch (e) {
-          console.error("Failed to move clip:", e);
-      }
-  }
+        try {
+            // Backend uses 0-based index, frontend uses 1-based ID
+            // Ensure this matches your logic (track.id - 1)
+            await invoke('move_clip', { 
+                trackIndex: trackId - 1, 
+                clipIndex: clipIndex,
+                newTime: newStartTime 
+            });
+        } catch (e) {
+            console.error("Failed to move clip:", e);
+        }
+    }
 
 </script>
 
-<svelte:window onmousemove={onScrubMove} onmouseup={stopScrub} />
+<svelte:window onmousemove={onScrubMove} onmouseup={stopScrub} on:keydown={handleKeyDown}/>
+{#if showMenu}
+    <ContextMenu 
+        x={menuPos.x} 
+        y={menuPos.y} 
+        onClose={() => showMenu = false}
+        options={[
+            { 
+                label: 'Split Clip', 
+                action: performSplit 
+            },
+            // You can add Delete here easily later:
+            // { label: 'Delete', danger: true, action: performDelete }
+        ]}
+    />
+{/if}
 
 <div class="flex-1 h-full relative flex flex-col bg-[#13131f]/90 backdrop-blur-md overflow-hidden select-none">
   
@@ -196,19 +294,19 @@
                     tabindex="0"
                 >    
                     <div class={`absolute inset-0 transition-colors duration-300 ${track.color}`} style={`opacity: ${track.isRecording ? 0.08 : 0};`}></div>
-                    {#each track.clips as clip, clipIndex}
-                        <DraggableTrackItem 
-                            bind:clip={tracks[trackIndex].clips[clipIndex]} 
-                            zoom={zoomMultiplier} 
-                            currentTime={currentTime}
-                            bpm={bpm}
-                            on:change={(e) => handleClipMove(e, clipIndex)} 
-                        />
-                    {/each}    
+                    {#each track.clips as clip, clipIndex (clip.id)}
+                      <DraggableTrackItem
+                        bind:clip={tracks[trackIndex].clips[clipIndex]}
+                        zoom={zoomMultiplier}
+                        {currentTime}
+                        {bpm}
+                        on:change={(e) => handleClipMove(e, clipIndex)}
+                        on:contextmenu={(e) => handleClipContextMenu(e, trackIndex, clipIndex)}
+                      />
+                    {/each}
                 </div>
             {/each}
         </div>
-
         <div 
             class="absolute top-0 bottom-0 w-4 -ml-2 z-30 cursor-ew-resize group flex justify-center"
             style="transform: translateX({currentTime * PIXELS_PER_SECOND * zoomMultiplier}px);"

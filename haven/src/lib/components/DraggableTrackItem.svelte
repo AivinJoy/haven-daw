@@ -69,6 +69,15 @@
     clip.startTime = newTime;
   }
 
+  function handleRightClick(e: MouseEvent) {
+        e.preventDefault(); // Stop browser menu
+        dispatch('contextmenu', {
+            x: e.clientX,
+            y: e.clientY,
+            // We can pass specific clip info if needed, 
+            // but the parent loop usually knows the index.
+        });
+  }
 
   async function handleMouseUp() {
     if (isDragging) {
@@ -99,6 +108,7 @@
         will-change: transform;
     "
     onmousedown={onMouseDown}
+    oncontextmenu={handleRightClick}
     role="button"
     tabindex="0"
 >
@@ -108,6 +118,7 @@
         currentTime={currentTime}
         startTime={clip.startTime || 0} 
         duration={clip.duration}
+        offset={clip.offset || 0}
         zoom={zoom} 
         name={clip.name}
      />

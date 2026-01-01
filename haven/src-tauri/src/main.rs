@@ -25,11 +25,90 @@ struct AppState {
 
 // --- 2. Define Return Struct ---
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ImportResult {
     mins: Vec<f32>,
     maxs: Vec<f32>,
     duration: f64,
+    bins_per_second: f64,
     bpm: Option<f32>, // New field for BPM
+}
+
+// Helper function to build the UI state from the raw track list
+fn build_ui_state(
+    app: &tauri::AppHandle, 
+    tracks_info: Vec<daw_modules::audio_runtime::FrontendTrackInfo>,
+    bpm: f32,
+    master_gain: f32
+) -> Result<ProjectState, String> {
+    
+    let mut results = Vec::new();
+    let colors = [
+        "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
+        "bg-emerald-500", "bg-orange-500", "bg-pink-500",
+        "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
+    ];
+
+    for (i, info) in tracks_info.iter().enumerate() {
+        let track_id = info.id + 1; // Frontend uses 1-based ID
+        let color = colors[i % colors.len()].to_string();
+        
+        let mut loaded_clips = Vec::new();
+
+        for (j, clip_info) in info.clips.iter().enumerate() {
+            // Emit progress event
+            let _ = app.emit("load-progress", format!("Analyzing Track {} Clip {}", track_id, j + 1));
+
+            // Decode Audio for Waveform
+            // Note: In a real app, you might want to cache this to avoid re-analyzing unchanged clips
+            let (samples, sr, channels) = daw_modules::bpm::adapter::decode_to_vec(&clip_info.path)
+                .map_err(|e| format!("Failed to decode {}: {}", clip_info.path, e))?;
+            
+            let wf = Waveform::build_from_samples(&samples, sr, channels, 512);
+            let pixels_per_second = 100.0;
+            let spp = (sr as f64) / pixels_per_second;
+            let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
+
+            let clip_id = format!("clip_{}_{}", track_id, j);
+            let clip_name = std::path::Path::new(&clip_info.path)
+                .file_name().unwrap_or_default().to_string_lossy().to_string();
+
+            loaded_clips.push(LoadedClip {
+                id: clip_id,
+                track_id,
+                name: clip_name,
+                path: clip_info.path.clone(),
+                start_time: clip_info.start_time,
+                duration: clip_info.duration, 
+                offset: clip_info.offset,
+                color: color.clone(),
+                waveform: ImportResult {
+                    mins: mins.to_vec(),
+                    maxs: maxs.to_vec(),
+                    duration: wf.duration_secs,
+                    bins_per_second: pixels_per_second,
+                    bpm: None,
+                },
+            });
+        }
+
+        results.push(LoadedTrack {
+            id: track_id,
+            name: info.name.clone(),
+            color,
+            clips: loaded_clips,
+            gain: info.gain,
+            pan: info.pan,
+            muted: info.muted,
+            solo: info.solo
+        });
+    }
+    
+    Ok(ProjectState {
+        tracks: results,
+        bpm,
+        master_gain,
+    })
 }
 
 // --- 3. Commands ---
@@ -98,6 +177,8 @@ fn import_track(path: String, state: State<AppState>) -> Result<ImportResult, St
         mins: mins.to_vec(),
         maxs: maxs.to_vec(),
         duration: wf.duration_secs,
+        bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
+
         bpm: detected_bpm,
     })
 }
@@ -125,6 +206,7 @@ fn analyze_file(path: String) -> Result<ImportResult, String> {
         mins: mins.to_vec(),
         maxs: maxs.to_vec(),
         duration: wf.duration_secs,
+        bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
         bpm: detected_bpm,
     })
 }
@@ -304,6 +386,45 @@ fn create_track(state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn split_clip(
+    track_index: usize, 
+    time: f64, 
+    state: State<AppState>
+) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
+    
+    // Frontend uses 1-based track IDs usually? 
+    // If your frontend passes the array index (0-based), keep as is.
+    // If frontend passes ID (1, 2...), subtract 1.
+    // Based on 'move_clip' in your file, it seems direct mapping or handled there.
+    // Let's assume track_index matches the Vec index.
+    
+    audio.split_clip(track_index, time).map_err(|e| e.to_string())?;
+    
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_project_state(
+    app: tauri::AppHandle, 
+    state: State<'_, AppState>
+) -> Result<ProjectState, String> {
+    
+    // 1. Fetch Data from Memory (NO Disk I/O)
+    let audio_runtime = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    
+    let bpm = audio_runtime.bpm();
+    let master_gain = audio_runtime.master_gain();
+    let tracks_info = audio_runtime.get_tracks_list();
+    drop(audio_runtime); // Release lock
+
+    // 2. Build UI State (Reuse Helper)
+    let state = build_ui_state(&app, tracks_info, bpm, master_gain)?;
+
+    Ok(state)
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LoadedClip {
@@ -356,104 +477,26 @@ fn export_project(path: String, state: State<AppState>) -> Result<(), String> {
 async fn load_project(
     app: tauri::AppHandle, 
     path: String, 
-    state: State<'_, AppState>, // <--- FIX: Added <'_, ...>
+    state: State<'_, AppState>,
 ) -> Result<ProjectState, String> {
     
-    // We clone the inner Runtime so we don't hold the State lock across await points
-    // (This is a best practice in async Rust to prevent deadlocks)
+    // 1. Perform the Load (Disk I/O)
     let audio_runtime = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-
     audio_runtime.load_project(path.clone())?;
 
+    // 2. Fetch Data from Memory
     let bpm = audio_runtime.bpm();
     let master_gain = audio_runtime.master_gain();
-    
-    // A. Restore Backend State
-    // Note: Since load_project is blocking, we wrap it if we want true non-blocking,
-    // but for now, just calling it here is fine since we are in an async command.
-    
-    // B. Fetch the list of tracks now in the engine
     let tracks_info = audio_runtime.get_tracks_list();
-    
-    // Drop the lock here so we don't hold it while doing the heavy loop below
-    drop(audio_runtime); 
+    drop(audio_runtime); // Release lock
 
-    let mut results = Vec::new();
-    let _total = tracks_info.len();
+    // 3. Build UI State (Reuse Helper)
+    let state = build_ui_state(&app, tracks_info, bpm, master_gain)?;
 
-    let colors = [
-        "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
-        "bg-emerald-500", "bg-orange-500", "bg-pink-500"
-    ];
-
-    // C. Re-Analyze Audio for Visualization
-    for (i, info) in tracks_info.iter().enumerate() {
-        let track_id = info.id + 1; // Frontend uses 1-based ID
-        let color = colors[i % colors.len()].to_string();
-        
-        let mut loaded_clips = Vec::new();
-
-        // 4. Process Clips within the Track
-        for (j, clip_info) in info.clips.iter().enumerate() {
-            // Update progress
-            let _ = app.emit("load-progress", format!("Analyzing Track {} Clip {}", track_id, j + 1));
-
-            // Decode Audio for Waveform
-            let (samples, sr, channels) = bpm::adapter::decode_to_vec(&clip_info.path)
-                .map_err(|e| format!("Failed to decode {}: {}", clip_info.path, e))?;
-            
-            let wf = Waveform::build_from_samples(&samples, sr, channels, 512);
-            let pixels_per_second = 100.0;
-            let spp = (sr as f64) / pixels_per_second;
-            let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
-
-            // Generate a unique ID for the UI
-            let clip_id = format!("clip_{}_{}", track_id, j);
-            let clip_name = std::path::Path::new(&clip_info.path)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            loaded_clips.push(LoadedClip {
-                id: clip_id,
-                track_id,
-                name: clip_name,
-                path: clip_info.path.clone(),
-                start_time: clip_info.start_time,
-                duration: wf.duration_secs, // Use actual decoded duration
-                offset: clip_info.offset,
-                color: color.clone(),
-                waveform: ImportResult {
-                    mins: mins.to_vec(),
-                    maxs: maxs.to_vec(),
-                    duration: wf.duration_secs,
-                    bpm: None,
-                },
-            });
-        }
-
-        results.push(LoadedTrack {
-            id: track_id,
-            name: info.name.clone(),
-            color,
-            clips: loaded_clips, // Pass the array of clips
-            gain: info.gain,
-            pan: info.pan,
-            muted: info.muted,
-            solo: info.solo
-        });
-    }
-    
-    // Finish
     let _ = app.emit("load-percent", 100.0);
     let _ = app.emit("load-progress", "Ready");
-    
-    Ok(ProjectState {
-        tracks: results,
-        bpm,
-        master_gain,
-    })
+
+    Ok(state)
 }
 // Add these to the invoke_handler list!
 #[tauri::command]
@@ -497,7 +540,9 @@ fn main() {
             load_project,
             export_project,
             get_temp_path,
-            add_clip
+            add_clip,
+            split_clip,
+            get_project_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

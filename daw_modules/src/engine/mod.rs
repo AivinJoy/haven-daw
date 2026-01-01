@@ -87,6 +87,17 @@ impl Engine {
         &self.tracks
     }
 
+    pub fn split_clip(&mut self, track_index: usize, time_secs: f64) -> anyhow::Result<()> {
+        let split_time = Duration::from_secs_f64(time_secs);
+        
+        if let Some(track) = self.tracks.get_mut(track_index) {
+             track.split_at_time(split_time, self.sample_rate, self.channels)?;
+             Ok(())
+        } else {
+            Err(anyhow::anyhow!("Track not found"))
+        }
+    }
+
     pub fn tracks_mut(&mut self) -> &mut [Track] {
         &mut self.tracks
     }

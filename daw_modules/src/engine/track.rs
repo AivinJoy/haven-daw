@@ -125,7 +125,10 @@ pub struct Clip {
     pub path: String,
     pub start_time: Duration, // Position on timeline
     pub offset: Duration,     // Start offset in the file (trimming)
-    pub duration: Duration,   // Duration on timeline
+    pub duration: Duration,
+     pub source_duration: Duration, // full file length (never changes)
+    pub source_sr: u32,
+    pub source_ch: usize,   // Duration on timeline
     decoder: DecoderHandle,
 }
 
@@ -168,8 +171,50 @@ impl Clip {
             start_time,
             offset: Duration::ZERO,
             duration, // <--- FIX: Use Actual Duration
+            source_duration: duration,
+            source_sr: source_sr,
+            source_ch: source_ch,
             decoder,
         })
+    }
+
+    pub fn new_known(
+        path: String, 
+        start_time: Duration, 
+        offset: Duration,
+        duration: Duration,          // timeline length
+        source_duration: Duration,   // full file length
+        source_sr: u32,
+        source_ch: usize,
+        output_sr: u32, 
+        output_ch: usize
+    ) -> anyhow::Result<Self> {
+        
+        // Create Decoder immediately (IO cost is low compared to decoding)
+        let decoder = DecoderHandle::new_for_engine(
+            path.clone(), 
+            source_ch, 
+            output_ch, 
+            source_sr, 
+            output_sr
+        )?;
+
+        // If the clip has an offset, we must seek the decoder so it's ready to play
+        let mut clip = Self {
+            path,
+            start_time,
+            offset,
+            duration,
+            source_duration,
+            source_sr,
+            source_ch,
+            decoder,
+        };
+        
+        // Ensure the decoder internal buffer is at the right spot
+        clip.seek(start_time);
+
+        Ok(clip)
     }
 
     pub fn set_playing(&self, playing: bool) {
@@ -177,21 +222,23 @@ impl Clip {
     }
 
     pub fn seek(&mut self, global_pos: Duration) {
-        if global_pos >= self.start_time {
-            let offset_into_clip = global_pos - self.start_time + self.offset;
-            
-            // --- FIX: Guard against seeking past the end of the file ---
-            if offset_into_clip > self.duration {
-                // We are past the end of the clip. Do nothing.
-                return;
-            }
-            // -----------------------------------------------------------
-
-            self.decoder.seek(offset_into_clip);
+        // Source-file playback position (seconds into the original file)
+        let file_pos = if global_pos >= self.start_time {
+            global_pos - self.start_time + self.offset
         } else {
-            self.decoder.seek(self.offset);
+            self.offset
+        };
+
+        // Guard against seeking past end of the *source file*.
+        // NOTE: This requires you to store the full source duration in the Clip.
+        // If you don't have it yet, temporarily remove this guard.
+        if file_pos >= self.source_duration {
+            return;
         }
+
+        self.decoder.seek(file_pos);
     }
+
 }
 
 /// A single audio track in the engine.
@@ -279,6 +326,58 @@ impl Track {
     pub fn is_playing(&self) -> bool {
         matches!(self.state, TrackState::Playing)
     }
+
+    pub fn split_at_time(
+        &mut self,
+        split_time: Duration,
+        output_sr: u32,
+        output_ch: usize
+    ) -> anyhow::Result<()> {
+
+        let split_secs = split_time.as_secs_f64();
+
+        // Find the index first so we can insert next to it
+
+        for (i, clip) in self.clips.iter_mut().enumerate() {
+            let start = clip.start_time.as_secs_f64();
+            let end = start + clip.duration.as_secs_f64();
+
+            if split_secs > start && split_secs < end {
+
+                let relative_split_secs = split_secs - start;
+                let relative_split = Duration::from_secs_f64(relative_split_secs);
+
+                let right_start = split_time;
+                let right_offset = clip.offset + relative_split;
+                let right_duration = clip.duration - relative_split;
+
+                // Left side becomes shorter on the timeline
+                clip.duration = relative_split;
+
+                let new_clip = Clip::new_known(
+                    clip.path.clone(),
+                    right_start,
+                    right_offset,
+                    right_duration,
+                    clip.source_duration,
+                    clip.source_sr,
+                    clip.source_ch,
+                    output_sr,
+                    output_ch
+                )?;
+
+                // IMPORTANT: preserve full file duration + metadata
+                // If your new_known doesn't set these yet, update it to do so.
+                self.clips.insert(i + 1, new_clip);
+
+                println!("✂️ Split successful @ {:.2}s", split_secs);
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
 
     pub fn move_clip(&mut self, clip_index: usize, new_start: Duration) {
         if let Some(clip) = self.clips.get_mut(clip_index) {
