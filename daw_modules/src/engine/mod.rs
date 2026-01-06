@@ -98,6 +98,15 @@ impl Engine {
         }
     }
 
+    pub fn merge_clip_with_next(&mut self, track_index: usize, clip_index: usize) -> anyhow::Result<()> {
+    if let Some(track) = self.tracks.get_mut(track_index) {
+        track.merge_next(clip_index)
+    } else {
+        Err(anyhow::anyhow!("Track not found"))
+    }
+}
+
+
     pub fn tracks_mut(&mut self) -> &mut [Track] {
         &mut self.tracks
     }

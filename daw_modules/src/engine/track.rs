@@ -254,6 +254,38 @@ pub struct Track {
     // --- Track Start Time (for Drag & Drop) ---
 }
 
+fn apply_edge_fades(
+    buf: &mut [f32],
+    frames: usize,
+    channels: usize,
+    fade_frames: usize,
+    fade_in: bool,
+    fade_out: bool,
+) {
+    if fade_frames == 0 || frames == 0 { return; }
+
+    for f in 0..frames {
+        let mut g = 1.0f32;
+
+        if fade_in {
+            let gi = (f as f32 / fade_frames as f32).clamp(0.0, 1.0);
+            g = g.min(gi);
+        }
+
+        if fade_out {
+            let rem = (frames - 1).saturating_sub(f);
+            let go = (rem as f32 / fade_frames as f32).clamp(0.0, 1.0);
+            g = g.min(go);
+        }
+
+        let base = f * channels;
+        for c in 0..channels {
+            buf[base + c] *= g;
+        }
+    }
+}
+
+
 impl Track {
     /// `engine_sample_rate` and `engine_channels` should match the output device.
     pub fn new(
@@ -326,6 +358,47 @@ impl Track {
     pub fn is_playing(&self) -> bool {
         matches!(self.state, TrackState::Playing)
     }
+
+    pub fn merge_next(&mut self, clip_index: usize) -> anyhow::Result<()> {
+       if clip_index + 1 >= self.clips.len() {
+           return Err(anyhow::anyhow!("No next clip to merge"));
+       }
+    
+       let eps = 0.001; // 1ms tolerance
+    
+       let left = &self.clips[clip_index];
+       let right = &self.clips[clip_index + 1];
+    
+       let left_start = left.start_time.as_secs_f64();
+       let left_dur = left.duration.as_secs_f64();
+       let left_end = left_start + left_dur;
+       let right_start = right.start_time.as_secs_f64();
+    
+       // Must touch on timeline
+       if (right_start - left_end).abs() > eps {
+           return Err(anyhow::anyhow!("Clips are not adjacent on the timeline"));
+       }
+    
+       // Must be same source file
+       if left.path != right.path {
+           return Err(anyhow::anyhow!("Clips have different source paths"));
+       }
+    
+       // Must be contiguous in source file
+       let left_src_end = (left.offset + left.duration).as_secs_f64();
+       let right_src_start = right.offset.as_secs_f64();
+       if (right_src_start - left_src_end).abs() > eps {
+           return Err(anyhow::anyhow!("Clips are not contiguous in source"));
+       }
+    
+       // Apply merge: extend left, remove right
+       let right_duration = self.clips[clip_index + 1].duration;
+       self.clips[clip_index].duration += right_duration;
+       self.clips.remove(clip_index + 1);
+    
+       Ok(())
+    }
+
 
     pub fn split_at_time(
         &mut self,
@@ -446,12 +519,42 @@ impl Track {
             let mix_dst = &mut dst[(offset_frames * channels)..];
             let frames_to_mix = mix_dst.len() / channels;
 
+            let fade_frames = ((sample_rate as f32) * 0.005) as usize; // 5ms
+
             if is_audible {
-                clip.decoder.mix_interleaved(mix_dst, frames_to_mix, channels);
-                active_clips += 1;
+                // Render clip audio into a temp buffer first
+                let mut temp = vec![0.0f32; frames_to_mix * channels];
+                let written = clip.decoder.mix_interleaved(&mut temp, frames_to_mix, channels);
+            
+                if written > 0 {
+                    // Detect whether this engine block contains the clip start or end
+                    let start_edge_in_block = start_secs < clip_start && end_secs > clip_start;
+                    let end_edge_in_block = start_secs < clip_end && end_secs > clip_end;
+                
+                    // Apply fades only if we are near an edge
+                    if fade_frames > 0 && (start_edge_in_block || end_edge_in_block) {
+                        apply_edge_fades(
+                            &mut temp,
+                            written,
+                            channels,
+                            fade_frames.max(1),
+                            start_edge_in_block,
+                            end_edge_in_block,
+                        );
+                    }
+                
+                    // Mix into the track buffer at the correct offset
+                    let samples = written * channels;
+                    for i in 0..samples {
+                        mix_dst[i] += temp[i];
+                    }
+                
+                    active_clips += 1;
+                }
             } else {
                 clip.decoder.consume(frames_to_mix, channels);
             }
+
         }
 
         // Apply Gain/Pan only if we actually mixed something

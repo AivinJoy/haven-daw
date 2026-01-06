@@ -112,12 +112,13 @@
       // --- CONTEXT MENU STATE ---
     let showMenu = $state(false);
     let menuPos = $state({ x: 0, y: 0 });
-    let activeContext = $state<{ trackIndex: number } | null>(null);
+    let activeContext = $state<{ trackIndex: number; clipIndex: number } | null>(null);
+
 
     function handleClipContextMenu(event: CustomEvent, trackIndex: number, clipIndex: number) {
         const { x, y } = event.detail;
         // We only store the trackIndex. We will use 'currentTime' (Playhead) for the split.
-        activeContext = { trackIndex };
+        activeContext = { trackIndex, clipIndex };
         menuPos = { x, y }; 
         showMenu = true;
     }
@@ -191,6 +192,62 @@
         showMenu = false;
     }
 
+    async function executeMergeNext(trackIndex: number, clipIndex: number) {
+      const t = tracks[trackIndex];
+      if (!t) return;
+        
+      const left = t.clips?.[clipIndex];
+      const right = t.clips?.[clipIndex + 1];
+      if (!left || !right) return;
+        
+      // Optimistic UI: extend left, remove right
+      const merged = { ...left, duration: (left.duration ?? 0) + (right.duration ?? 0) };
+      t.clips.splice(clipIndex, 2, merged);
+      tracks = [...tracks];
+        
+      try {
+        await invoke("merge_clip_with_next", { trackIndex, clipIndex });
+      } catch (e) {
+        console.error("Backend merge failed", e);
+        dispatch("refresh"); // rollback by reloading backend state only on error
+      }
+    }
+
+
+    async function performMergeNext() {
+      if (!activeContext) return;
+      const { trackIndex, clipIndex } = activeContext;
+
+      showMenu = false;
+      await executeMergeNext(trackIndex, clipIndex);
+    }
+
+
+    const EPS = 0.001;
+
+    function canMergeNext(ctx: { trackIndex: number; clipIndex: number } | null) {
+      if (!ctx) return false;
+
+      const t = tracks[ctx.trackIndex];
+      if (!t) return false;
+
+      const left = t.clips?.[ctx.clipIndex];
+      const right = t.clips?.[ctx.clipIndex + 1];
+      if (!left || !right) return false;
+
+      const leftEnd = (left.startTime ?? 0) + (left.duration ?? 0);
+
+      const adjacentTimeline = Math.abs((right.startTime ?? 0) - leftEnd) <= EPS;
+      const samePath = left.path === right.path;
+
+      const leftSrcEnd = (left.offset ?? 0) + (left.duration ?? 0);
+      const contiguousSource = Math.abs((right.offset ?? 0) - leftSrcEnd) <= EPS;
+
+      return adjacentTimeline && samePath && contiguousSource;
+    }
+
+
+
     async function handleClipMove(event: CustomEvent, clipIndex:number) {
         const { trackId, newStartTime } = event.detail;
 
@@ -213,19 +270,20 @@
 
 <svelte:window onmousemove={onScrubMove} onmouseup={stopScrub} on:keydown={handleKeyDown}/>
 {#if showMenu}
-    <ContextMenu 
-        x={menuPos.x} 
-        y={menuPos.y} 
-        onClose={() => showMenu = false}
-        options={[
-            { 
-                label: 'Split Clip', 
-                action: performSplit 
-            },
-            // You can add Delete here easily later:
-            // { label: 'Delete', danger: true, action: performDelete }
-        ]}
+    <ContextMenu
+      x={menuPos.x}
+      y={menuPos.y}
+      onClose={() => (showMenu = false)}
+      options={[
+        { label: "Split Clip", action: performSplit },
+        {
+          label: "Merge with next",
+          action: performMergeNext,
+          disabled: !canMergeNext(activeContext)
+        }
+      ]}
     />
+
 {/if}
 
 <div class="flex-1 h-full relative flex flex-col bg-[#13131f]/90 backdrop-blur-md overflow-hidden select-none">

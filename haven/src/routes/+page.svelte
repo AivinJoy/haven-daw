@@ -617,7 +617,7 @@
             bpm={bpm} 
             on:seek={(e) => seekTo(e.detail)}
             on:select={handleTrackSelect}
-            on:refresh={refreshProjectState} 
+            on:refresh={refreshProjectState}
         /> 
 
     </div>

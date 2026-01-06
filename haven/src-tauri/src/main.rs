@@ -294,7 +294,6 @@ fn stop_recording(state: State<AppState>) -> Result<(), String> {
 }
 
 
-
 #[tauri::command]
 fn seek(pos: f64, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
@@ -403,6 +402,12 @@ fn split_clip(
     audio.split_clip(track_index, time).map_err(|e| e.to_string())?;
     
     Ok(())
+}
+
+#[tauri::command]
+fn merge_clip_with_next(track_index: usize, clip_index: usize, state: State<AppState>) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
+    audio.merge_clip_with_next(track_index, clip_index).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -543,6 +548,7 @@ fn main() {
             add_clip,
             split_clip,
             get_project_state,
+            merge_clip_with_next
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
