@@ -298,6 +298,24 @@
         }
     }
 
+    async function handleDeleteTrack(event: CustomEvent<number>) {
+        const index = event.detail;
+        
+        // 1. Optimistic Update
+        tracks.splice(index, 1);
+        tracks = [...tracks]; // Trigger reactivity
+
+        // 2. Call Backend
+        try {
+            await invoke('delete_track', { trackIndex: index });
+            console.log("🗑️ Track deleted");
+        } catch (e) {
+            console.error("Failed to delete track:", e);
+            alert("Error deleting track: " + e);
+            refreshProjectState(); // Rollback/Sync on error
+        }
+    }
+
     // --- NEW HELPER: Exclusive Arming ---
     function armTrack(trackId: number) {
         // Set isRecording = true ONLY for the matching ID, false for everyone else
@@ -607,9 +625,12 @@
     />
 
     <div class="flex-1 flex overflow-hidden relative">
-        <TrackList {tracks} on:requestAdd={handleAddRequest}
+        <TrackList {tracks} 
+            on:requestAdd={handleAddRequest}
             on:select={handleTrackSelect}
-            on:toggleMonitor={handleToggleMonitor} />
+            on:toggleMonitor={handleToggleMonitor}
+            on:delete={handleDeleteTrack}
+        />
         
         <Timeline 
             bind:tracks={tracks} 

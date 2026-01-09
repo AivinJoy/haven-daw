@@ -17,7 +17,8 @@
     isRecording = false,
     source = 'media',
     monitor = false,
-    onmonitor = () => {}
+    onmonitor = () => {},
+    onmenu = (e: MouseEvent) => {}
   } = $props();
 
   // --- LOCAL STATE ---
@@ -164,7 +165,11 @@
             class={`w-6 h-6 rounded text-[9px] font-bold border transition-all ${solo ? 'bg-yellow-500/20 border-yellow-500 text-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.4)]' : 'border-white/10 text-white/40 hover:border-white/30 hover:text-white/70'}`}
         >S</button>
         
-        <button class="w-6 h-6 flex items-center justify-center text-white/20 hover:text-white transition-colors" aria-label="Track Settings">
+        <button 
+            onclick={(e) => onmenu(e)} 
+            class="w-6 h-6 flex items-center justify-center text-white/20 hover:text-white transition-colors" 
+            aria-label="Track Settings"
+        >
             <MoreVertical size={14} />
         </button>
     </div>

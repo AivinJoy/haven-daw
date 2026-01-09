@@ -181,6 +181,13 @@ impl AudioRuntime {
         Ok(())
     }
 
+    pub fn delete_track(&self, index: usize) -> anyhow::Result<()> {
+        if let Ok(mut eng) = self.engine.lock() {
+            eng.remove_track(index)?;
+        }
+        Ok(())
+    }
+
     // --- ADD THIS NEW METHOD ---
     pub fn create_empty_track(&self) -> anyhow::Result<()> {
         if let Ok(mut eng) = self.engine.lock() {

@@ -74,6 +74,15 @@ impl Engine {
         Ok(())
     }
 
+    pub fn remove_track(&mut self, index: usize) -> anyhow::Result<()> {
+        if index < self.tracks.len() {
+            self.tracks.remove(index);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Track index out of bounds"))
+        }
+    }
+
     // --- UPDATED: Wrapper for backward compatibility ---
     // Creates a track and adds the file as the first clip at 0.0s
     pub fn add_track(&mut self, path: String) -> anyhow::Result<TrackId> {

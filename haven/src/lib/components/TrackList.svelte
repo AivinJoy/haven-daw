@@ -2,12 +2,14 @@
 <script lang="ts">
   import { Plus } from 'lucide-svelte';
   import TrackControl from './TrackControl.svelte';
+  import ContextMenu from './ContextMenu.svelte';
   import { createEventDispatcher } from 'svelte';
-
+  
   const dispatch = createEventDispatcher<{
     requestAdd: null;        // No payload
     select: number;          // Payload is Track ID
     toggleMonitor: number;   // Payload is Track ID
+    delete: number;
   }>();
 
   // Receive tracks prop (bindable if you want the list itself to change, but usually internal props bind)
@@ -29,6 +31,27 @@
 
     dispatch('select', id);
   }
+
+  // --- MENU STATE ---
+  let showMenu = $state(false);
+  let menuPos = $state({ x: 0, y: 0 });
+  let activeTrackIndex = $state(-1);
+
+  function handleTrackMenu(e: MouseEvent, index: number) {
+      e.stopPropagation(); // Prevent track selection
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      menuPos = { x: e.clientX, y: e.clientY };
+      activeTrackIndex = index;
+      showMenu = true;
+  }
+
+  function handleDelete() {
+      if (activeTrackIndex !== -1) {
+          dispatch('delete', activeTrackIndex);
+      }
+      showMenu = false;
+  }
+
 </script>
 
 <div class="w-[320px] h-full flex flex-col border-r border-white/10 bg-[#0a0a0f]/60 backdrop-blur-xl relative z-10">
@@ -82,11 +105,26 @@
 
                 monitor={track.monitor}
                 onmonitor={() => dispatch('toggleMonitor', track.id)}
+                onmenu={(e: any) => handleTrackMenu(e, i)}
             />
         </div>
     {/each}
   </div>
 </div>
+{#if showMenu}
+    <ContextMenu
+        x={menuPos.x}
+        y={menuPos.y}
+        onClose={() => showMenu = false}
+        options={[
+            { 
+                label: "Delete Track", 
+                action: handleDelete, 
+                danger: true 
+            }
+        ]}
+    />
+{/if}
 
 <style>
     .scrollbar-hide::-webkit-scrollbar { display: none; }
