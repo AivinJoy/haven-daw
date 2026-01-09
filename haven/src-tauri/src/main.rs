@@ -411,6 +411,16 @@ fn merge_clip_with_next(track_index: usize, clip_index: usize, state: State<AppS
 }
 
 #[tauri::command]
+fn delete_clip(
+    track_index: usize, 
+    clip_index: usize, 
+    state: State<AppState>
+) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
+    audio.delete_clip(track_index, clip_index).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn get_project_state(
     app: tauri::AppHandle, 
     state: State<'_, AppState>
@@ -548,7 +558,8 @@ fn main() {
             add_clip,
             split_clip,
             get_project_state,
-            merge_clip_with_next
+            merge_clip_with_next,
+            delete_clip
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

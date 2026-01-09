@@ -173,10 +173,21 @@
       if (e.key.toLowerCase() === "s") {
         e.preventDefault();
         e.stopPropagation();
-        tracks.forEach((t: any, idx: number) => {
-          const hasClip = t.clips.some((c: any) => currentTime >= c.startTime && currentTime < c.startTime + c.duration);
-          if (hasClip) executeSplit(idx, currentTime);
-        });
+        
+        // 1. Find the currently selected (armed) track index
+        const selectedIdx = tracks.findIndex((t: any) => t.isRecording);
+        
+        // 2. Only split if a track is selected and has a valid clip at the playhead
+        if (selectedIdx !== -1) {
+             const t = tracks[selectedIdx];
+             const hasClip = t.clips.some((c: any) => currentTime >= c.startTime && currentTime < c.startTime + c.duration);
+             
+             if (hasClip) {
+                 executeSplit(selectedIdx, currentTime);
+             }
+        } else {
+            console.warn("No track selected for splitting. Click a track header to select it.");
+        }
       }
     }
 
@@ -220,6 +231,28 @@
 
       showMenu = false;
       await executeMergeNext(trackIndex, clipIndex);
+    }
+
+    // --- NEW: Delete Logic ---
+    async function performDelete() {
+        if (!activeContext) return;
+        const { trackIndex, clipIndex } = activeContext;
+
+        // 1. Optimistic UI Update
+        if (tracks[trackIndex] && tracks[trackIndex].clips) {
+            tracks[trackIndex].clips.splice(clipIndex, 1);
+            tracks = [...tracks]; // Trigger Reactivity
+        }
+        
+        showMenu = false;
+
+        // 2. Sync with Backend
+        try {
+            await invoke('delete_clip', { trackIndex, clipIndex });
+        } catch (e) {
+            console.error("Failed to delete clip:", e);
+            dispatch("refresh"); // Fallback: reload state from backend on error
+        }
     }
 
 
@@ -275,11 +308,20 @@
       y={menuPos.y}
       onClose={() => (showMenu = false)}
       options={[
-        { label: "Split Clip", action: performSplit },
+        { label: "Split Clip",
+          action: performSplit 
+        },
+
         {
           label: "Merge with next",
           action: performMergeNext,
           disabled: !canMergeNext(activeContext)
+        },
+        // NEW: Delete Option
+        { 
+          label: "Delete Clip", 
+          action: performDelete, 
+          danger: true 
         }
       ]}
     />

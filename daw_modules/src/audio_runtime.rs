@@ -385,6 +385,12 @@ impl AudioRuntime {
        Ok(())
     }
 
+    pub fn delete_clip(&self, track_index: usize, clip_index: usize) -> anyhow::Result<()> {
+        if let Ok(mut eng) = self.engine.lock() {
+            eng.delete_clip(track_index, clip_index)?;
+        }
+        Ok(())
+    }
 
     // FIX: Corrected Reset Methods (No Delta, Just Reset)
     pub fn reset_track_gain(&self, track_index: usize) {

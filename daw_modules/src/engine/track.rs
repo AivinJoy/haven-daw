@@ -461,6 +461,16 @@ impl Track {
         }
     }
 
+    pub fn delete_clip(&mut self, clip_index: usize) -> anyhow::Result<()> {
+        if clip_index < self.clips.len() {
+            self.clips.remove(clip_index);
+            println!("🗑️ Deleted clip at index {}", clip_index);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Clip index out of bounds"))
+        }
+    }
+
     /// Pull `frames` of interleaved f32 into `dst`.
     /// Handles start_time offset logic.
     pub fn render_into(
