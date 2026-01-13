@@ -7,6 +7,7 @@
     size?: 'sm' | 'lg';
     color: string; // HEX CODE
     mapMode?: 'linear' | 'log';
+    bipolar?: boolean; // NEW: If true, fills from center (for Pan)
     defaultValue?: number; 
     onChange: (val: number) => void;
   }
@@ -19,6 +20,7 @@
     size = 'lg', 
     color, 
     mapMode = 'linear',
+    bipolar = false,
     defaultValue, 
     onChange 
   }: Props = $props();
@@ -34,7 +36,7 @@
   let startY = 0;
   let startValue = 0;
 
-  // --- LOGARITHMIC HELPERS ---
+  // --- MATH HELPERS ---
   function toProgress(val: number) {
     if (mapMode === 'linear') return (val - min) / (max - min);
     return (Math.log(val) - Math.log(min)) / (Math.log(max) - Math.log(min));
@@ -95,14 +97,42 @@
   }
 
   // --- VISUAL MATH ---
-  // Current progress (0.0 to 1.0) used for lighting up ticks
   let fraction = $derived(Math.max(0, Math.min(1, toProgress(value))));
   let angle = $derived(fraction * 270 - 135);
 
   let circumference = $derived(2 * Math.PI * config.r);
-  let arcLength = $derived(circumference * 0.75);
-  let valueDash = $derived(arcLength * fraction);
-  let gapDash = $derived(circumference - valueDash);
+  let arcLength = $derived(circumference * 0.75); // Total length of the 270 degree arc
+
+  // --- BIPOLAR VS STANDARD DRAWING ---
+  let dashArray = $derived.by(() => {
+    if (bipolar) {
+      // CENTER-OUT FILL
+      const halfArc = arcLength / 2;
+      const centerGap = 0; // We start rotation at -135deg (7 o'clock). 0-0.5 is left side.
+      
+      // If fraction > 0.5 (Right side)
+      if (fraction >= 0.5) {
+        // Gap from start(7oc) to center(12oc) is halfArc
+        // Fill length is (fraction - 0.5) * arcLength
+        const fill = (fraction - 0.5) * arcLength;
+        // Logic: 0 solid, halfArc gap, fill solid, rest gap
+        return `0 ${halfArc} ${fill} ${circumference}`;
+      } 
+      // If fraction < 0.5 (Left side)
+      else {
+        // Gap from start(7oc) to currentPos is fraction * arcLength
+        // Fill length is (0.5 - fraction) * arcLength (from pos to center)
+        const gap = fraction * arcLength;
+        const fill = (0.5 - fraction) * arcLength;
+        return `0 ${gap} ${fill} ${circumference}`;
+      }
+    } else {
+      // STANDARD LEFT-TO-RIGHT FILL
+      const valueDash = arcLength * fraction;
+      const gapDash = circumference - valueDash;
+      return `${valueDash} ${gapDash}`;
+    }
+  });
 
   const ticks = Array.from({ length: 21 }, (_, i) => {
     const p = i / 20; 
@@ -122,10 +152,15 @@
   tabindex="0"
 >
   
-  <div class="absolute inset-0 pointer-events-none">
+  <div class="absolute inset-0 pointer-events-none opacity-60">
     {#each ticks as deg, i}
       {@const tickFraction = i / 20}
-      {@const isActive = tickFraction <= fraction + 0.01} <div 
+      {@const isActive = bipolar 
+          ? (fraction >= 0.5 ? (tickFraction >= 0.5 && tickFraction <= fraction) : (tickFraction >= fraction && tickFraction <= 0.5))
+          : (tickFraction <= fraction + 0.01)
+      }
+      
+      <div 
         class="absolute rounded-full left-1/2 top-1/2 origin-top transition-colors duration-75"
         style={`
             width: ${config.tickW}px; 
@@ -154,7 +189,7 @@
       stroke={color} 
       stroke-width={config.stroke}
       stroke-linecap="round"
-      stroke-dasharray={`${valueDash} ${gapDash}`}
+      stroke-dasharray={dashArray}
       class="drop-shadow-[0_0_3px_currentColor] transition-none" 
     />
   </svg>
