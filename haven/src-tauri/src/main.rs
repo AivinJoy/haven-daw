@@ -133,20 +133,54 @@ fn get_position(state: State<AppState>) -> Result<f64, String> {
     Ok(audio.position().as_secs_f64())
 }
 
-
+#[derive(Clone, serde::Serialize)]
+struct ProgressPayload {
+    message: String,
+    progress: f64,
+    visible: bool,
+}
 
 #[tauri::command]
-fn import_track(path: String, state: State<AppState>) -> Result<ImportResult, String> {
+fn import_track(app: tauri::AppHandle,path: String, state: State<AppState>) -> Result<ImportResult, String> {
+    
+    // 0. Start Loader
+    let _ = app.emit("progress-update", ProgressPayload { 
+        message: "Initializing Import...".into(), 
+        progress: 5.0, 
+        visible: true 
+    });
+
     // 1. Add to Audio Engine (Playback)
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
     audio.add_track(path.clone()).map_err(|e| e.to_string())?;
+
+    // Update Progress
+    let _ = app.emit("progress-update", ProgressPayload { 
+        message: "Decoding Audio...".into(), 
+        progress: 20.0, 
+        visible: true 
+    });
 
     // 2. Decode Once (Analysis) - Using the FIXED decode_to_vec
     let (samples, sr, channels) = bpm::adapter::decode_to_vec(&path)
         .map_err(|e| format!("Failed to decode: {}", e))?;
 
+    // Update Progress
+    let _ = app.emit("progress-update", ProgressPayload { 
+        message: "Analyzing Waveform...".into(), 
+        progress: 60.0, 
+        visible: true 
+    });
+
     // 3. Build Waveform (Visual) - Using the FIXED build_from_samples
     let wf = Waveform::build_from_samples(&samples, sr, channels, 512);
+
+    // Update Progress
+    let _ = app.emit("progress-update", ProgressPayload { 
+        message: "Detecting BPM...".into(), 
+        progress: 80.0, 
+        visible: true 
+    });
 
     // --- ADD THIS DEBUG BLOCK ---
     println!("--------------------------------------------------");
@@ -172,6 +206,13 @@ fn import_track(path: String, state: State<AppState>) -> Result<ImportResult, St
     
     // FIX: Pass 4 arguments (spp, channel, start_bin, columns)
     let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
+
+    // 6. Finish Loader
+    let _ = app.emit("progress-update", ProgressPayload { 
+        message: "Done".into(), 
+        progress: 100.0, 
+        visible: false // Hides the loader
+    });
 
     Ok(ImportResult {
         mins: mins.to_vec(),
@@ -537,9 +578,28 @@ fn save_project(path: String, state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn export_project(path: String, state: State<AppState>) -> Result<(), String> {
+fn export_project(app: tauri::AppHandle,path: String, state: State<AppState>) -> Result<(), String> {
+    // 1. Show Loader
+    let _ = app.emit("progress-update", ProgressPayload { 
+        message: "Rendering Project...".into(), 
+        progress: 0.0, // Indeterminate start
+        visible: true 
+    });
+    
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    audio.export_project(path)
+
+    // NOTE: If audio.export_project takes a long time, it will block this thread.
+    // Ideally, export_project inside AudioRuntime should accept a callback closure 
+    // to report progress. For now, this ensures the loader at least appears.
+    let result = audio.export_project(path);
+
+    // 2. Hide Loader
+    let _ = app.emit("progress-update", ProgressPayload { 
+        message: "Export Complete".into(), 
+        progress: 100.0, 
+        visible: false 
+    });
+    result
 }
 
 #[tauri::command]
