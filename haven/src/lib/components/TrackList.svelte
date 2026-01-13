@@ -10,6 +10,7 @@
     select: number;          // Payload is Track ID
     toggleMonitor: number;   // Payload is Track ID
     delete: number;
+    openEq: number;
   }>();
 
   // Receive tracks prop (bindable if you want the list itself to change, but usually internal props bind)
@@ -117,6 +118,13 @@
         y={menuPos.y}
         onClose={() => showMenu = false}
         options={[
+            { 
+                label: "Open EQ", 
+                action: () => {
+                    dispatch('openEq', activeTrackIndex); // <--- Dispatch EQ event
+                    showMenu = false;
+                }
+            },
             { 
                 label: "Delete Track", 
                 action: handleDelete, 

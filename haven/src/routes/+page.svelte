@@ -12,12 +12,15 @@
     import Timeline from '$lib/components/Timeline.svelte';
     import Loader from '$lib/components/Loader.svelte';
     import { recordingManager } from '$lib/managers/RecordingManager';
+    import EqWindow from "$lib/components/EqWindow.svelte";
 
     // --- STATE ---
     let view: 'landing' | 'studio' = $state('landing');
     let showModal = $state(false); 
     let isPlaying = $state(false);
     let currentTime = $state(0); 
+    let showEqWindow = $state(false);
+    let eqTrackIndex = $state(0);
     
     // --- GLOBAL BPM STATE ---
     let bpm = $state(120); 
@@ -314,6 +317,11 @@
             alert("Error deleting track: " + e);
             refreshProjectState(); // Rollback/Sync on error
         }
+    }
+
+    function handleOpenEq(event: CustomEvent<number>) {
+        eqTrackIndex = event.detail; // TrackList sends the index (0, 1, 2...)
+        showEqWindow = true;
     }
 
     // --- NEW HELPER: Exclusive Arming ---
@@ -630,6 +638,7 @@
             on:select={handleTrackSelect}
             on:toggleMonitor={handleToggleMonitor}
             on:delete={handleDeleteTrack}
+            on:openEq={handleOpenEq}
         />
         
         <Timeline 
@@ -644,5 +653,11 @@
     </div>
 
   {/if}
+  {#if showEqWindow}
+        <EqWindow 
+            trackIndex={eqTrackIndex} 
+            onClose={() => showEqWindow = false} 
+        />
+    {/if}
 
 </main>

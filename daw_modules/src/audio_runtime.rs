@@ -10,6 +10,7 @@ use crate::audio::setup_output_device;
 use crate::engine::Engine;
 use crate::session::{Session, commands::{SetTrackGain, SetTrackPan, SetTrackMute}}; 
 use crate::engine::time::GridLine;
+use crate::effects::equalizer::EqParams; // <--- Import this
 
 /// Owns Engine + CPAL stream and exposes a simple control API.
 pub struct AudioRuntime {
@@ -397,6 +398,25 @@ impl AudioRuntime {
             eng.delete_clip(track_index, clip_index)?;
         }
         Ok(())
+    }
+
+    // --- EQ COMMANDS ---
+
+    pub fn update_eq(&self, track_index: usize, band_index: usize, params: EqParams) {
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().get_mut(track_index) {
+                track.track_eq.update_band(band_index, params);
+            }
+        }
+    }
+
+    pub fn get_eq_state(&self, track_index: usize) -> Vec<EqParams> {
+        if let Ok(eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks().get(track_index) {
+                return track.track_eq.get_state();
+            }
+        }
+        Vec::new()
     }
 
     // FIX: Corrected Reset Methods (No Delta, Just Reset)

@@ -426,6 +426,54 @@ fn delete_clip(
     audio.delete_clip(track_index, clip_index).map_err(|e| e.to_string())
 }
 
+// 1. Argument Struct
+#[derive(serde::Deserialize)]
+struct EqUpdateArgs {
+    track_index: usize,
+    band_index: usize,
+    filter_type: String, 
+    freq: f32,
+    q: f32,
+    gain: f32,
+    active: bool,
+}
+
+// 2. Commands
+
+#[tauri::command]
+fn update_eq(args: EqUpdateArgs, state: State<AppState>) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
+    
+    // Map String to Enum
+    let filter_type = match args.filter_type.as_str() {
+        "LowPass" => daw_modules::effects::equalizer::EqFilterType::LowPass,
+        "HighPass" => daw_modules::effects::equalizer::EqFilterType::HighPass,
+        "Peaking" => daw_modules::effects::equalizer::EqFilterType::Peaking,
+        "LowShelf" => daw_modules::effects::equalizer::EqFilterType::LowShelf,
+        "HighShelf" => daw_modules::effects::equalizer::EqFilterType::HighShelf,
+        "Notch" => daw_modules::effects::equalizer::EqFilterType::Notch,
+        "BandPass" => daw_modules::effects::equalizer::EqFilterType::BandPass,
+        _ => daw_modules::effects::equalizer::EqFilterType::Peaking,
+    };
+
+    let params = daw_modules::effects::equalizer::EqParams {
+        filter_type,
+        freq: args.freq,
+        q: args.q,
+        gain: args.gain,
+        active: args.active,
+    };
+
+    audio.update_eq(args.track_index, args.band_index, params);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_eq_state(track_index: usize, state: State<AppState>) -> Result<Vec<daw_modules::effects::equalizer::EqParams>, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
+    Ok(audio.get_eq_state(track_index))
+}
+
 #[tauri::command]
 async fn get_project_state(
     app: tauri::AppHandle, 
@@ -566,7 +614,9 @@ fn main() {
             get_project_state,
             merge_clip_with_next,
             delete_clip,
-            delete_track
+            delete_track,
+            update_eq,
+            get_eq_state
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

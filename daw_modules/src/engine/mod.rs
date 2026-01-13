@@ -51,10 +51,12 @@ impl Engine {
     }
 
     // --- NEW: Create a generic empty track ---
+    // --- NEW: Create a generic empty track ---
     pub fn add_empty_track(&mut self) -> TrackId {
         let id = TrackId(self.tracks.len() as u32);
-        // Use the new Track::new(id, name) signature
-        let track = Track::new(id, format!("Track {}", id.0 + 1));
+        // UPDATED: Pass self.sample_rate as the 3rd argument
+        // Pass self.channels as the 4th argument
+        let track = Track::new(id, format!("Track {}", id.0 + 1), self.sample_rate, self.channels);
         self.tracks.push(track);
         id
     }

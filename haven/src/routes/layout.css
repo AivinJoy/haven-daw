@@ -1,3 +1,4 @@
+/* haven\src\routes\layout.css */
 @import 'tailwindcss';
 
 @theme {
@@ -11,7 +12,17 @@
   --color-emerald-500: #10b981;
   --color-orange-500: #f97316;
   --color-pink-500: #ec4899;
+
+  /* * --- NEW: Equalizer Theme Colors ---  */
+  /* These map automatically to bg-eq-bg, text-eq-low, etc. */
+  --color-eq-bg: #18181b;     /* Dark textured background */
+  --color-eq-panel: #27272a;  /* Panel background */
+  --color-eq-low: #fbbf24;    /* Yellow/Gold (Low Freq) */
+  --color-eq-mid: #22d3ee;    /* Cyan (Mid Freq) */
+  --color-eq-hmid: #a855f7;   /* Purple (High-Mid Freq) */
+  --color-eq-high: #ec4899;   /* Pink (High Freq) */
 }
+
 
 :root {
     background-color: #0f0f16;
