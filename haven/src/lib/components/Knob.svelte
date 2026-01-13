@@ -5,8 +5,9 @@
     max: number;
     step?: number;
     size?: 'sm' | 'lg';
-    color: string; // HEX CODE (e.g., "#fbbf24")
+    color: string; // HEX CODE
     mapMode?: 'linear' | 'log';
+    defaultValue?: number; 
     onChange: (val: number) => void;
   }
 
@@ -17,7 +18,8 @@
     step = 0.1, 
     size = 'lg', 
     color, 
-    mapMode = 'linear', 
+    mapMode = 'linear',
+    defaultValue, 
     onChange 
   }: Props = $props();
 
@@ -83,7 +85,17 @@
     window.removeEventListener('mouseup', onMouseUp);
   }
 
+  function onDoubleClick(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (defaultValue !== undefined) {
+      value = defaultValue;
+      onChange(value);
+    }
+  }
+
   // --- VISUAL MATH ---
+  // Current progress (0.0 to 1.0) used for lighting up ticks
   let fraction = $derived(Math.max(0, Math.min(1, toProgress(value))));
   let angle = $derived(fraction * 270 - 135);
 
@@ -104,18 +116,22 @@
   class="relative flex items-center justify-center select-none cursor-ns-resize group touch-none"
   style={`width: ${config.px}px; height: ${config.px}px; color: ${color};`} 
   onmousedown={onMouseDown}
+  ondblclick={onDoubleClick}
   role="slider"
   aria-valuenow={value}
   tabindex="0"
 >
   
-  <div class="absolute inset-0 pointer-events-none opacity-60">
-    {#each ticks as deg}
-      <div 
-        class="absolute bg-[#3f3f46] rounded-full left-1/2 top-1/2 origin-top"
+  <div class="absolute inset-0 pointer-events-none">
+    {#each ticks as deg, i}
+      {@const tickFraction = i / 20}
+      {@const isActive = tickFraction <= fraction + 0.01} <div 
+        class="absolute rounded-full left-1/2 top-1/2 origin-top transition-colors duration-75"
         style={`
             width: ${config.tickW}px; 
             height: ${config.tickH}px; 
+            background-color: ${isActive ? color : '#3f3f46'}; 
+            box-shadow: ${isActive ? `0 0 2px ${color}` : 'none'};
             transform: translate(-50%, -50%) rotate(${deg}deg) translateY(-${config.px/2 + config.tickOffset}px);
         `}
       ></div>

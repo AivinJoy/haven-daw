@@ -9,17 +9,21 @@
   let loading = $state(true);
   let bands = $state<any[]>([]); 
   
+  // Global Bypass State
+  let isBypassed = $state(false);
+  let previousBandStates: boolean[] = [];
+
+  // Window Drag
   let winX = $state(100);
   let winY = $state(100);
   let isDragging = false;
   let dragOffset = { x: 0, y: 0 };
 
-  // --- CONFIG (Using Explicit Hex Colors) ---
   const bandConfig = [
-    { label: 'Low',      color: '#fbbf24' }, // Amber-400
-    { label: 'Mid',      color: '#22d3ee' }, // Cyan-400
-    { label: 'High Mid', color: '#a855f7' }, // Purple-500
-    { label: 'High',     color: '#ec4899' }, // Pink-500
+    { label: 'Low',      color: '#fbbf24', defaultFreq: 75.0 },   // Amber
+    { label: 'Mid',      color: '#22d3ee', defaultFreq: 200.0 },  // Cyan
+    { label: 'High Mid', color: '#a855f7', defaultFreq: 2000.0 }, // Purple
+    { label: 'High',     color: '#ec4899', defaultFreq: 10000.0 } // Pink
   ];
 
   const filterTypes = [
@@ -35,24 +39,46 @@
     }
   });
 
+  // --- CORE UPDATE LOGIC ---
   async function updateBand(bandIndex: number, param: string, value: any) {
-    bands[bandIndex][param] = value; // Optimistic Update
+    // 1. Optimistic Update
+    bands[bandIndex][param] = value;
 
-    const band = bands[bandIndex];
-    const args = {
-      track_index: trackIndex,
-      band_index: bandIndex,
-      filter_type: band.filter_type,
-      freq: parseFloat(band.freq),
-      q: parseFloat(band.q),
-      gain: parseFloat(band.gain),
-      active: !!band.active,
-    };
-
+    // 2. Send to Backend
     try {
+      const args = {
+        track_index: trackIndex,
+        band_index: bandIndex,
+        filter_type: bands[bandIndex].filter_type,
+        freq: parseFloat(bands[bandIndex].freq),
+        q: parseFloat(bands[bandIndex].q),
+        gain: parseFloat(bands[bandIndex].gain),
+        active: !!bands[bandIndex].active, 
+      };
       await invoke("update_eq", { args });
     } catch (e) {
       console.error("EQ Update Failed:", e);
+    }
+  }
+
+  // --- GLOBAL BYPASS LOGIC ---
+  function toggleGlobalBypass() {
+    if (isBypassed) {
+      isBypassed = false;
+      bands.forEach((band, i) => {
+        if (previousBandStates[i] === true) {
+          updateBand(i, 'active', true);
+        }
+      });
+    } else {
+      previousBandStates = bands.map(b => b.active); 
+      isBypassed = true;
+      
+      bands.forEach((band, i) => {
+        if (band.active) {
+          updateBand(i, 'active', false);
+        }
+      });
     }
   }
 
@@ -91,8 +117,11 @@
     class="h-12 bg-[#202023] border-b border-black/30 flex items-center justify-between px-4 cursor-move"
     onmousedown={startDrag} role="button" tabindex="0"
   >
-    <button class="flex items-center gap-2 bg-eq-panel hover:bg-[#3f3f46] px-3 py-1 rounded text-xs uppercase tracking-wider font-bold transition-colors border border-white/5 shadow-sm">
-        <Power size={12} class="text-zinc-500" />
+    <button 
+      onclick={toggleGlobalBypass}
+      class={`flex items-center gap-2 px-3 py-1 rounded text-xs uppercase tracking-wider font-bold transition-colors border border-white/5 shadow-sm ${isBypassed ? 'bg-red-500/20 text-red-400 border-red-500/50' : 'bg-eq-panel hover:bg-[#3f3f46] text-zinc-500'}`}
+    >
+        <Power size={12} class={isBypassed ? "text-red-400" : "text-zinc-500"} />
         <span>Bypass</span>
     </button>
 
@@ -119,12 +148,15 @@
       {#each bands as band, i}
         {@const config = bandConfig[i]}
         
+        {@const isActive = band.active && !isBypassed}
+        {@const currentAccent = isActive ? config.color : '#52525b'} 
+        
         <div class="bg-[#1a1a1d] rounded-lg p-5 flex flex-col items-center border border-white/5 shadow-[0_4px_10px_rgba(0,0,0,0.3)] relative group">
             
             <div class="w-full flex flex-col items-center mb-4">
                 <h3 
-                    class="text-base font-bold drop-shadow-md mb-2" 
-                    style={`color: ${config.color}`}
+                    class="text-base font-bold drop-shadow-md mb-2 transition-colors duration-200" 
+                    style={`color: ${currentAccent}`}
                 >
                     {config.label}
                 </h3>
@@ -148,7 +180,8 @@
                     min={20} max={20000} step={1} 
                     size="lg"
                     mapMode="log"
-                    color={config.color}
+                    color={currentAccent}
+                    defaultValue={config.defaultFreq}
                     onChange={(val) => updateBand(i, 'freq', val)}
                 />
             </div>
@@ -160,25 +193,31 @@
                     type="button"
                     onclick={(e) => {
                         e.stopPropagation();
+                        if (isBypassed) isBypassed = false; 
                         updateBand(i, 'active', !band.active);
                     }}
                     class="w-8 h-4 rounded-full p-0.5 transition-colors border border-white/5 relative cursor-pointer"
-                    style={`background-color: ${band.active ? config.color + '33' : '#0f0f11'}`} 
+                    style={`background-color: ${band.active ? currentAccent + '33' : '#0f0f11'}`} 
                     aria-label="Toggle Band"
                 >
                     <div 
                         class="w-3 h-3 rounded-full shadow-sm transition-transform absolute top-0.5 left-0.5"
                         style={`
                             transform: translateX(${band.active ? '16px' : '0'});
-                            background-color: ${band.active ? config.color : '#3f3f46'};
-                            box-shadow: ${band.active ? `0 0 6px ${config.color}` : 'none'};
+                            background-color: ${band.active ? currentAccent : '#3f3f46'};
+                            box-shadow: ${band.active ? `0 0 6px ${currentAccent}` : 'none'};
                         `}
                     ></div>
                 </button>
             </div>
 
             <div class="w-full bg-[#0f0f11] border border-white/5 rounded px-2 py-1.5 text-center shadow-[inset_0_2px_4px_rgba(0,0,0,0.5)] mb-6">
-                <span class="text-sm text-zinc-200 font-mono tracking-wide">{formatFreqLabel(band.freq)}</span>
+                <span 
+                    class="text-sm font-mono tracking-wide transition-colors"
+                    style={`color: ${isActive ? '#e4e4e7' : '#52525b'}`}
+                >
+                    {formatFreqLabel(band.freq)}
+                </span>
             </div>
 
             <div class="w-full flex items-center justify-between mb-4 pl-1">
@@ -186,8 +225,8 @@
                      <span class="text-[10px] font-bold uppercase text-zinc-600 mb-1">Gain</span>
                      <div class="bg-[#0f0f11] border border-white/5 rounded px-2 py-1 shadow-[inset_0_2px_4px_rgba(0,0,0,0.5)] flex justify-end">
                         <span 
-                            class="text-xs font-mono"
-                            style={`color: ${band.gain > 0 ? config.color : (band.gain < 0 ? '#a1a1aa' : '#52525b')}`}
+                            class="text-xs font-mono transition-colors"
+                            style={`color: ${isActive ? (band.gain > 0 ? currentAccent : '#a1a1aa') : '#52525b'}`}
                         >
                             {band.gain > 0 ? '+' : ''}{band.gain.toFixed(1)} <span class="text-[9px] text-zinc-700">dB</span>
                         </span>
@@ -196,7 +235,8 @@
                  <Knob 
                     bind:value={band.gain} min={-15} max={15} step={0.1} 
                     size="sm"
-                    color={config.color}
+                    color={currentAccent}
+                    defaultValue={0.0}
                     onChange={(val) => updateBand(i, 'gain', val)}
                  />
             </div>
@@ -205,7 +245,10 @@
                 <div class="flex flex-col w-full mr-3">
                      <span class="text-[10px] font-bold uppercase text-zinc-600 mb-1">Q</span>
                      <div class="bg-[#0f0f11] border border-white/5 rounded px-2 py-1 shadow-[inset_0_2px_4px_rgba(0,0,0,0.5)] flex justify-end">
-                        <span class="text-xs font-mono" style={`color: ${config.color}`}>
+                        <span 
+                            class="text-xs font-mono transition-colors" 
+                            style={`color: ${isActive ? currentAccent : '#52525b'}`}
+                        >
                             {band.q.toFixed(2)}
                         </span>
                     </div>
@@ -213,7 +256,8 @@
                  <Knob 
                     bind:value={band.q} min={0.1} max={10.0} step={0.1} 
                     size="sm"
-                    color={config.color}
+                    color={currentAccent}
+                    defaultValue={0.707}
                     onChange={(val) => updateBand(i, 'q', val)}
                  />
             </div>
