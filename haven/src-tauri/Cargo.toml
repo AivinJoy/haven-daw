@@ -29,4 +29,5 @@ tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
 
 daw_modules = { path = "../../daw_modules"}
+tokio = { version = "1.49.0", features = ["full"] }
 

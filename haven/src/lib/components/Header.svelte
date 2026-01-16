@@ -1,3 +1,5 @@
+<!-- haven\src\lib\components\Header.svelte -->
+
 <script lang="ts">
   import { PenLine, Settings, User, Bell } from 'lucide-svelte';
 

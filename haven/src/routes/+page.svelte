@@ -26,16 +26,6 @@
     let bpm = $state(120); 
     let projectName = $state("untitled Project");
 
-    let loadProgress = $state(0);
-    listen('load-progress', (e) => loadingMessage = e.payload as string);
-    listen('load-percent', (e) => loadProgress = e.payload as number);
-
-    let isLoading = $state(false);
-    let loadingMessage = $state("Processing...");
-    listen('load-progress', (event) => {
-      loadingMessage = event.payload as string;
-    });
-
     let isRecordingMode = $state(false);
 
     type Clip = {
@@ -87,8 +77,6 @@
             });
 
             if (path && typeof path === 'string') {
-                isLoading = true;
-                loadingMessage = "initializing...";
 
                 // 1. Backend: Load Engine State & Re-Analyze Waveforms
                 const projectState = await invoke<{
@@ -115,7 +103,6 @@
             console.error("Load failed:", e);
             alert("Failed to load: " + e);
         } finally {
-            isLoading = false;
         }
     }
 
@@ -129,8 +116,6 @@
             });
 
             if (path) {
-                isLoading = true;
-                loadingMessage = "Saving Project...";
                 await invoke('save_project', { path });
                 const newName = path.split(/[\\/]/).pop();
                 if (newName) projectName = newName.replace('.hvn', '');
@@ -138,7 +123,6 @@
         } catch (e) {
             console.error("Save failed:", e);
         } finally {
-            isLoading = false;
         }
     }
 
@@ -154,8 +138,6 @@
                   if (path) {
                       if (isPlaying) { await invoke('pause'); isPlaying = false; }
 
-                      isLoading = true;
-                      loadingMessage = "Rendering Audio...";
                       if (isPlaying) {
                         await invoke('pause');
                         isPlaying = false;
@@ -166,7 +148,6 @@
               } catch (e) {
                   console.error("Export failed:", e);
               } finally {
-                  isLoading = false;
               }
     }
 
@@ -242,57 +223,69 @@
         }
         else if (type === 'import' || type === 'upload') {
             try {
+                // 1. Allow Multiple Files
                 const selected = await openDialog({
-                    multiple: false,
+                    multiple: true, // <--- CHANGED
                     filters: [{ name: 'Audio', extensions: ['wav', 'mp3', 'flac', 'ogg'] }]
                 });
               
-                if (selected && typeof selected === 'string') {
+                if (selected) {
+                    // Normalize to Array (Tauri returns string if single, array if multiple)
+                    const paths = Array.isArray(selected) ? selected : [selected];
 
-                    isLoading = true;
-                    loadingMessage = "Importing Track..."
 
-                    const result = await invoke<{
-                        mins: number[], 
-                        maxs: number[], 
-                        duration: number,
-                        binsPerSecond: number, 
-                        bpm?: number 
-                    }>('import_track', { path: selected });
+                    // 2. Call the NEW Plural Backend Command
+                    // This command emits events that update 'loadingMessage' automatically via your listener
+                    const results = await invoke<any[]>('import_tracks', { paths });
 
-                    const filename = selected.split(/[\\/]/).pop() || `Imported ${id}`;
-                  
-                    if (result.bpm && result.bpm > 0) {
-                        console.log("Detected BPM:", result.bpm);
-                        bpm = Math.round(result.bpm); 
-                    }
-                  
-                    const newClip: Clip = {
-                        id: `clip_${Date.now()}`,
-                        trackId: id,
-                        name: filename,
-                        path: selected,
-                        startTime: 0,
-                        duration: result.duration,
-                        offset: 0,
-                        waveform: { mins: result.mins, maxs: result.maxs, duration: result.duration, binsPerSecond: result.binsPerSecond },
-                        color: color
-                    };
+                    // 3. Process the list of results
+                    // We need to determine the starting ID for the batch
+                    let currentIdCounter = tracks.length > 0 ? Math.max(...tracks.map(t => t.id)) : 0;
 
-                    tracks = [...tracks, { 
-                        id, 
-                        name: filename, 
-                        color, 
-                        clips: [newClip],
-                        ...defaultMixer, // Spread mixer defaults
-                        isRecording: false,
-                        source: 'media'
-                    }];
+                    results.forEach((result, i) => {
+                        currentIdCounter++; // Increment ID for each new track
+                        
+                        const path = paths[i];
+                        const filename = path.split(/[\\/]/).pop() || `Imported ${currentIdCounter}`;
+                        
+                        // Assign a random color for each track in the batch
+                        const batchColor = colors[Math.floor(Math.random() * colors.length)];
+
+                        // Update BPM if detected (only from the first track to avoid jumping)
+                        if (i === 0 && result.bpm && result.bpm > 0) {
+                            bpm = Math.round(result.bpm); 
+                        }
+                        
+                        const newClip: Clip = {
+                            id: `clip_${Date.now()}_${i}`,
+                            trackId: currentIdCounter,
+                            name: filename,
+                            path: path,
+                            startTime: 0,
+                            duration: result.duration,
+                            offset: 0,
+                            waveform: { mins: result.mins, maxs: result.maxs, duration: result.duration, binsPerSecond: result.binsPerSecond },
+                            color: batchColor
+                        };
+
+                        // Push to tracks array
+                        tracks.push({ 
+                            id: currentIdCounter, 
+                            name: filename, 
+                            color: batchColor, 
+                            clips: [newClip],
+                            ...defaultMixer, 
+                            isRecording: false,
+                            source: 'media'
+                        });
+                    });
+
+                    // 4. Trigger Svelte Reactivity
+                    tracks = [...tracks];
                 }
             } catch (e) {
                 console.error("Import failed:", e);
             } finally {
-                isLoading = false;
             }
         } 
         else {
@@ -472,8 +465,6 @@
     // NEW: Function to refresh tracks from backend
     async function refreshProjectState() {
         try {
-            isLoading = true;
-            loadingMessage = "Updating Project...";
 
             const projectState = await invoke<{
               tracks: Track[],
@@ -489,7 +480,6 @@
         } catch (e) {
             console.error("Failed to refresh project:", e);
         } finally {
-            isLoading = false;
         }
     }
 
@@ -595,9 +585,7 @@
 
 <svelte:window on:keydown={handleKeydown} />
 
-{#if isLoading}
-    <Loader message={loadingMessage} progress={loadProgress} />
-{/if}    
+<Loader />  
 
 <main class="h-screen w-screen bg-[#0f0f16] text-white overflow-hidden relative font-sans flex flex-col">
   

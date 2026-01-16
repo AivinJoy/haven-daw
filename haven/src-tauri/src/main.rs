@@ -141,87 +141,130 @@ struct ProgressPayload {
 }
 
 #[tauri::command]
-fn import_track(app: tauri::AppHandle,path: String, state: State<AppState>) -> Result<ImportResult, String> {
+async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
+    app: tauri::AppHandle,
+    paths: Vec<String>, 
+    state: State<'_, AppState>
+) -> Result<Vec<ImportResult>, String> { 
     
-    // 0. Start Loader
+    let total_files = paths.len() as f64;
+    let mut results = Vec::new();
+
+    for (i, path) in paths.iter().enumerate() {
+        let file_num = i + 1;
+        let step_size = 100.0 / total_files;
+        let base_progress = (i as f64) * step_size;
+
+        // --- STEP 1: PREPARING (Fast) ---
+        let _ = app.emit("progress-update", ProgressPayload { 
+            message: format!("Preparing file {} of {}...", file_num, total_files),
+            progress: base_progress + (step_size * 0.05), 
+            visible: true 
+        });
+
+        // LOCK SCOPE: Only lock audio for the split second we need to add the track
+        {
+            let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+            audio.add_track(path.clone()).map_err(|e| e.to_string())?;
+        } // <--- LOCK IS DROPPED HERE. Audio engine is free now.
+
+        // Force UI Update
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // --- STEP 2: DECODING (Heavy) ---
+        let _ = app.emit("progress-update", ProgressPayload { 
+            message: format!("Decoding Audio Data {}...", file_num),
+            progress: base_progress + (step_size * 0.15), 
+            visible: true 
+        });
+        
+        // Force UI Update
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // We clone path so we can move it into the thread
+        let path_clone = path.clone();
+
+        // RUN HEAVY TASK ON SEPARATE THREAD so UI doesn't freeze
+        let (samples, sr, channels) = tauri::async_runtime::spawn_blocking(move || {
+            bpm::adapter::decode_to_vec(&path_clone)
+        }).await.map_err(|e| e.to_string())?.map_err(|e| format!("Failed to decode: {}", e))?;
+
+        // --- STEP 3: WAVEFORM (Heavy) ---
+        let _ = app.emit("progress-update", ProgressPayload { 
+            message: format!("Generating Waveform {}...", file_num),
+            progress: base_progress + (step_size * 0.50), 
+            visible: true 
+        });
+
+        // Force UI Update
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let samples_clone = samples.clone();
+        
+        // RUN HEAVY TASK ON SEPARATE THREAD
+        let wf = tauri::async_runtime::spawn_blocking(move || {
+            Waveform::build_from_samples(&samples_clone, sr, channels, 512)
+        }).await.map_err(|e| e.to_string())?;
+
+        // --- STEP 4: BPM (Heavy) ---
+        let _ = app.emit("progress-update", ProgressPayload { 
+            message: format!("Detecting Tempo {}...", file_num),
+            progress: base_progress + (step_size * 0.80), 
+            visible: true 
+        });
+
+        // Force UI Update
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // --- ADD THIS DEBUG BLOCK ---
+        println!("--------------------------------------------------");
+        println!("📊 BACKEND TRUTH:");
+        println!("   - Duration:     {:.6} seconds", wf.duration_secs);
+        println!("   - Samples:      {}", samples.len());
+        println!("   - Channels:     {}", channels);
+        println!("   - Rate:         {}", sr);
+        
+        let target_width = wf.duration_secs * 50.0;
+        println!("   - Target Width: {:.4} px (at 1x Zoom)", target_width);
+        println!("--------------------------------------------------");
+        // ----------------------------
+
+
+        let samples_bpm = samples.clone();
+        let detected_bpm = tauri::async_runtime::spawn_blocking(move || {
+            let mut det = bpm::BpmDetector::new(2048);
+            let opts = bpm::BpmOptions { compute_beats: true, ..Default::default() };
+            det.detect(&samples_bpm, channels, sr, opts).map(|res| res.bpm)
+        }).await.map_err(|e| e.to_string())?;
+
+        // --- STEP 5: FINALIZE ---
+        let _ = app.emit("progress-update", ProgressPayload { 
+            message: format!("Finalizing {}...", file_num),
+            progress: base_progress + (step_size * 0.95), 
+            visible: true 
+        });
+
+        let pixels_per_second = 100.0;
+        let spp = (sr as f64) / pixels_per_second;
+        let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
+
+        results.push(ImportResult {
+            mins: mins.to_vec(),
+            maxs: maxs.to_vec(),
+            duration: wf.duration_secs,
+            bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
+            bpm: detected_bpm,
+        });
+    }
+
+    // --- DONE ---
     let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Initializing Import...".into(), 
-        progress: 5.0, 
-        visible: true 
-    });
-
-    // 1. Add to Audio Engine (Playback)
-    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    audio.add_track(path.clone()).map_err(|e| e.to_string())?;
-
-    // Update Progress
-    let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Decoding Audio...".into(), 
-        progress: 20.0, 
-        visible: true 
-    });
-
-    // 2. Decode Once (Analysis) - Using the FIXED decode_to_vec
-    let (samples, sr, channels) = bpm::adapter::decode_to_vec(&path)
-        .map_err(|e| format!("Failed to decode: {}", e))?;
-
-    // Update Progress
-    let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Analyzing Waveform...".into(), 
-        progress: 60.0, 
-        visible: true 
-    });
-
-    // 3. Build Waveform (Visual) - Using the FIXED build_from_samples
-    let wf = Waveform::build_from_samples(&samples, sr, channels, 512);
-
-    // Update Progress
-    let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Detecting BPM...".into(), 
-        progress: 80.0, 
-        visible: true 
-    });
-
-    // --- ADD THIS DEBUG BLOCK ---
-    println!("--------------------------------------------------");
-    println!("📊 BACKEND TRUTH:");
-    println!("   - Duration:     {:.6} seconds", wf.duration_secs);
-    println!("   - Samples:      {}", samples.len());
-    println!("   - Channels:     {}", channels);
-    println!("   - Rate:         {}", sr);
-    
-    let target_width = wf.duration_secs * 50.0;
-    println!("   - Target Width: {:.4} px (at 1x Zoom)", target_width);
-    println!("--------------------------------------------------");
-    // ----------------------------
-
-    // 4. Detect BPM (Musical)
-    let mut det = bpm::BpmDetector::new(2048);
-    let opts = bpm::BpmOptions { compute_beats: true, ..Default::default() };
-    let detected_bpm = det.detect(&samples, channels, sr, opts).map(|res| res.bpm);
-
-    // 5. Send to Frontend
-    let pixels_per_second = 100.0;
-    let spp = (sr as f64) / pixels_per_second;
-    
-    // FIX: Pass 4 arguments (spp, channel, start_bin, columns)
-    let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
-
-    // 6. Finish Loader
-    let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Done".into(), 
+        message: "Import Complete!".into(), 
         progress: 100.0, 
-        visible: false // Hides the loader
+        visible: false 
     });
 
-    Ok(ImportResult {
-        mins: mins.to_vec(),
-        maxs: maxs.to_vec(),
-        duration: wf.duration_secs,
-        bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
-
-        bpm: detected_bpm,
-    })
+    Ok(results)
 }
 
 #[tauri::command]
@@ -648,7 +691,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             play,
             pause,
-            import_track,
+            import_tracks,
             analyze_file,
             create_track,
             get_position,
