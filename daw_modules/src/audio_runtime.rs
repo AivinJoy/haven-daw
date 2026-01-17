@@ -53,11 +53,14 @@ impl AudioRuntime {
     pub fn new(initial_track: Option<String>) -> anyhow::Result<Self> {
         let output = setup_output_device()?;
         let sample_rate = output.output_sample_rate;
-        let channels = output.output_channels;
+        let device_channels = output.output_channels;
+
+        // Debug log to confirm what the device is doing
+         println!("🔊 AudioRuntime: Device running at {} Hz with {} channels", sample_rate, device_channels);
 
         let master_gain = Arc::new(Mutex::new(1.0_f32));
         // Initialize Engine with default master gain
-        let mut engine = Engine::new(sample_rate, channels);
+        let mut engine = Engine::new(sample_rate, 2);
 
         if let Some(path) = initial_track {
             let _ = engine.add_track(path)?;
@@ -74,6 +77,8 @@ impl AudioRuntime {
         let engine_cb = engine.clone();
         let gain_cb = master_gain.clone();
 
+        let mut scratch_buffer: Vec<f32> = Vec::with_capacity(1024);
+
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _| {
@@ -82,7 +87,37 @@ impl AudioRuntime {
                     if let Ok(g) = gain_cb.lock() {
                         eng.master_gain = *g;
                     }
-                    eng.render(data);
+                    // 3. CALCULATE FRAMES: How many "moments in time" are in this buffer?
+                    let frames = data.len() / device_channels as usize;
+                    // 4. PREPARE SCRATCH: Resize to hold exactly 2 samples per frame (Stereo)
+                    if scratch_buffer.len() != frames * 2 {
+                        scratch_buffer.resize(frames * 2, 0.0);
+                    }
+
+                    // 5. RENDER STEREO: Engine writes strictly to our 2-channel scratch buffer
+                    eng.render(&mut scratch_buffer);
+
+                    // 6. MAP CHANNELS: Copy Scratch -> Device Buffer
+                    let mut scratch_idx = 0;
+                    // Process the device buffer in chunks (one chunk = one time frame across all channels)
+                    for frame in data.chunks_mut(device_channels as usize) {
+
+                        // Fast copy of Left and Right
+                        let l = scratch_buffer[scratch_idx];
+                        let r = scratch_buffer[scratch_idx + 1];
+
+                        if frame.len() >= 2 {
+                            frame[0] = l; // Channel 1 (Left)
+                            frame[1] = r; // Channel 2 (Right)
+                        }
+
+                        // Silence remaining channels (3, 4, 5, 6, 7, 8...)
+                        for sample in frame.iter_mut().skip(2) {
+                            *sample = 0.0;
+                        }
+
+                        scratch_idx += 2;
+                    }
                 } else {
                     data.fill(0.0);
                 }
