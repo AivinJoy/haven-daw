@@ -24,30 +24,22 @@ Before running the project, ensure you have the following installed:
 2.  **Node.js & npm (or pnpm):** [Install Node.js](https://nodejs.org/) (v16 or higher)
 3.  **Tauri Dependencies:**
     * **Windows:** Install "C++ Build Tools" via Visual Studio Installer and the "WebView2" runtime.
-    * **Linux:** `sudo apt install libwebkit2gtk-4.0-dev build-essential curl wget libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev`
-    * **macOS:** XCode Command Line Tools (`xcode-select --install`).
-
 ## 📦 Installation
 
 1.  **Clone the repository:**
     ```bash
     git clone [https://github.com/YOUR_USERNAME/haven-daw.git](https://github.com/YOUR_USERNAME/haven-daw.git)
-    cd haven-daw
+    cd haven
     ```
 
-2.  **Install Frontend Dependencies:**
+2.  **Install Dependencies:**
     ```bash
     npm install
     # or
     pnpm install
     ```
 
-3.  **Install Backend Dependencies:**
-    ```bash
-    cd src-tauri
-    cargo check
-    cd ..
-    ```
+
 
 ## ▶️ Running Development Server
 
@@ -62,13 +54,6 @@ The Frontend will load at localhost:1420.
 
 The Rust Backend will compile and launch the native window.
 
-🏗️ Building for Production
-To create an optimized executable/installer for your OS:
-
-Bash
-
-npm run tauri build
-The output will be in src-tauri/target/release/bundle/.
 
 📂 Project Structure
 src/ - Frontend (SvelteKit): UI components, Timeline logic, Canvas rendering.
