@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{State, Emitter};
+use cpal::traits::{HostTrait, DeviceTrait};
 
 // Import modules
 use daw_modules::audio_runtime::AudioRuntime;
@@ -112,6 +113,59 @@ fn build_ui_state(
 }
 
 // --- 3. Commands ---
+
+// 1. Define this struct to send richer data to Frontend
+#[derive(serde::Serialize)]
+struct AudioDeviceInfo {
+    name: String,
+    is_default: bool,
+}
+
+#[tauri::command]
+fn get_output_devices() -> Result<Vec<AudioDeviceInfo>, String> {
+    let host = cpal::default_host();
+    
+    // 1. Get the exact name of the system default device
+    let default_name = host.default_output_device()
+        .and_then(|d| d.name().ok());
+
+    let devices = host.output_devices().map_err(|e| e.to_string())?;
+    
+    // 2. Map devices to our struct, checking if they match the default
+    let list: Vec<AudioDeviceInfo> = devices
+        .filter_map(|d| {
+            let name = d.name().ok()?;
+            // Check exact name match
+            let is_default = Some(name.clone()) == default_name;
+            
+            Some(AudioDeviceInfo { name, is_default })
+        })
+        .collect();
+        
+    Ok(list)
+}
+
+#[tauri::command]
+fn get_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
+    let host = cpal::default_host();
+    
+    // 1. Get the exact name of the system default device
+    let default_name = host.default_input_device()
+        .and_then(|d| d.name().ok());
+
+    let devices = host.input_devices().map_err(|e| e.to_string())?;
+    
+    let list: Vec<AudioDeviceInfo> = devices
+        .filter_map(|d| {
+            let name = d.name().ok()?;
+            let is_default = Some(name.clone()) == default_name;
+            
+            Some(AudioDeviceInfo { name, is_default })
+        })
+        .collect();
+        
+    Ok(list)
+}
 
 #[tauri::command]
 fn play(state: State<AppState>) -> Result<(), String> {
@@ -719,7 +773,9 @@ fn main() {
             delete_clip,
             delete_track,
             update_eq,
-            get_eq_state
+            get_eq_state,
+            get_output_devices,
+            get_input_devices
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
