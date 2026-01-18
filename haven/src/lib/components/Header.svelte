@@ -2,6 +2,7 @@
 
 <script lang="ts">
   import { PenLine, Settings, User, Bell } from 'lucide-svelte';
+  import { ui } from '$lib/stores/ui.svelte';
 
   // Props
   let { projectName = $bindable("Untitled Project") } = $props();
@@ -65,7 +66,13 @@
 
   <div class="w-1/3 flex justify-end items-center gap-4">
     <button class="text-white/40 hover:text-white transition-colors"><Bell size={18} /></button>
-    <button class="text-white/40 hover:text-white transition-colors"><Settings size={18} /></button>
+   
+    <button 
+        onclick={() => ui.isSettingsOpen = true}
+        class="text-white/40 hover:text-white transition-colors"
+    >
+        <Settings size={18} />
+    </button>
     
     <div class="w-8 h-8 rounded-full bg-linear-to-tr from-purple-500 to-blue-500 border border-white/20 flex items-center justify-center shadow-lg cursor-pointer hover:scale-105 transition-transform">
         <User size={14} class="text-white" />
