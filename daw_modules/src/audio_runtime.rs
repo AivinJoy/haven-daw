@@ -8,7 +8,7 @@ use cpal::Stream;
 
 use crate::audio::setup_output_device;
 use crate::engine::Engine;
-use crate::session::{Session, commands::{SetTrackGain, SetTrackPan, SetTrackMute}}; 
+use crate::session::{Session, commands::*}; 
 use crate::engine::time::GridLine;
 use crate::effects::equalizer::EqParams; // <--- Import this
 
@@ -256,15 +256,39 @@ impl AudioRuntime {
     }
 
     pub fn move_clip(&self, track_index: usize, clip_index: usize, new_start: f64) -> anyhow::Result<()> {
-        if let Ok(mut eng) = self.engine.lock() {
-            eng.move_clip(track_index, clip_index, new_start)?;
+        let (track_id, old_start) = {
+             let eng = self.engine.lock().unwrap();
+             let track = eng.tracks().get(track_index).ok_or(anyhow::anyhow!("Track not found"))?;
+             let clip = track.clips.get(clip_index).ok_or(anyhow::anyhow!("Clip not found"))?;
+             (track.id, clip.start_time)
+        };
+
+        let cmd = Box::new(MoveClip {
+            track_id,
+            clip_index,
+            old_start,
+            new_start: Duration::from_secs_f64(new_start),
+        });
+
+        if let Ok(mut session) = self.session.lock() {
+            session.apply(&self.engine, cmd)?;
         }
         Ok(())
     }
 
     pub fn split_clip(&self, track_index: usize, time: f64) -> anyhow::Result<()> {
-        if let Ok(mut eng) = self.engine.lock() {
-            eng.split_clip(track_index, time)?;
+        let track_id = {
+             let eng = self.engine.lock().unwrap();
+             eng.tracks().get(track_index).map(|t| t.id)
+        }.ok_or(anyhow::anyhow!("Track not found"))?;
+    
+        let cmd = Box::new(SplitClip {
+            track_id,
+            split_time: Duration::from_secs_f64(time),
+        });
+    
+        if let Ok(mut session) = self.session.lock() {
+            session.apply(&self.engine, cmd)?;
         }
         Ok(())
     }
@@ -330,10 +354,16 @@ impl AudioRuntime {
 
     // Non-destructive solo logic
     pub fn toggle_solo(&self, track_index: usize) {
-        if let Ok(mut eng) = self.engine.lock() {
-            if let Some(track) = eng.tracks_mut().get_mut(track_index) {
-                track.solo = !track.solo;
-                println!("Track {} solo: {}", track_index, track.solo);
+        let track_id = {
+            let eng = self.engine.lock().unwrap();
+            eng.tracks().get(track_index).map(|t| t.id)
+        };
+
+        if let Some(tid) = track_id {
+            let cmd = Box::new(ToggleSolo { track_id: tid });
+            if let Ok(mut session) = self.session.lock() {
+                let _ = session.apply(&self.engine, cmd);
+                println!("Track {} solo toggled", track_index);
             }
         }
     }
@@ -429,8 +459,31 @@ impl AudioRuntime {
     }
 
     pub fn delete_clip(&self, track_index: usize, clip_index: usize) -> anyhow::Result<()> {
-        if let Ok(mut eng) = self.engine.lock() {
-            eng.delete_clip(track_index, clip_index)?;
+        let (track_id, clip_data) = {
+            let eng = self.engine.lock().unwrap();
+            let track = eng.tracks().get(track_index).ok_or(anyhow::anyhow!("Track not found"))?;
+            let clip = track.clips.get(clip_index).ok_or(anyhow::anyhow!("Clip not found"))?;
+            
+            let data = DeletedClipData {
+                path: clip.path.clone(),
+                start_time: clip.start_time,
+                offset: clip.offset,
+                duration: clip.duration,
+                source_duration: clip.source_duration,
+                source_sr: clip.source_sr,
+                source_ch: clip.source_ch,
+            };
+            (track.id, data)
+        };
+    
+        let cmd = Box::new(DeleteClip {
+            track_id,
+            clip_index,
+            clip_data,
+        });
+        
+        if let Ok(mut session) = self.session.lock() {
+            session.apply(&self.engine, cmd)?;
         }
         Ok(())
     }
@@ -438,9 +491,30 @@ impl AudioRuntime {
     // --- EQ COMMANDS ---
 
     pub fn update_eq(&self, track_index: usize, band_index: usize, params: EqParams) {
-        if let Ok(mut eng) = self.engine.lock() {
-            if let Some(track) = eng.tracks_mut().get_mut(track_index) {
-                track.track_eq.update_band(band_index, params);
+        let (track_id, old_params) = {
+            let eng = self.engine.lock().unwrap();
+            if let Some(track) = eng.tracks().get(track_index) {
+                let current_state = track.track_eq.get_state(); 
+                if band_index < current_state.len() {
+                    (Some(track.id), Some(current_state[band_index]))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        };
+
+        if let (Some(tid), Some(old)) = (track_id, old_params) {
+            let cmd = Box::new(UpdateEq {
+                track_id: tid,
+                band_index,
+                old_params: old,
+                new_params: params,
+            });
+            
+            if let Ok(mut session) = self.session.lock() {
+                let _ = session.apply(&self.engine, cmd);
             }
         }
     }

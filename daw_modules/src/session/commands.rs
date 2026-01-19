@@ -2,6 +2,8 @@
 
 use crate::engine::{Engine, TrackId};
 use anyhow::Result;
+use crate::effects::equalizer::EqParams;
+use std::time::Duration;
 
 /// The Command trait defines an action that can be executed and undone.
 /// We require Send + Sync so commands can be moved between threads if necessary.
@@ -145,4 +147,153 @@ impl Command for SetTrackMute {
     }
     
     fn name(&self) -> &str { "Toggle Mute" }
+}
+
+pub struct ToggleSolo {
+    pub track_id: TrackId,
+}
+
+impl Command for ToggleSolo {
+    fn execute(&self, engine: &mut Engine) -> Result<()> {
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            track.solo = !track.solo;
+        }
+        Ok(())
+    }
+    fn undo(&self, engine: &mut Engine) -> Result<()> {
+        self.execute(engine) // Toggle is its own undo
+    }
+    fn name(&self) -> &str { "Toggle Solo" }
+}
+
+pub struct MoveClip {
+    pub track_id: TrackId,
+    pub clip_index: usize,
+    pub old_start: Duration,
+    pub new_start: Duration,
+}
+
+impl Command for MoveClip {
+    fn execute(&self, engine: &mut Engine) -> Result<()> {
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            track.move_clip(self.clip_index, self.new_start);
+        }
+        Ok(())
+    }
+    fn undo(&self, engine: &mut Engine) -> Result<()> {
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            track.move_clip(self.clip_index, self.old_start);
+        }
+        Ok(())
+    }
+    fn name(&self) -> &str { "Move Clip" }
+}
+
+// Data needed to restore a clip
+pub struct DeletedClipData {
+    pub path: String,
+    pub start_time: Duration,
+    pub offset: Duration,
+    pub duration: Duration,
+    pub source_duration: Duration,
+    pub source_sr: u32,
+    pub source_ch: usize,
+}
+
+pub struct DeleteClip {
+    pub track_id: TrackId,
+    pub clip_index: usize,
+    pub clip_data: DeletedClipData, // Saved state for Undo
+}
+
+impl Command for DeleteClip {
+    fn execute(&self, engine: &mut Engine) -> Result<()> {
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            track.delete_clip(self.clip_index)?;
+        }
+        Ok(())
+    }
+    fn undo(&self, engine: &mut Engine) -> Result<()> {
+        // FIX: Capture variables before borrowing tracks_mut()
+        let sr = engine.sample_rate;
+        let ch = engine.channels;
+
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            // NOTE: This call will fail to compile UNTIL you update track.rs in the next step.
+            track.restore_clip(
+                self.clip_index,
+                self.clip_data.path.clone(),
+                self.clip_data.start_time,
+                self.clip_data.offset,
+                self.clip_data.duration,
+                self.clip_data.source_duration,
+                self.clip_data.source_sr,
+                self.clip_data.source_ch,
+                sr,
+                ch
+            )?;
+        }
+        Ok(())
+    }
+    fn name(&self) -> &str { "Delete Clip" }
+}
+
+pub struct SplitClip {
+    pub track_id: TrackId,
+    pub split_time: Duration,
+}
+
+impl Command for SplitClip {
+    fn execute(&self, engine: &mut Engine) -> Result<()> {
+         // FIX: Capture variables before borrowing tracks_mut()
+         let sr = engine.sample_rate;
+         let ch = engine.channels;
+         
+         if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+             track.split_at_time(self.split_time, sr, ch)?;
+         }
+         Ok(())
+    }
+    fn undo(&self, engine: &mut Engine) -> Result<()> {
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            // Find the clip that ends at split_time (the left half)
+            // merge_next takes the index of the LEFT clip.
+            // We need to find index `i` where `clips[i].end == split_time`
+            
+            let eps = 0.001;
+            let split_secs = self.split_time.as_secs_f64();
+            
+            if let Some(idx) = track.clips.iter().position(|c| {
+                let end = c.start_time.as_secs_f64() + c.duration.as_secs_f64();
+                (end - split_secs).abs() < eps
+            }) {
+                track.merge_next(idx)?;
+            }
+        }
+        Ok(())
+    }
+    fn name(&self) -> &str { "Split Clip" }
+}
+
+pub struct UpdateEq {
+    pub track_id: TrackId,
+    pub band_index: usize,
+    pub old_params: EqParams,
+    pub new_params: EqParams,
+}
+
+impl Command for UpdateEq {
+    fn execute(&self, engine: &mut Engine) -> Result<()> {
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            track.track_eq.update_band(self.band_index, self.new_params);
+        }
+        Ok(())
+    }
+    fn undo(&self, engine: &mut Engine) -> Result<()> {
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            track.track_eq.update_band(self.band_index, self.old_params);
+        }
+        Ok(())
+    }
+    fn name(&self) -> &str { "EQ Change" }
 }

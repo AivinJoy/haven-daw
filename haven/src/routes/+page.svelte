@@ -483,6 +483,20 @@
         }
     }
 
+    // --- NEW: Listen for Undo/Redo Events ---
+    // --- NEW: Listen for Undo/Redo Events ---
+    $effect(() => {
+        const handleRefresh = () => refreshProjectState();
+        
+        // Listen for the custom event dispatched by TopToolbar
+        window.addEventListener('refresh-project', handleRefresh);
+        
+        // Cleanup when component unmounts
+        return () => {
+            window.removeEventListener('refresh-project', handleRefresh);
+        };
+    });
+
     // --- PLAYBACK LOOP ---
     async function togglePlayback() {
         if (isRecordingMode) { await stopRecordingLogic(); return; }

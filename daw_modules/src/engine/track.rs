@@ -605,4 +605,30 @@ impl Track {
 
         dst.len() / channels
     }
+    // --- ADD THIS NEW METHOD ---
+    pub fn restore_clip(
+        &mut self,
+        index: usize,
+        path: String,
+        start: Duration,
+        offset: Duration,
+        dur: Duration,
+        src_dur: Duration,
+        src_sr: u32,
+        src_ch: usize,
+        out_sr: u32,
+        out_ch: usize
+    ) -> anyhow::Result<()> {
+        let clip = Clip::new_known(
+            path, start, offset, dur, src_dur, src_sr, src_ch, out_sr, out_ch
+        )?;
+        
+        if index <= self.clips.len() {
+            self.clips.insert(index, clip);
+        } else {
+            self.clips.push(clip);
+        }
+        println!("♻️ Restored clip at index {}", index);
+        Ok(())
+    }
 }
