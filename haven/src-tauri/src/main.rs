@@ -24,6 +24,7 @@ struct AppState {
     audio: Mutex<AudioRuntime>,
     recorder: Mutex<Option<Recorder>>,
     cache: Mutex<HashMap<String, ImportResult>>,
+    track_colors: Mutex<HashMap<u32, String>>,
 }
 
 // --- 2. Define Return Struct ---
@@ -35,6 +36,7 @@ struct ImportResult {
     duration: f64,
     bins_per_second: f64,
     bpm: Option<f32>, // New field for BPM
+    color: String,
 }
 
 // Helper function to build the UI state from the raw track list
@@ -44,20 +46,46 @@ fn build_ui_state(
     bpm: f32,
     master_gain: f32,
     silent: bool,
-    cache_store: &Mutex<HashMap<String, ImportResult>>
+    cache_store: &Mutex<HashMap<String, ImportResult>>,
+    color_store: &Mutex<HashMap<u32, String>>
 ) -> Result<ProjectState, String> {
     
     let mut results = Vec::new();
-    let colors = [
+    let available_colors = [
         "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
         "bg-emerald-500", "bg-orange-500", "bg-pink-500",
         "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
     ];
 
     for info in tracks_info.iter() {
-        let track_id = info.id + 1; // Frontend uses 1-based ID
-        let color_idx = (info.id as usize) % colors.len(); 
-        let color = colors[color_idx].to_string();
+        let raw_id = info.id; // Frontend uses 1-based ID
+        // 1. Try to find existing color
+        let stored_color = {
+            let map = color_store.lock().map_err(|_| "Failed to lock colors")?;
+            map.get(&raw_id).cloned()
+        };
+
+        let color = if let Some(c) = stored_color {
+            c // ✅ Found it! Use the permanent color.
+        } else {
+            // 🎲 New Track? Pick a RANDOM color.
+            // Simple pseudo-random using time if rand crate isn't available, 
+            // or just rotation based on ID + SystemTime for variety.
+            // Let's use a simple rotation offset by time to simulate random
+            let time_factor = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as usize;
+            
+            let random_idx = (raw_id as usize + time_factor) % available_colors.len();
+            let new_color = available_colors[random_idx].to_string();
+
+            // Save it forever (for this session)
+            if let Ok(mut map) = color_store.lock() {
+                map.insert(raw_id, new_color.clone());
+            }
+            new_color
+        };
+
+        let track_id = raw_id + 1;
         
         let mut loaded_clips = Vec::new();
 
@@ -83,6 +111,7 @@ fn build_ui_state(
                     duration: clip_info.duration, // Use duration from backend info
                     bins_per_second: 100.0,
                     bpm: None,
+                    color: "".to_string(),
                 }
             };
 
@@ -227,10 +256,23 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
         });
 
         // LOCK SCOPE: Only lock audio for the split second we need to add the track
-        {
+        // LOCK SCOPE: Add track AND Set Name
+        let track_id_for_color = {
             let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
             audio.add_track(path.clone()).map_err(|e| e.to_string())?;
-        } // <--- LOCK IS DROPPED HERE. Audio engine is free now.
+            
+            // FIX 1: Set the Name in the Backend immediately
+            let track_list = audio.get_tracks_list();
+            let id = track_list.len() - 1; // Assuming new track is last
+            let raw_id = track_list[id].id; // Get the actual ID
+            
+            let filename = std::path::Path::new(&path)
+                .file_name().unwrap_or_default().to_string_lossy().to_string();
+            
+            audio.set_track_name(id, filename);
+            
+            raw_id // Return ID for color generation
+        };
 
         // Force UI Update
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -312,6 +354,23 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
         let spp = (sr as f64) / pixels_per_second;
         let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
 
+        // FIX 2: Generate Permanent Color
+        let available_colors = [
+            "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
+            "bg-emerald-500", "bg-orange-500", "bg-pink-500",
+            "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
+        ];
+        // Use ID + Time for randomness
+        let time_factor = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as usize;
+        let random_idx = (track_id_for_color as usize + time_factor) % available_colors.len();
+        let assigned_color = available_colors[random_idx].to_string();
+
+        // SAVE Color to State (So Undo remembers it)
+        if let Ok(mut colors) = state.track_colors.lock() {
+            colors.insert(track_id_for_color, assigned_color.clone());
+        }
+
         // 1. Create the result object first
         let result = ImportResult {
             mins: mins.to_vec(),
@@ -319,6 +378,7 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
             duration: wf.duration_secs,
             bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
             bpm: detected_bpm,
+            color: assigned_color,
         };
 
         // 2. WRITE TO CACHE (This is the critical fix)
@@ -366,6 +426,7 @@ fn analyze_file(path: String) -> Result<ImportResult, String> {
         duration: wf.duration_secs,
         bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
         bpm: detected_bpm,
+        color: "".to_string(),
     })
 }
 
@@ -661,8 +722,8 @@ async fn get_project_state(
     drop(audio_runtime); // Release lock
 
     // 2. Build UI State (Reuse Helper)
-    let state = build_ui_state(&app, tracks_info, bpm, master_gain, true, &state.cache)?;
-
+    // Pass cache AND color store
+    let state = build_ui_state(&app, tracks_info, bpm, master_gain, true, &state.cache, &state.track_colors)?;
     Ok(state)
 }
 
@@ -767,8 +828,12 @@ async fn load_project(
                       let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
                       
                       let data = ImportResult {
-                          mins: mins.to_vec(), maxs: maxs.to_vec(), duration: wf.duration_secs,
-                          bins_per_second: pixels_per_second, bpm: None
+                            mins: mins.to_vec(),
+                            maxs: maxs.to_vec(), 
+                            duration: wf.duration_secs,
+                            bins_per_second: pixels_per_second,
+                            bpm: None,
+                            color: String::new(),
                       };
                       
                       state.cache.lock().unwrap().insert(path_key, data);
@@ -778,7 +843,8 @@ async fn load_project(
     }
 
     // 3. Build UI State (Reuse Helper)
-    let state = build_ui_state(&app, tracks_info, bpm, master_gain, false, &state.cache)?;
+    // Pass cache AND color store
+    let state = build_ui_state(&app, tracks_info, bpm, master_gain, false, &state.cache, &state.track_colors)?;
 
     let _ = app.emit("load-percent", 100.0);
     let _ = app.emit("load-progress", "Ready");
@@ -803,6 +869,7 @@ fn main() {
             audio: Mutex::new(runtime),
             recorder: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
+            track_colors: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             play,

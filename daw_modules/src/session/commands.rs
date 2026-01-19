@@ -226,9 +226,6 @@ impl Command for DeleteClip {
                 self.clip_data.start_time,
                 self.clip_data.offset,
                 self.clip_data.duration,
-                self.clip_data.source_duration,
-                self.clip_data.source_sr,
-                self.clip_data.source_ch,
                 sr,
                 ch
             )?;

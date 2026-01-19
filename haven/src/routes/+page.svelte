@@ -249,7 +249,8 @@
                         const filename = path.split(/[\\/]/).pop() || `Imported ${currentIdCounter}`;
                         
                         // Assign a random color for each track in the batch
-                        const batchColor = colors[Math.floor(Math.random() * colors.length)];
+                        // Use the color sent from the backend!
+                        const batchColor = result.color;
 
                         // Update BPM if detected (only from the first track to avoid jumping)
                         if (i === 0 && result.bpm && result.bpm > 0) {

@@ -648,4 +648,12 @@ impl AudioRuntime {
             None
         }
     }
+
+    pub fn set_track_name(&self, track_index: usize, name: String) {
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().get_mut(track_index) {
+                track.name = name;
+            }
+        }
+    }
 }
