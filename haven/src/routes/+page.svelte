@@ -13,6 +13,7 @@
     import Loader from '$lib/components/Loader.svelte';
     import { recordingManager } from '$lib/managers/RecordingManager';
     import EqWindow from "$lib/components/EqWindow.svelte";
+    import AIChatbot from '$lib/components/AIChatbot.svelte';
 
     // --- STATE ---
     let view: 'landing' | 'studio' = $state('landing');
@@ -504,6 +505,10 @@
     function handleKeydown(e: KeyboardEvent) {
         if (view !== 'studio') return;
 
+        // 🛑 FIX: Ignore global shortcuts if user is typing in an Input or Textarea
+        const target = e.target as HTMLElement;
+        if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+
         switch (e.code) {
             case 'Space':
                 e.preventDefault();
@@ -583,6 +588,8 @@
         /> 
 
     </div>
+
+    <AIChatbot {tracks} />
 
   {/if}
   {#if showEqWindow}

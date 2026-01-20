@@ -10,6 +10,7 @@ use std::time::Duration;
 use std::collections::HashMap;
 use tauri::{State, Emitter};
 use cpal::traits::{HostTrait, DeviceTrait};
+use dotenv::dotenv;
 
 // Import modules
 use daw_modules::audio_runtime::AudioRuntime;
@@ -898,7 +899,123 @@ fn get_temp_path(filename: String) -> String {
     path.to_string_lossy().to_string()
 }
 
+// ==========================================================
+// 🚀 AI CHATBOT IMPLEMENTATION (NEW)
+// ==========================================================
+
+#[derive(serde::Deserialize)]
+struct GroqApiResponse {
+    choices: Vec<GroqChoice>,
+}
+
+#[derive(serde::Deserialize)]
+struct GroqChoice {
+    message: GroqMessage,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GroqMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+struct AiErrorResponse {
+    action: String,
+    message: String,
+}
+
+#[tauri::command]
+async fn ask_ai(user_input: String, track_context: String) -> Result<String, String> {
+    // 1. Setup Client with Strict Timeout (Prevent UI Freeze)
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8)) // 8-second hard limit
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // 2. Get API Key from Environment
+    // NOTE: In production, you might want to load this from a user config file
+    let api_key = std::env::var("GROQ_API_KEY").unwrap_or_else(|_| "".to_string());
+    
+    if api_key.is_empty() {
+         return Ok(serde_json::to_string(&AiErrorResponse {
+             action: "none".into(),
+             message: "Error: Missing GROQ_API_KEY environment variable.".into()
+         }).unwrap());
+    }
+
+    // 3. Construct System Prompt (Strict JSON Schema)
+    let system_prompt = format!(
+        "You are an intelligent assistant for a DAW (Haven). \
+        You control the app via JSON commands. \
+        \n\nCONTEXT:\nTracks: [{}]\n\n\
+        USER REQUEST: '{}'\n\n\
+        RESPONSE SCHEMA (Strict JSON Only):\n\
+        {{ \n\
+          \"action\": \"set_gain\" | \"set_pan\" | \"toggle_mute\" | \"toggle_solo\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"clarify\" | \"none\", \n\
+          \"parameters\": {{ \n\
+            \"track_id\": number (optional), \n\
+            \"value\": number (optional), \n\
+            \"time\": number (optional) \n\
+          }}, \n\
+          \"message\": \"User-friendly confirmation text\", \n\
+          \"confidence\": 0.0-1.0 \n\
+        }}\n\n\
+        RULES:\n\
+        1. If user input is ambiguous or missing track info, return action='clarify'.\n\
+        2. If unrelated to audio/DAW, return action='none'.\n\
+        3. Tracks are 1-based IDs.\n\
+        4. Do NOT output markdown or explanations outside JSON.",
+        track_context, user_input
+    );
+
+    // 4. Construct Request Payload
+    let payload = serde_json::json!({
+        "model":   "qwen/qwen3-32b", //"qwen-2.5-72b-instruct",  //"llama3-70b-8192", // Fast & Good at JSON
+        "messages": [
+            {   "role": "system",
+                "content": system_prompt }
+        ],
+        "response_format": { "type": "json_object" },
+
+        "temperature" : 0, // Low creativity = High accuracy for code
+        "max_tokens" : 600, // Prevent rambling
+        "top_p": 1.0,   // Standard sampling
+        "stream": false // We need full JSON to execute
+    });
+
+    // 5. Send Request
+    let res = client.post("https://api.groq.com/openai/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Network Error: {}", e))?;
+
+    if !res.status().is_success() {
+        return Ok(serde_json::to_string(&AiErrorResponse {
+            action: "none".into(),
+            message: format!("AI Service Error: {}", res.status())
+        }).unwrap());
+    }
+
+    // 6. Parse Response
+    let chat_res: GroqApiResponse = res.json().await.map_err(|e| format!("Parse Error: {}", e))?;
+    
+    if let Some(choice) = chat_res.choices.first() {
+        Ok(choice.message.content.clone())
+    } else {
+         Ok(serde_json::to_string(&AiErrorResponse {
+             action: "none".into(),
+             message: "AI returned empty response.".into()
+         }).unwrap())
+    }
+}
+
 fn main() {
+
+    dotenv().ok();
     let runtime = AudioRuntime::new(None).expect("Failed to init Audio Engine");
 
     tauri::Builder::default()
@@ -945,8 +1062,10 @@ fn main() {
             get_output_devices,
             get_input_devices,
             undo,
-            redo
+            redo,
+            ask_ai
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+    
 }
