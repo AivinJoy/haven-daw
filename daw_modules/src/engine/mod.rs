@@ -24,6 +24,7 @@ pub struct Engine {
     pub master_gain: f32, // <--- New Field
     tracks: Vec<Track>,
     mixer: Mixer,
+    next_id: u32,
 }
 
 impl Engine {
@@ -39,6 +40,7 @@ impl Engine {
             master_gain: 1.0, // <--- FIXED: Initialized here (Default 1.0 = 100%)
             tracks: Vec::new(),
             mixer: Mixer::new(channels),
+            next_id: 0,
         }
     }
 
@@ -53,7 +55,8 @@ impl Engine {
     // --- NEW: Create a generic empty track ---
     // --- NEW: Create a generic empty track ---
     pub fn add_empty_track(&mut self) -> TrackId {
-        let id = TrackId(self.tracks.len() as u32);
+        let id = TrackId(self.next_id);
+        self.next_id += 1; 
         // UPDATED: Pass self.sample_rate as the 3rd argument
         // Pass self.channels as the 4th argument
         let track = Track::new(id, format!("Track {}", id.0 + 1), self.sample_rate, self.channels);

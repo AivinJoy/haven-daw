@@ -77,7 +77,6 @@
             });
 
             if (path && typeof path === 'string') {
-
                 // 1. Backend: Load Engine State & Re-Analyze Waveforms
                 const projectState = await invoke<{
                   tracks: Track[],
@@ -102,7 +101,6 @@
         } catch (e) {
             console.error("Load failed:", e);
             alert("Failed to load: " + e);
-        } finally {
         }
     }
 
@@ -165,151 +163,92 @@
     }
 
     // --- CORE LOGIC: ADD TRACK + BACKEND IMPORT ---
+    // --- CORE LOGIC: ADD TRACK (STRICT BACKEND AUTHORITY) ---
     async function addNewTrack(type: string) {
-        const maxId = tracks.length > 0 ? Math.max(...tracks.map(t => t.id)) : 0;
-        const id = maxId + 1;
         
-        const colors = [
-            'bg-brand-blue', 
-            'bg-brand-red', 
-            'bg-purple-500', 
-            'bg-emerald-500', 
-            'bg-orange-500', 
-            'bg-pink-500',
-            'bg-cyan-500',   // Added extra variety
-            'bg-indigo-500', // Added extra variety
-            'bg-rose-500'    // Added extra variety
-        ];
-        const color = colors[Math.floor(Math.random() * colors.length)];
-        
-        // Default mixer values
-        const defaultMixer = {
-            gain: 1.0,
-            pan: 0.0,
-            muted: false,
-            solo: false,
+        // 1. We only define the UI flags here. 
+        // Gain, Pan, Mute, Solo come from the Backend in 'newTrack'.
+        const defaultMixerUI = {
+            isRecording: false,
+            source: 'media' as const,
             monitor: false
         };
-      
-        if (type === 'record') {
-            // 1. Setup File Path (In real app, use a project folder)
-            tracks = tracks.map(t => ({ ...t, isRecording: false }));
-            const filename = `Recording_${id}.wav`;
-            const savePath = await invoke<string>('get_temp_path', { filename }); 
 
-            // 2. Add "Placeholder" Track (Red, growing)
-            tracks = [...tracks, { 
-                id, 
-                name: "Recording...", 
-                color: color, 
-                // startTime: currentTime, 
-                // duration: 0, 
-                clips: [],
-                ...defaultMixer,
-                isRecording: true, // Flag for custom styling if needed
-                savePath: savePath,
-                source: 'mic'
-            }];
+        if (type === 'record') {
             try {
-                await invoke('create_track');
-                console.log("✅ Backend track created.");
+                // Ask Backend to Create Track (Returns ID, Name, Color, Gain, Pan, etc.)
+                const newTrack = await invoke<Track>('create_track');
+                
+                // Setup Recording Path
+                const filename = `Recording_${newTrack.id}.wav`;
+                const savePath = await invoke<string>('get_temp_path', { filename });
+
+                // Merge Backend Data + UI Flags
+                tracks = [...tracks, { 
+                    ...newTrack,          // <--- This brings in gain:1.0, pan:0.0, etc.
+                    ...defaultMixerUI,    // <--- This adds monitor:false, source:'media'
+                    name: "Recording...", 
+                    isRecording: true,    
+                    source: 'mic',
+                    savePath: savePath
+                }];
+                
+                console.log(`✅ Track ${newTrack.id} Created & Armed.`);
             } catch (e) {
                 console.error("Failed to create backend track:", e);
             }
-            // ----------------------------------------
-          
-            console.log("Track Armed. Press Record button to start.");
-          
         }
         else if (type === 'import' || type === 'upload') {
             try {
-                // 1. Allow Multiple Files
                 const selected = await openDialog({
-                    multiple: true, // <--- CHANGED
+                    multiple: true,
                     filters: [{ name: 'Audio', extensions: ['wav', 'mp3', 'flac', 'ogg'] }]
                 });
-              
+                
                 if (selected) {
-                    // Normalize to Array (Tauri returns string if single, array if multiple)
                     const paths = Array.isArray(selected) ? selected : [selected];
 
-
-                    // 2. Call the NEW Plural Backend Command
-                    // This command emits events that update 'loadingMessage' automatically via your listener
+                    // Backend handles import and returns analysis
                     const results = await invoke<any[]>('import_tracks', { paths });
 
-                    // 3. Process the list of results
-                    // We need to determine the starting ID for the batch
-                    let currentIdCounter = tracks.length > 0 ? Math.max(...tracks.map(t => t.id)) : 0;
+                    if (tracks.length === 0 && results.length > 0 && results[0].bpm) {
+                        bpm = Math.round(results[0].bpm);
+                    }
 
-                    results.forEach((result, i) => {
-                        currentIdCounter++; // Increment ID for each new track
-                        
-                        const path = paths[i];
-                        const filename = path.split(/[\\/]/).pop() || `Imported ${currentIdCounter}`;
-                        
-                        // Assign a random color for each track in the batch
-                        // Use the color sent from the backend!
-                        const batchColor = result.color;
-
-                        // Update BPM if detected (only from the first track to avoid jumping)
-                        if (i === 0 && result.bpm && result.bpm > 0) {
-                            bpm = Math.round(result.bpm); 
-                        }
-                        
-                        const newClip: Clip = {
-                            id: `clip_${Date.now()}_${i}`,
-                            trackId: currentIdCounter,
-                            name: filename,
-                            path: path,
-                            startTime: 0,
-                            duration: result.duration,
-                            offset: 0,
-                            waveform: { mins: result.mins, maxs: result.maxs, duration: result.duration, binsPerSecond: result.binsPerSecond },
-                            color: batchColor
-                        };
-
-                        // Push to tracks array
-                        tracks.push({ 
-                            id: currentIdCounter, 
-                            name: filename, 
-                            color: batchColor, 
-                            clips: [newClip],
-                            ...defaultMixer, 
-                            isRecording: false,
-                            source: 'media'
-                        });
-                    });
-
-                    // 4. Trigger Svelte Reactivity
-                    tracks = [...tracks];
+                    // Refresh to get the tracks created by the import command
+                    await refreshProjectState(); 
                 }
             } catch (e) {
                 console.error("Import failed:", e);
-            } finally {
             }
         } 
         else {
-            const name = `Track ${id}`;
-            tracks = [...tracks, { id, name, color, clips: [],  ...defaultMixer, isRecording: false, source: 'media' }];
+             // Generic Empty Track
+             try {
+                const newTrack = await invoke<Track>('create_track');
+                // Merge Backend Data + UI Flags
+                tracks = [...tracks, { 
+                    ...newTrack, 
+                    ...defaultMixerUI 
+                }];
+             } catch(e) {
+                 console.error("Failed to add track", e);
+             }
         }
     }
 
     async function handleDeleteTrack(event: CustomEvent<number>) {
         const index = event.detail;
         
-        // 1. Optimistic Update
-        tracks.splice(index, 1);
-        tracks = [...tracks]; // Trigger reactivity
-
-        // 2. Call Backend
+        // 1. Call Backend
         try {
             await invoke('delete_track', { trackIndex: index });
             console.log("🗑️ Track deleted");
+            // 2. Sync State (Safest way to ensure IDs stay aligned)
+            await refreshProjectState();
         } catch (e) {
             console.error("Failed to delete track:", e);
             alert("Error deleting track: " + e);
-            refreshProjectState(); // Rollback/Sync on error
         }
     }
 
@@ -424,6 +363,7 @@
     }
 
     // --- 4. UPDATED STOP LOGIC ---
+   // --- STOP LOGIC ---
     async function stopRecordingLogic() {
         await invoke('pause');
         isPlaying = false;
@@ -431,57 +371,46 @@
 
         isRecordingMode = false;
         const result = await recordingManager.stop();
-
+        
         if (result) {
-            const tIdx = tracks.findIndex(t => t.isRecording);
-            const trackColor = tracks[tIdx].color;
-
-            if (tIdx !== -1) {
-                const clips = tracks[tIdx].clips;
-                const lastClipIdx = clips.length - 1;
-
-                if (lastClipIdx >= 0) {
-                    // Finalize the clip data
-                    // We update the specific clip with the new Waveform data
-                    tracks[tIdx].clips[lastClipIdx] = {
-                        ...tracks[tIdx].clips[lastClipIdx],
-                        name: `Take ${clips.length}`,
-                        color: trackColor,
-                        duration: result.duration,
-                        waveform: { mins: result.mins, maxs: result.maxs, duration: result.duration, binsPerSecond: (result as any).binsPerSecond ?? 100 } 
-                    };
-
-                    // Cleanup recording state
-                    tracks[tIdx].savePath = undefined;
-
-                    // CRITICAL: Trigger Svelte Reactivity
-                    tracks = [...tracks]; 
-
-                    console.log("🌊 Visuals updated for track", tracks[tIdx].id);
-                }
-            }
+            // After recording stops, the backend has analyzed and cached the file.
+            // We refresh the project state to get the final, authoritative clip data
+            // instead of trying to patch it manually.
+            await refreshProjectState();
+            console.log("🌊 Project Synced after recording");
         }
     }
 
     // NEW: Function to refresh tracks from backend
+    // Refresh tracks from backend
     async function refreshProjectState() {
         try {
-
             const projectState = await invoke<{
               tracks: Track[],
               bpm: number,
               masterGain: number
             }>('get_project_state');
+            
+            // We preserve 'isRecording', 'monitor', and 'source' flags which are UI-only
+            // by merging them back into the fresh state based on ID matching.
+            const oldStateMap = new Map(tracks.map(t => [t.id, t]));
+            
+            tracks = projectState.tracks.map(newTrack => {
+                const oldTrack = oldStateMap.get(newTrack.id);
+                return {
+                    ...newTrack,
+                    isRecording: oldTrack ? oldTrack.isRecording : false,
+                    monitor: oldTrack ? oldTrack.monitor : false,
+                    source: oldTrack ? oldTrack.source : 'media',
+                    savePath: oldTrack ? oldTrack.savePath : undefined
+                };
+            });
 
-            // Force reactivity update
-            tracks = projectState.tracks;
             bpm = projectState.bpm;
-
             console.log("🔄 Project State Refreshed");
         } catch (e) {
             console.error("Failed to refresh project:", e);
-        } finally {
-        }
+        } 
     }
 
     // --- NEW: Listen for Undo/Redo Events ---

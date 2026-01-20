@@ -68,14 +68,9 @@ fn build_ui_state(
         let color = if let Some(c) = stored_color {
             c // ✅ Found it! Use the permanent color.
         } else {
-            // 🎲 New Track? Pick a RANDOM color.
-            // Simple pseudo-random using time if rand crate isn't available, 
-            // or just rotation based on ID + SystemTime for variety.
-            // Let's use a simple rotation offset by time to simulate random
-            let time_factor = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as usize;
-            
-            let random_idx = (raw_id as usize + time_factor) % available_colors.len();
+            // 🎲 New Track? Pick a Color deterministically based on ID 
+            // to avoid "random" changes if ID persists (e.g. during Undo)
+            let random_idx = (raw_id as usize) % available_colors.len();
             let new_color = available_colors[random_idx].to_string();
 
             // Save it forever (for this session)
@@ -360,10 +355,8 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
             "bg-emerald-500", "bg-orange-500", "bg-pink-500",
             "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
         ];
-        // Use ID + Time for randomness
-        let time_factor = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as usize;
-        let random_idx = (track_id_for_color as usize + time_factor) % available_colors.len();
+        // [Refinement 2] Deterministic color based on ID
+        let random_idx = (track_id_for_color as usize) % available_colors.len();
         let assigned_color = available_colors[random_idx].to_string();
 
         // SAVE Color to State (So Undo remembers it)
@@ -402,7 +395,7 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
 }
 
 #[tauri::command]
-fn analyze_file(path: String) -> Result<ImportResult, String> {
+fn analyze_file(path: String, state: State<AppState>) -> Result<ImportResult, String> {
     // 1. Decode (Analysis)
     let (samples, sr, channels) = bpm::adapter::decode_to_vec(&path)
         .map_err(|e| format!("Failed to decode: {}", e))?;
@@ -420,14 +413,21 @@ fn analyze_file(path: String) -> Result<ImportResult, String> {
     let spp = (sr as f64) / pixels_per_second;
     let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
 
-    Ok(ImportResult {
+    let result = ImportResult {
         mins: mins.to_vec(),
         maxs: maxs.to_vec(),
         duration: wf.duration_secs,
         bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
         bpm: detected_bpm,
-        color: "".to_string(),
-    })
+        color: "".to_string(), // Frontend assigns color for clips, or we ignore
+    };
+
+    // CRITICAL FIX: Save to cache so Undo can find it
+    if let Ok(mut cache) = state.cache.lock() {
+        cache.insert(path.clone(), result.clone());
+    }
+
+    Ok(result)
 }
 
 #[tauri::command]
@@ -597,11 +597,50 @@ fn add_clip(
     Ok(())
 }
 
+// [Refinement 1] Create Track: Source of Truth
+// Returns the fully formed track data (ID, Name, Color) to the frontend.
 #[tauri::command]
-fn create_track(state: State<AppState>) -> Result<(), String> {
+fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
     audio.create_empty_track().map_err(|e| e.to_string())?;
-    Ok(())
+    
+    // 1. Fetch the track we just created (It is the last one in the list)
+    let tracks = audio.get_tracks_list();
+    let info = tracks.last().ok_or("Track creation failed")?;
+    let raw_id = info.id; // Monotonic ID
+    let track_id_display = raw_id + 1; // 1-based for UI display
+
+    // 2. Generate Metadata (Name & Color)
+    // [Refinement 2] Standardized naming: "Track-01", "Track-02"
+    let new_name = format!("Track-{:02}", track_id_display);
+    
+    let available_colors = [
+        "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
+        "bg-emerald-500", "bg-orange-500", "bg-pink-500",
+        "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
+    ];
+    let color_idx = (raw_id as usize) % available_colors.len();
+    let color = available_colors[color_idx].to_string();
+    
+    // 3. Persist Metadata in Backend
+    // Set Name in Engine
+    let index = tracks.len() - 1; 
+    audio.set_track_name(index, new_name.clone());
+    
+    // Set Color in AppState
+    state.track_colors.lock().unwrap().insert(raw_id, color.clone());
+    
+    // 4. Return to Frontend
+    Ok(LoadedTrack {
+        id: track_id_display, // Matches the convention in build_ui_state
+        name: new_name,
+        color: color,
+        clips: vec![],
+        gain: 1.0,
+        pan: 0.0,
+        muted: false,
+        solo: false
+    })
 }
 
 #[tauri::command]
