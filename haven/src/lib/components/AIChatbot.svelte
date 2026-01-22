@@ -20,6 +20,11 @@
             content: input, 
             timestamp: Date.now() 
         };
+
+        // Keep a reference to the history BEFORE adding the new message
+        // (Or include it? Usually better to send history + current input separately, 
+        // but our backend logic appends current input. So let's pass 'messages' as is).
+        const historyToSend = [...messages];
         
         // Add user message immediately (right aligned)
         messages = [...messages, userMsg];
@@ -27,8 +32,8 @@
         input = "";
         isLoading = true;
 
-        // Process with Agent
-        const response = await aiAgent.sendMessage(currentInput, tracks);
+        // PASS HISTORY HERE
+        const response = await aiAgent.sendMessage(currentInput, tracks, historyToSend);
         
         messages = [...messages, response];
         isLoading = false;
@@ -66,7 +71,7 @@
                                 : 'bg-white/5 text-white/90 rounded-tl-none border border-white/5'
                             }`}
                         >
-                            {#if msg.role === 'ai'} <Bot size={14} class="opacity-50" /> {/if}
+                            {#if msg.role === 'assistant'} <Bot size={14} class="opacity-50" /> {/if}
                             <span>{msg.content}</span>
                         </div>
 

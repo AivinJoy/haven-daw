@@ -416,15 +416,69 @@
 
     // --- NEW: Listen for Undo/Redo Events ---
     // --- NEW: Listen for Undo/Redo Events ---
+    // --- NEW: Global Event Listeners (Undo/Redo + AI Commands) ---
     $effect(() => {
         const handleRefresh = () => refreshProjectState();
+
+        const handleAICommand = async (e: Event) => {
+            const customEvent = e as CustomEvent;
+            const { action, mode, time, direction } = customEvent.detail;
+            console.log("⚡ Page received AI Command:", action, mode);
+
+            switch (action) {
+                case 'play':
+                    if (!isPlaying) togglePlayback();
+                    break;
+                case 'pause':
+                    if (isPlaying) togglePlayback();
+                    break;
+                case 'rewind':
+                    rewind(); // Calls your existing rewind() function (Seek 0)
+                    break;
+
+                // --- NEW SEEK LOGIC ---
+                case 'seek':
+                    if (time === undefined) return;
+                    
+                    let targetTime = time;
+
+                    if (direction === 'forward') {
+                        targetTime = currentTime + time;
+                    } else if (direction === 'backward') {
+                        targetTime = currentTime - time;
+                    }
+                    
+                    // Clamp to 0 (cannot seek before start)
+                    seekTo(Math.max(0, targetTime));
+                    break;
+                // ----------------------
+                    
+                case 'record':
+                    // Toggle recording logic
+                    // FIX: If AI specified a track (e.g., "Record on Track 2"), ARM it first!
+                    if (customEvent.detail.trackId) {
+                        console.log("🤖 AI Arming Track:", customEvent.detail.trackId);
+                        armTrack(customEvent.detail.trackId);
+                    }
+
+                    // Then proceed with toggle logic
+                    if (isRecordingMode) stopRecordingLogic();
+                    else startRecordingLogic();
+                    break;
+                case 'create_track':
+                    // Handle "Add audio track" vs "Add empty track"
+                    if (mode === 'record') await addNewTrack('record');
+                    else await addNewTrack('default');
+                    break;
+            }
+        };
         
-        // Listen for the custom event dispatched by TopToolbar
         window.addEventListener('refresh-project', handleRefresh);
+        window.addEventListener('ai-command', handleAICommand);
         
-        // Cleanup when component unmounts
         return () => {
             window.removeEventListener('refresh-project', handleRefresh);
+            window.removeEventListener('ai-command', handleAICommand);
         };
     });
 

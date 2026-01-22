@@ -42,7 +42,7 @@ struct ImportResult {
 
 // Helper function to build the UI state from the raw track list
 fn build_ui_state(
-    app: &tauri::AppHandle, 
+    _app: &tauri::AppHandle, 
     tracks_info: Vec<daw_modules::audio_runtime::FrontendTrackInfo>,
     bpm: f32,
     master_gain: f32,
@@ -603,18 +603,43 @@ fn add_clip(
 #[tauri::command]
 fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    
+    // 1. Calculate Smart Name (Gap Filling) BEFORE creating the track
+    let existing_tracks = audio.get_tracks_list();
+    let mut used_numbers = Vec::new();
+    
+    for t in &existing_tracks {
+        // Check if name is "Track-XX"
+        if t.name.starts_with("Track-") {
+            if let Ok(num) = t.name.replace("Track-", "").parse::<u32>() {
+                used_numbers.push(num);
+            }
+        }
+    }
+    used_numbers.sort();
+
+    // Find first gap
+    let mut target_num = 1;
+    for num in used_numbers {
+        if num == target_num {
+            target_num += 1;
+        } else if num > target_num {
+            break;
+        }
+    }
+    let new_name = format!("Track-{:02}", target_num);
+
+
+    // 2. Create the Track
     audio.create_empty_track().map_err(|e| e.to_string())?;
     
-    // 1. Fetch the track we just created (It is the last one in the list)
+    // 3. Get the new track info
     let tracks = audio.get_tracks_list();
     let info = tracks.last().ok_or("Track creation failed")?;
-    let raw_id = info.id; // Monotonic ID
-    let track_id_display = raw_id + 1; // 1-based for UI display
+    let raw_id = info.id; 
+    let track_id_display = raw_id + 1; 
 
-    // 2. Generate Metadata (Name & Color)
-    // [Refinement 2] Standardized naming: "Track-01", "Track-02"
-    let new_name = format!("Track-{:02}", track_id_display);
-    
+    // 4. Color Logic
     let available_colors = [
         "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
         "bg-emerald-500", "bg-orange-500", "bg-pink-500",
@@ -623,17 +648,13 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
     let color_idx = (raw_id as usize) % available_colors.len();
     let color = available_colors[color_idx].to_string();
     
-    // 3. Persist Metadata in Backend
-    // Set Name in Engine
+    // 5. Persist Metadata
     let index = tracks.len() - 1; 
     audio.set_track_name(index, new_name.clone());
-    
-    // Set Color in AppState
     state.track_colors.lock().unwrap().insert(raw_id, color.clone());
     
-    // 4. Return to Frontend
     Ok(LoadedTrack {
-        id: track_id_display, // Matches the convention in build_ui_state
+        id: track_id_display, 
         name: new_name,
         color: color,
         clips: vec![],
@@ -913,7 +934,7 @@ struct GroqChoice {
     message: GroqMessage,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct GroqMessage {
     role: String,
     content: String,
@@ -926,7 +947,11 @@ struct AiErrorResponse {
 }
 
 #[tauri::command]
-async fn ask_ai(user_input: String, track_context: String) -> Result<String, String> {
+async fn ask_ai(
+    user_input: String, 
+    track_context: String,
+    chat_history: Vec<GroqMessage>
+) -> Result<String, String> {
     // 1. Setup Client with Strict Timeout (Prevent UI Freeze)
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8)) // 8-second hard limit
@@ -952,11 +977,14 @@ async fn ask_ai(user_input: String, track_context: String) -> Result<String, Str
         USER REQUEST: '{}'\n\n\
         RESPONSE SCHEMA (Strict JSON Only):\n\
         {{ \n\
-          \"action\": \"set_gain\" | \"set_pan\" | \"toggle_mute\" | \"toggle_solo\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"clarify\" | \"none\", \n\
+          \"action\": \"play\" | \"pause\" | \"record\" | \"rewind\" | \"seek\" | \"set_gain\" | \"set_pan\" | \"toggle_mute\" | \"toggle_solo\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"clarify\" | \"none\", \n\
           \"parameters\": {{ \n\
             \"track_id\": number (optional), \n\
             \"value\": number (optional), \n\
-            \"time\": number (optional) \n\
+            \"time\": number (optional), \n\
+            \"mode\": \"audio\" (optional, for create_track) \n\
+            \"direction\": \"forward\" | \"backward\" (optional, for relative seek) \n\
+            \"count\": number (optional, default 1) \n\
           }}, \n\
           \"message\": \"User-friendly confirmation text\", \n\
           \"confidence\": 0.0-1.0 \n\
@@ -964,21 +992,42 @@ async fn ask_ai(user_input: String, track_context: String) -> Result<String, Str
         RULES:\n\
         1. If user input is ambiguous or missing track info, return action='clarify'.\n\
         2. If unrelated to audio/DAW, return action='none'.\n\
-        3. Tracks are 1-based IDs.\n\
+        3. Tracks are 1-based IDs. Match track names loosely (e.g. 'drums' matches 'Kick Drum' or 'Drums').\n\
         4. Do NOT output markdown or explanations outside JSON.",
         track_context, user_input
     );
 
+    // 4. Construct Message Chain (System -> History -> User)
+    let mut messages_payload = Vec::new();
+    
+    // A. System Prompt
+    messages_payload.push(serde_json::json!({ "role": "system", "content": system_prompt }));
+
+    // B. Chat History (The Memory)
+    // We limit history to last 6 messages to save tokens/speed
+    let history_limit = 6;
+    let start_index = if chat_history.len() > history_limit { chat_history.len() - history_limit } else { 0 };
+    
+    for msg in &chat_history[start_index..] {
+        // Map 'ai' or anything else to strict 'assistant' just in case
+        let clean_role = match msg.role.as_str() {
+            "user" => "user",
+            "system" => "system",
+            _ => "assistant", // Fallback for 'ai' or invalid roles
+        };
+        messages_payload.push(serde_json::json!({ "role": clean_role, "content": msg.content }));
+    }
+
+    // C. Current User Input
+    messages_payload.push(serde_json::json!({ "role": "user", "content": user_input }));
+
     // 4. Construct Request Payload
     let payload = serde_json::json!({
         "model":   "qwen/qwen3-32b", //"qwen-2.5-72b-instruct",  //"llama3-70b-8192", // Fast & Good at JSON
-        "messages": [
-            {   "role": "system",
-                "content": system_prompt }
-        ],
+        "messages": messages_payload,
         "response_format": { "type": "json_object" },
 
-        "temperature" : 0, // Low creativity = High accuracy for code
+        "temperature" : 0.0, // Low creativity = High accuracy for code
         "max_tokens" : 600, // Prevent rambling
         "top_p": 1.0,   // Standard sampling
         "stream": false // We need full JSON to execute
@@ -993,10 +1042,15 @@ async fn ask_ai(user_input: String, track_context: String) -> Result<String, Str
         .await
         .map_err(|e| format!("Network Error: {}", e))?;
 
+    // FIX 3: Capture the ACTUAL error message from Groq
     if !res.status().is_success() {
+        let error_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        println!("❌ AI Error Body: {}", error_text); // Prints to your terminal
+        
         return Ok(serde_json::to_string(&AiErrorResponse {
             action: "none".into(),
-            message: format!("AI Service Error: {}", res.status())
+            // Send a sanitized message to UI, but you see full error in terminal
+            message: "I'm having trouble thinking right now (API Error).".into() 
         }).unwrap());
     }
 
