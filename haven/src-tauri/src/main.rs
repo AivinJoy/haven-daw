@@ -977,15 +977,19 @@ async fn ask_ai(
         USER REQUEST: '{}'\n\n\
         RESPONSE SCHEMA (Strict JSON Only):\n\
         {{ \n\
-          \"action\": \"play\" | \"pause\" | \"record\" | \"rewind\" | \"seek\" | \"set_gain\" | \"set_pan\" | \"toggle_mute\" | \"toggle_solo\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"clarify\" | \"none\", \n\
-          \"parameters\": {{ \n\
-            \"track_id\": number (optional), \n\
-            \"value\": number (optional), \n\
-            \"time\": number (optional), \n\
-            \"mode\": \"audio\" (optional, for create_track) \n\
-            \"direction\": \"forward\" | \"backward\" (optional, for relative seek) \n\
-            \"count\": number (optional, default 1) \n\
-          }}, \n\
+          \"steps\": [ \n\
+            {{ \n\
+              \"action\": \"play\" | \"pause\" | \"record\" | \"rewind\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"clarify\" | \"none\", \n\
+              \"parameters\": {{ \n\
+                \"track_id\": number (optional), \n\
+                \"value\": number (optional), \n\
+                \"time\": number (optional), \n\
+                \"mode\": \"audio\" (optional), \n\
+                \"direction\": \"forward\" | \"backward\" (optional), \n\
+                \"count\": number (optional) \n\
+              }} \n\
+            }} \n\
+          ], \n\
           \"message\": \"User-friendly confirmation text\", \n\
           \"confidence\": 0.0-1.0 \n\
         }}\n\n\
@@ -993,7 +997,12 @@ async fn ask_ai(
         1. If user input is ambiguous or missing track info, return action='clarify'.\n\
         2. If unrelated to audio/DAW, return action='none'.\n\
         3. Tracks are 1-based IDs. Match track names loosely (e.g. 'drums' matches 'Kick Drum' or 'Drums').\n\
-        4. Do NOT output markdown or explanations outside JSON.",
+        4. VOLUME RULES: \n\
+             - Range is 0.0 (Silence) to 1.5 (Max Boost).\n\
+             - 'Max volume' = 1.5.\n\
+             - 'Normal/Reset volume' = 1.0.\n\
+             - 'Half volume' = 0.5.\n\
+        5. Do NOT output markdown or explanations outside JSON.",
         track_context, user_input
     );
 

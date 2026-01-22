@@ -470,6 +470,15 @@
                     if (mode === 'record') await addNewTrack('record');
                     else await addNewTrack('default');
                     break;
+
+                case 'toggle_monitor':
+                    if (customEvent.detail.trackId) {
+                         // Reuse your existing logic!
+                         // We create a fake event structure because your handleToggleMonitor expects CustomEvent<number>
+                         handleToggleMonitor(new CustomEvent('toggle', { detail: customEvent.detail.trackId }));
+                    }
+                    break; 
+                    
             }
         };
         

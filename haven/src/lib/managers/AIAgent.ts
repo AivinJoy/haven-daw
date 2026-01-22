@@ -8,12 +8,27 @@ export type AIMessage = {
     action?: string;
 };
 
-export type AIResponse = {
-    action: string;
+interface AIResponse {
+    // New: List of steps for multi-action commands
+    steps?: {
+        action: string;
+        parameters?: {
+            track_id?: number;
+            value?: number;
+            time?: number;
+            mode?: string;
+            direction?: string;
+            count?: number;
+        };
+    }[];
+    
+    // Legacy support (optional, if AI returns single action)
+    action?: string; 
     parameters?: any;
+
     message: string;
-    confidence?: number;
-};
+    confidence: number;
+}
 
 class AIAgent {
     // Reactive state using Svelte 5 Runes pattern if possible, 
@@ -43,17 +58,29 @@ class AIAgent {
                 chatHistory: chatHistory // <--- Passing Memory 
             });
 
-            // 3. Parse JSON
             const data: AIResponse = JSON.parse(rawResponse);
+            console.log("🧠 AI Plan:", data);
 
-            // 4. Execute Action (The Guard)
-            await this.executeAction(data, tracks);
+            // CASE 1: New Multi-Step Format
+            if (data.steps && Array.isArray(data.steps)) {
+                for (const step of data.steps) {
+                    await this.executeAction(step, tracks);
+                    await new Promise(r => setTimeout(r, 100)); // Delay for UI safety
+                }
+            } 
+            // CASE 2: Fallback (Old Single Action Format)
+            else if (data.action) {
+                 await this.executeAction({ 
+                     action: data.action, 
+                     parameters: data.parameters 
+                 }, tracks);
+            }
 
             return {
                 role: 'assistant',
                 content: data.message,
                 timestamp: Date.now(),
-                action: data.action
+                action: data.steps?.[0]?.action || data.action || 'none'
             };
 
         } catch (e) {
@@ -66,14 +93,14 @@ class AIAgent {
         }
     }
 
-    private async executeAction(response: AIResponse, tracks: any[]) {
-        const { action, parameters } = response;
+    private async executeAction(step: any, tracks: any[]) {
+        const { action, parameters } = step;
         console.log("🤖 AI Action:", action, parameters);
 
         if (!action || action === 'none' || action === 'clarify') return;
 
         // Transport & Recording (Handled by +page.svelte via Event)
-        if (['play', 'pause', 'record', 'rewind', 'seek'].includes(action)) {
+        if (['play', 'pause', 'record', 'rewind', 'seek', 'toggle_monitor'].includes(action)) {
             window.dispatchEvent(new CustomEvent('ai-command', { detail: { 
                 action,
                 trackId: parameters?.track_id,
@@ -115,6 +142,12 @@ class AIAgent {
                 const gain = Math.max(0, Math.min(1.5, parameters.value ?? 1.0));
                 await invoke('set_track_gain', { trackIndex: parameters.track_id - 1, gain });
                 break;
+            // --- NEW: Master Gain ---
+            case 'set_master_gain':
+                const masterGain = Math.max(0, Math.min(1.5, parameters.value ?? 1.0));
+                await invoke('set_master_gain', { gain: masterGain });
+                break;
+
             case 'set_pan':
                 const pan = Math.max(-1, Math.min(1, parameters.value ?? 0));
                 await invoke('set_track_pan', { trackIndex: parameters.track_id - 1, pan });
