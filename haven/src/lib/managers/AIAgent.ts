@@ -139,12 +139,12 @@ class AIAgent {
 
         switch (action) {
             case 'set_gain':
-                const gain = Math.max(0, Math.min(1.5, parameters.value ?? 1.0));
+                const gain = Math.max(0, Math.min(2.0, parameters.value ?? 1.0));
                 await invoke('set_track_gain', { trackIndex: parameters.track_id - 1, gain });
                 break;
             // --- NEW: Master Gain ---
             case 'set_master_gain':
-                const masterGain = Math.max(0, Math.min(1.5, parameters.value ?? 1.0));
+                const masterGain = Math.max(0, Math.min(2.0, parameters.value ?? 1.0));
                 await invoke('set_master_gain', { gain: masterGain });
                 break;
 

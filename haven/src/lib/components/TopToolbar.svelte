@@ -14,14 +14,21 @@
       isPlaying = false, 
       isRecording = false, 
       currentTime = 0, 
-      bpm = $bindable(120) 
+      bpm = $bindable(120),
+      masterGain = $bindable(1.0) 
     } = $props();
 
     const dispatch = createEventDispatcher();
 
     // Local state
     let timeSignature = $state('4 / 4');
-    let masterVolume = $state(75);
+    
+    let masterVolume = $state(masterGain * 50);
+    // Watch for external changes (e.g. AI updates masterGain -> Update Slider)
+    $effect(() => {
+        masterVolume = Math.min(100, masterGain * 50);
+    });
+
     let isMenuOpen = $state(false);
 
     // --- MENU LOGIC ---
@@ -49,10 +56,14 @@
     function updateMaster(e: Event) {
         const val = parseFloat((e.target as HTMLInputElement).value);
         masterVolume = val;
-        invoke('set_master_gain', { gain: val / 75.0 });
+        // Update the bound prop (Parent will handle backend sync if bound, or we do it here)
+        masterGain = val / 50.0; 
+        invoke('set_master_gain', { gain: masterGain });
     }
+
     function resetMaster() {
-        masterVolume = 75;
+        masterVolume = 50; // Visual Center
+        masterGain = 1.0;  // Unity Gain
         invoke('set_master_gain', { gain: 1.0 });
     }
 

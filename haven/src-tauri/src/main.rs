@@ -970,12 +970,14 @@ async fn ask_ai(
     }
 
     // 3. Construct System Prompt (Strict JSON Schema)
+    // 3. System Prompt (Strict JSON-Only API)
     let system_prompt = format!(
-        "You are an intelligent assistant for a DAW (Haven). \
-        You control the app via JSON commands. \
-        \n\nCONTEXT:\nTracks: [{}]\n\n\
-        USER REQUEST: '{}'\n\n\
-        RESPONSE SCHEMA (Strict JSON Only):\n\
+        "You are a JSON-only API for a DAW. You must output raw JSON. No markdown. No text.\n\
+        \n\
+        CONTEXT:\nTracks: [{}]\n\
+        USER REQUEST: '{}'\n\
+        \n\
+        SCHEMA:\n\
         {{ \n\
           \"steps\": [ \n\
             {{ \n\
@@ -990,19 +992,24 @@ async fn ask_ai(
               }} \n\
             }} \n\
           ], \n\
-          \"message\": \"User-friendly confirmation text\", \n\
-          \"confidence\": 0.0-1.0 \n\
-        }}\n\n\
+          \"message\": \"Short confirmation text\", \n\
+          \"confidence\": 1.0 \n\
+        }}\n\
+        \n\
         RULES:\n\
-        1. If user input is ambiguous or missing track info, return action='clarify'.\n\
-        2. If unrelated to audio/DAW, return action='none'.\n\
-        3. Tracks are 1-based IDs. Match track names loosely (e.g. 'drums' matches 'Kick Drum' or 'Drums').\n\
-        4. VOLUME RULES: \n\
-             - Range is 0.0 (Silence) to 1.5 (Max Boost).\n\
-             - 'Max volume' = 1.5.\n\
-             - 'Normal/Reset volume' = 1.0.\n\
-             - 'Half volume' = 0.5.\n\
-        5. Do NOT output markdown or explanations outside JSON.",
+        1. Output MUST start with {{ and end with }}.\n\
+        2. RESET LOGIC: 'Reset' means set_gain=1.0 and set_pan=0.0.\n\
+           - ONLY generate 'toggle_mute' if the track is currently muted (true).\n\
+           - ONLY generate 'toggle_solo' if the track is currently soloed (true).\n\
+        3. VOLUME: 0.0 to 2.0. Max=2.0. Normal=1.0.\n\
+        4. If user says 'Reset everything', generate these steps for ALL tracks in the context.\n\
+        \n\
+        EXAMPLES:\n\
+        User: 'Set max volume'\n\
+        JSON: {{ \"steps\": [ {{ \"action\": \"set_master_gain\", \"parameters\": {{ \"value\": 2.0 }} }} ], \"message\": \"Master volume maximized.\", \"confidence\": 1.0 }}\n\
+        \n\
+        User: 'Reset track 1' (Context says track 1 is Muted)\n\
+        JSON: {{ \"steps\": [ {{ \"action\": \"set_gain\", \"parameters\": {{ \"track_id\": 1, \"value\": 1.0 }} }}, {{ \"action\": \"set_pan\", \"parameters\": {{ \"track_id\": 1, \"value\": 0.0 }} }}, {{ \"action\": \"toggle_mute\", \"parameters\": {{ \"track_id\": 1 }} }} ], \"message\": \"Track 1 reset.\", \"confidence\": 1.0 }}",
         track_context, user_input
     );
 

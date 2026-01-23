@@ -25,6 +25,7 @@
     
     // --- GLOBAL BPM STATE ---
     let bpm = $state(120); 
+    let masterGain = $state(1.0); // Add this near 'bpm'
     let projectName = $state("untitled Project");
 
     let isRecordingMode = $state(false);
@@ -86,6 +87,7 @@
                 }>('load_project', { path });
 
                 bpm = projectState.bpm;
+                
 
                 const fileName = path.split(/[\\/]/).pop();
                 if (fileName) projectName = fileName.replace('.hvn', '');
@@ -188,7 +190,7 @@
                 tracks = [...tracks, { 
                     ...newTrack,          // <--- This brings in gain:1.0, pan:0.0, etc.
                     ...defaultMixerUI,    // <--- This adds monitor:false, source:'media'
-                    name: "Recording...", 
+                    // name: "Recording...", 
                     isRecording: true,    
                     source: 'mic',
                     savePath: savePath
@@ -408,6 +410,7 @@
             });
 
             bpm = projectState.bpm;
+            masterGain = projectState.masterGain;
             console.log("🔄 Project State Refreshed");
         } catch (e) {
             console.error("Failed to refresh project:", e);
@@ -610,7 +613,8 @@
   {#if view === 'studio'}
     <Header bind:projectName={projectName}/>
     
-    <TopToolbar 
+    <TopToolbar
+        bind:masterGain={masterGain} 
         isPlaying={isPlaying} 
         currentTime={currentTime}
         bind:bpm={bpm}
@@ -633,7 +637,8 @@
     />
 
     <div class="flex-1 flex overflow-hidden relative">
-        <TrackList {tracks} 
+        <TrackList 
+            bind:tracks={tracks} 
             on:requestAdd={handleAddRequest}
             on:select={handleTrackSelect}
             on:toggleMonitor={handleToggleMonitor}
