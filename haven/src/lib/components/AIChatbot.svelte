@@ -61,7 +61,7 @@
             role="region"
             aria-label="AI Chat Response History"
         >
-            <div class="flex-1 overflow-y-auto p-4 flex flex-col gap-3 scrollbar-hide">
+            <div class={`flex-1 overflow-y-auto p-4 flex flex-col gap-3 scrollbar-hide transition-opacity duration-300 ${isHovered ? 'opacity-100': 'opacity-0 pointer-events-none'}`}>
                 {#each messages as msg}
                     <div class={`flex w-full ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                         
@@ -83,10 +83,10 @@
                 <div class="absolute bottom-0 left-0 w-full h-12 flex items-center px-4 gap-3 bg-linear-to-t from-black/80 to-transparent">
                      <Bot size={16} class="text-brand-blue animate-pulse" />
                      <span class="text-sm text-white/90 truncate">
-                        {messages[messages.length - 1].content}
+                        {[...messages].reverse().find(m => m.role === 'assistant')?.content || ''}
                      </span>
                      <span class="ml-auto text-[10px] text-white/40 uppercase tracking-widest">
-                        Hover History
+                        Hover
                      </span>
                 </div>
             {/if}
