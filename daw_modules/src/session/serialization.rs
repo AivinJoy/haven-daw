@@ -15,6 +15,7 @@ pub struct ClipState {
 #[derive(Serialize, Deserialize)]
 pub struct TrackState {
     pub name: String,
+    pub color: String,
     pub gain: f32,
     pub pan: f32,
     pub muted: bool,

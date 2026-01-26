@@ -304,6 +304,7 @@ impl Clip {
 pub struct Track {
     pub id: TrackId,
     pub name: String,
+    pub color: String,
     pub gain: f32,
     pub pan: f32, // -1.0 left, 0 center, +1.0 right
     pub muted: bool,
@@ -351,12 +352,14 @@ impl Track {
     pub fn new(
         id: TrackId,
         name: String,
+        color: String,
         sample_rate: u32,
         channels: usize,
     ) -> Self {
         Self {
             id,
             name,
+            color,
             gain: 1.0,
             pan: 0.0,
             muted: false,

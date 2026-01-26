@@ -9,6 +9,7 @@ pub use mixer::Mixer;
 pub use time::TempoMap;
 
 use std::time::Duration;
+use rand::seq::IndexedRandom;
 
 #[derive(Clone, Debug)]
 pub struct Transport {
@@ -54,12 +55,35 @@ impl Engine {
 
     // --- NEW: Create a generic empty track ---
     // --- NEW: Create a generic empty track ---
+    // --- NEW: Create a generic empty track ---
     pub fn add_empty_track(&mut self) -> TrackId {
         let id = TrackId(self.next_id);
         self.next_id += 1; 
-        // UPDATED: Pass self.sample_rate as the 3rd argument
-        // Pass self.channels as the 4th argument
-        let track = Track::new(id, format!("Track {}", id.0 + 1), self.sample_rate, self.channels);
+
+        // 1. Define Palette
+        let colors = [
+            "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
+            "bg-emerald-500", "bg-orange-500", "bg-pink-500",
+            "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
+        ];
+
+        // 2. Pick Random Color
+        let mut rng = rand::rng(); // For rand 0.9+
+        // If using older rand (0.8), use: let mut rng = rand::thread_rng();
+        // Based on your cargo.toml having rand 0.9.0, rand::rng() is correct.
+        
+        let chosen_color = colors.choose(&mut rng)
+            .unwrap_or(&"bg-brand-blue")
+            .to_string();
+
+        // 3. Create Track with Color
+        let track = Track::new(
+            id, 
+            format!("Track {}", id.0 + 1), 
+            chosen_color, // <--- Pass Color Here
+            self.sample_rate, 
+            self.channels
+        );
         self.tracks.push(track);
         id
     }

@@ -53,7 +53,8 @@ impl Session {
 
             // Return the struct at the end of the block
             TrackState {
-                name: t.name.clone(), 
+                name: t.name.clone(),
+                color: t.color.clone(), 
                 gain: t.gain,
                 pan: t.pan,
                 muted: t.muted,
@@ -92,6 +93,7 @@ impl Session {
             
             if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id == id) {
                 track.name = t_state.name;
+                track.color = t_state.color;
                 track.gain = t_state.gain;
                 track.pan = t_state.pan;
                 track.muted = t_state.muted;

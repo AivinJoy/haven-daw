@@ -37,6 +37,7 @@ pub struct FrontendClipInfo {
 pub struct FrontendTrackInfo {
     pub id: u32,
     pub name: String,
+    pub color: String,
     pub gain: f32,
     pub pan: f32,
     pub muted: bool,
@@ -575,6 +576,7 @@ impl AudioRuntime {
             // 2. Create the TrackState
             crate::session::serialization::TrackState {
                 name: t.name.clone(), // Used to be 'path', now 'name'
+                color: t.color.clone(),
                 gain: t.gain,
                 pan: t.pan,
                 muted: t.muted,
@@ -618,6 +620,7 @@ impl AudioRuntime {
                 FrontendTrackInfo {
                     id: t.id.0,
                     name: t.name.clone(),
+                    color: t.color.clone(),
                     gain: t.gain,
                     pan: t.pan,
                     muted: t.muted,

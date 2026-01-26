@@ -30,6 +30,14 @@ interface AIResponse {
     confidence: number;
 }
 
+// Helper to define the structure of Recording Status
+interface RecordingState {
+    is_recording: boolean;
+    duration: number;
+    current_rms: number;
+    is_monitoring: boolean;
+}
+
 class AIAgent {
     // Reactive state using Svelte 5 Runes pattern if possible, 
     // but a simple class is safer for plain TS until integrated.
@@ -43,11 +51,28 @@ class AIAgent {
             role: m.role,
             content: m.content
         }));
+
+        // 2. FETCH REAL TIME STATE (Crucial Fix)
+        // We need to know if Monitoring is ON so the AI knows whether to turn it OFF.
+        let isMonitoring = false;
+        try {
+            const recState = await invoke<RecordingState>('get_recording_status');
+            isMonitoring = recState.is_monitoring;
+        } catch (e) {
+            console.warn("Could not fetch recording status for AI context", e);
+        }
         
         // 1. Normalize Context
+        // 1. Normalize Context
+        // We MUST include gain/pan/muted/solo so the AI knows what to reset
         const context = JSON.stringify(tracks.map(t => ({ 
             id: t.id, 
-            name: t.name.toLowerCase() 
+            name: t.name.toLowerCase(),
+            gain: t.gain,
+            pan: t.pan,
+            muted: t.muted,
+            solo: t.solo,
+            monitoring: isMonitoring
         })));
 
         try {

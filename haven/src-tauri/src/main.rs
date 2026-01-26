@@ -25,7 +25,6 @@ struct AppState {
     audio: Mutex<AudioRuntime>,
     recorder: Mutex<Option<Recorder>>,
     cache: Mutex<HashMap<String, ImportResult>>,
-    track_colors: Mutex<HashMap<u32, String>>,
 }
 
 // --- 2. Define Return Struct ---
@@ -48,39 +47,16 @@ fn build_ui_state(
     master_gain: f32,
     silent: bool,
     cache_store: &Mutex<HashMap<String, ImportResult>>,
-    color_store: &Mutex<HashMap<u32, String>>
 ) -> Result<ProjectState, String> {
     
     let mut results = Vec::new();
-    let available_colors = [
-        "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
-        "bg-emerald-500", "bg-orange-500", "bg-pink-500",
-        "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
-    ];
 
     for info in tracks_info.iter() {
-        let raw_id = info.id; // Frontend uses 1-based ID
+        
         // 1. Try to find existing color
-        let stored_color = {
-            let map = color_store.lock().map_err(|_| "Failed to lock colors")?;
-            map.get(&raw_id).cloned()
-        };
+        let color = info.color.clone();
 
-        let color = if let Some(c) = stored_color {
-            c // ✅ Found it! Use the permanent color.
-        } else {
-            // 🎲 New Track? Pick a Color deterministically based on ID 
-            // to avoid "random" changes if ID persists (e.g. during Undo)
-            let random_idx = (raw_id as usize) % available_colors.len();
-            let new_color = available_colors[random_idx].to_string();
-
-            // Save it forever (for this session)
-            if let Ok(mut map) = color_store.lock() {
-                map.insert(raw_id, new_color.clone());
-            }
-            new_color
-        };
-
+        let raw_id = info.id; // Frontend uses 1-based ID
         let track_id = raw_id + 1;
         
         let mut loaded_clips = Vec::new();
@@ -253,21 +229,22 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
 
         // LOCK SCOPE: Only lock audio for the split second we need to add the track
         // LOCK SCOPE: Add track AND Set Name
-        let track_id_for_color = {
+        // Capture the assigned color directly from the backend
+        let assigned_color = {
             let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
             audio.add_track(path.clone()).map_err(|e| e.to_string())?;
             
-            // FIX 1: Set the Name in the Backend immediately
+            // Set Name and Get Color
             let track_list = audio.get_tracks_list();
-            let id = track_list.len() - 1; // Assuming new track is last
-            let raw_id = track_list[id].id; // Get the actual ID
+            let id = track_list.len() - 1; 
             
             let filename = std::path::Path::new(&path)
                 .file_name().unwrap_or_default().to_string_lossy().to_string();
             
             audio.set_track_name(id, filename);
             
-            raw_id // Return ID for color generation
+            // Return the color the backend generated
+            track_list[id].color.clone() 
         };
 
         // Force UI Update
@@ -349,21 +326,6 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
         let pixels_per_second = 100.0;
         let spp = (sr as f64) / pixels_per_second;
         let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
-
-        // FIX 2: Generate Permanent Color
-        let available_colors = [
-            "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
-            "bg-emerald-500", "bg-orange-500", "bg-pink-500",
-            "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
-        ];
-        // [Refinement 2] Deterministic color based on ID
-        let random_idx = (track_id_for_color as usize) % available_colors.len();
-        let assigned_color = available_colors[random_idx].to_string();
-
-        // SAVE Color to State (So Undo remembers it)
-        if let Ok(mut colors) = state.track_colors.lock() {
-            colors.insert(track_id_for_color, assigned_color.clone());
-        }
 
         // 1. Create the result object first
         let result = ImportResult {
@@ -636,27 +598,18 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
     // 3. Get the new track info
     let tracks = audio.get_tracks_list();
     let info = tracks.last().ok_or("Track creation failed")?;
+    
     let raw_id = info.id; 
     let track_id_display = raw_id + 1; 
 
-    // 4. Color Logic
-    let available_colors = [
-        "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
-        "bg-emerald-500", "bg-orange-500", "bg-pink-500",
-        "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
-    ];
-    let color_idx = (raw_id as usize) % available_colors.len();
-    let color = available_colors[color_idx].to_string();
-    
-    // 5. Persist Metadata
+    // 4. Persist Metadata (Name only, Color is auto-handled)
     let index = tracks.len() - 1; 
     audio.set_track_name(index, new_name.clone());
-    state.track_colors.lock().unwrap().insert(raw_id, color.clone());
     
     Ok(LoadedTrack {
         id: track_id_display, 
         name: new_name,
-        color: color,
+        color: info.color.clone(),
         clips: vec![],
         gain: 1.0,
         pan: 0.0,
@@ -784,7 +737,7 @@ async fn get_project_state(
 
     // 2. Build UI State (Reuse Helper)
     // Pass cache AND color store
-    let state = build_ui_state(&app, tracks_info, bpm, master_gain, true, &state.cache, &state.track_colors)?;
+    let state = build_ui_state(&app, tracks_info, bpm, master_gain, true, &state.cache)?;
     Ok(state)
 }
 
@@ -905,7 +858,7 @@ async fn load_project(
 
     // 3. Build UI State (Reuse Helper)
     // Pass cache AND color store
-    let state = build_ui_state(&app, tracks_info, bpm, master_gain, false, &state.cache, &state.track_colors)?;
+    let state = build_ui_state(&app, tracks_info, bpm, master_gain, false, &state.cache)?;
 
     let _ = app.emit("load-percent", 100.0);
     let _ = app.emit("load-progress", "Ready");
@@ -971,8 +924,9 @@ async fn ask_ai(
 
     // 3. Construct System Prompt (Strict JSON Schema)
     // 3. System Prompt (Strict JSON-Only API)
+    // 3. System Prompt (Refined for Reset Logic & JSON Stability)
     let system_prompt = format!(
-        "You are a JSON-only API for a DAW. You must output raw JSON. No markdown. No text.\n\
+        "You are a strict JSON API for a DAW. You speak ONLY JSON.\n\
         \n\
         CONTEXT:\nTracks: [{}]\n\
         USER REQUEST: '{}'\n\
@@ -981,37 +935,31 @@ async fn ask_ai(
         {{ \n\
           \"steps\": [ \n\
             {{ \n\
-              \"action\": \"play\" | \"pause\" | \"record\" | \"rewind\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"clarify\" | \"none\", \n\
+              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"none\", \n\
               \"parameters\": {{ \n\
                 \"track_id\": number (optional), \n\
                 \"value\": number (optional), \n\
-                \"time\": number (optional), \n\
-                \"mode\": \"audio\" (optional), \n\
-                \"direction\": \"forward\" | \"backward\" (optional), \n\
-                \"count\": number (optional) \n\
+                \"time\": number (optional) \n\
               }} \n\
             }} \n\
           ], \n\
-          \"message\": \"Short confirmation text\", \n\
-          \"confidence\": 1.0 \n\
+          \"message\": \"Short confirmation text\" \n\
         }}\n\
         \n\
         RULES:\n\
-        1. Output MUST start with {{ and end with }}.\n\
-        2. RESET LOGIC: 'Reset' means set_gain=1.0 and set_pan=0.0.\n\
-           - ONLY generate 'toggle_mute' if the track is currently muted (true).\n\
-           - ONLY generate 'toggle_solo' if the track is currently soloed (true).\n\
-        3. VOLUME: 0.0 to 2.0. Max=2.0. Normal=1.0.\n\
-        4. If user says 'Reset everything', generate these steps for ALL tracks in the context.\n\
-        \n\
-        EXAMPLES:\n\
-        User: 'Set max volume'\n\
-        JSON: {{ \"steps\": [ {{ \"action\": \"set_master_gain\", \"parameters\": {{ \"value\": 2.0 }} }} ], \"message\": \"Master volume maximized.\", \"confidence\": 1.0 }}\n\
-        \n\
-        User: 'Reset track 1' (Context says track 1 is Muted)\n\
-        JSON: {{ \"steps\": [ {{ \"action\": \"set_gain\", \"parameters\": {{ \"track_id\": 1, \"value\": 1.0 }} }}, {{ \"action\": \"set_pan\", \"parameters\": {{ \"track_id\": 1, \"value\": 0.0 }} }}, {{ \"action\": \"toggle_mute\", \"parameters\": {{ \"track_id\": 1 }} }} ], \"message\": \"Track 1 reset.\", \"confidence\": 1.0 }}",
+        1. OUTPUT RAW JSON ONLY. Do not use markdown formatting (no ```json). Do not include any text outside the braces.\n\
+        2. RESET LOGIC: When asked to 'Reset' a track or 'Reset Everything', you must neutralize all active states:\n\
+           - GAIN: Always set to 1.0.\n\
+           - PAN: Always set to 0.0.\n\
+           - MUTE: If context shows 'muted: true', generate 'toggle_mute'.\n\
+           - SOLO: If context shows 'solo: true', generate 'toggle_solo'.\n\
+           - MONITOR: If context shows 'monitoring: true' (or 'is_monitoring: true'), generate 'toggle_monitor'.\n\
+        3. SPECIFIC RESETS: If user says 'Reset monitoring', ONLY toggle monitoring if it is currently true.\n\
+        4. Track IDs: Use the numeric IDs provided in the context.\n\
+        ",
         track_context, user_input
     );
+
 
     // 4. Construct Message Chain (System -> History -> User)
     let mut messages_payload = Vec::new();
@@ -1095,7 +1043,6 @@ fn main() {
             audio: Mutex::new(runtime),
             recorder: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
-            track_colors: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             play,
