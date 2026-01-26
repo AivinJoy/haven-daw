@@ -14,7 +14,7 @@
   }>();
 
   // Receive tracks prop (bindable if you want the list itself to change, but usually internal props bind)
-  let { tracks = []} = $props();
+  let { tracks = $bindable([])} = $props();
 
   function requestAddTrack() {
     dispatch('requestAdd', null);

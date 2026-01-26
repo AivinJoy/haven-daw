@@ -7,8 +7,10 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::collections::HashMap;
 use tauri::{State, Emitter};
 use cpal::traits::{HostTrait, DeviceTrait};
+use dotenv::dotenv;
 
 // Import modules
 use daw_modules::audio_runtime::AudioRuntime;
@@ -22,10 +24,12 @@ use daw_modules::engine::time::GridLine; // Import GridLine
 struct AppState {
     audio: Mutex<AudioRuntime>,
     recorder: Mutex<Option<Recorder>>,
+    cache: Mutex<HashMap<String, ImportResult>>,
+    track_colors: Mutex<HashMap<u32, String>>,
 }
 
 // --- 2. Define Return Struct ---
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ImportResult {
     mins: Vec<f32>,
@@ -33,42 +37,79 @@ struct ImportResult {
     duration: f64,
     bins_per_second: f64,
     bpm: Option<f32>, // New field for BPM
+    color: String,
 }
 
 // Helper function to build the UI state from the raw track list
 fn build_ui_state(
-    app: &tauri::AppHandle, 
+    _app: &tauri::AppHandle, 
     tracks_info: Vec<daw_modules::audio_runtime::FrontendTrackInfo>,
     bpm: f32,
-    master_gain: f32
+    master_gain: f32,
+    silent: bool,
+    cache_store: &Mutex<HashMap<String, ImportResult>>,
+    color_store: &Mutex<HashMap<u32, String>>
 ) -> Result<ProjectState, String> {
     
     let mut results = Vec::new();
-    let colors = [
+    let available_colors = [
         "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
         "bg-emerald-500", "bg-orange-500", "bg-pink-500",
         "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
     ];
 
-    for (i, info) in tracks_info.iter().enumerate() {
-        let track_id = info.id + 1; // Frontend uses 1-based ID
-        let color = colors[i % colors.len()].to_string();
+    for info in tracks_info.iter() {
+        let raw_id = info.id; // Frontend uses 1-based ID
+        // 1. Try to find existing color
+        let stored_color = {
+            let map = color_store.lock().map_err(|_| "Failed to lock colors")?;
+            map.get(&raw_id).cloned()
+        };
+
+        let color = if let Some(c) = stored_color {
+            c // ✅ Found it! Use the permanent color.
+        } else {
+            // 🎲 New Track? Pick a Color deterministically based on ID 
+            // to avoid "random" changes if ID persists (e.g. during Undo)
+            let random_idx = (raw_id as usize) % available_colors.len();
+            let new_color = available_colors[random_idx].to_string();
+
+            // Save it forever (for this session)
+            if let Ok(mut map) = color_store.lock() {
+                map.insert(raw_id, new_color.clone());
+            }
+            new_color
+        };
+
+        let track_id = raw_id + 1;
         
         let mut loaded_clips = Vec::new();
 
         for (j, clip_info) in info.clips.iter().enumerate() {
             // Emit progress event
-            let _ = app.emit("load-progress", format!("Analyzing Track {} Clip {}", track_id, j + 1));
+            // 1. LOOKUP IN CACHE
+            let cached_data = {
+                let lock = cache_store.lock().map_err(|_| "Failed to lock cache")?;
+                lock.get(&clip_info.path).cloned()
+            };
 
-            // Decode Audio for Waveform
-            // Note: In a real app, you might want to cache this to avoid re-analyzing unchanged clips
-            let (samples, sr, channels) = daw_modules::bpm::adapter::decode_to_vec(&clip_info.path)
-                .map_err(|e| format!("Failed to decode {}: {}", clip_info.path, e))?;
-            
-            let wf = Waveform::build_from_samples(&samples, sr, channels, 512);
-            let pixels_per_second = 100.0;
-            let spp = (sr as f64) / pixels_per_second;
-            let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
+            // 2. DECIDE: HIT OR MISS?
+            let import_result = if let Some(data) = cached_data {
+                data // ✅ Instant Hit
+            } else {
+                // ⚠️ Miss: Return Placeholder (Do NOT compute here to prevent freezing)
+                if !silent {
+                     println!("⚠️ Cache miss for {}", clip_info.path);
+                }
+                ImportResult {
+                    mins: vec![],
+                    maxs: vec![],
+                    duration: clip_info.duration, // Use duration from backend info
+                    bins_per_second: 100.0,
+                    bpm: None,
+                    color: "".to_string(),
+                }
+            };
 
             let clip_id = format!("clip_{}_{}", track_id, j);
             let clip_name = std::path::Path::new(&clip_info.path)
@@ -83,13 +124,7 @@ fn build_ui_state(
                 duration: clip_info.duration, 
                 offset: clip_info.offset,
                 color: color.clone(),
-                waveform: ImportResult {
-                    mins: mins.to_vec(),
-                    maxs: maxs.to_vec(),
-                    duration: wf.duration_secs,
-                    bins_per_second: pixels_per_second,
-                    bpm: None,
-                },
+                waveform: import_result, // <--- Use the cached result
             });
         }
 
@@ -217,10 +252,23 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
         });
 
         // LOCK SCOPE: Only lock audio for the split second we need to add the track
-        {
+        // LOCK SCOPE: Add track AND Set Name
+        let track_id_for_color = {
             let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
             audio.add_track(path.clone()).map_err(|e| e.to_string())?;
-        } // <--- LOCK IS DROPPED HERE. Audio engine is free now.
+            
+            // FIX 1: Set the Name in the Backend immediately
+            let track_list = audio.get_tracks_list();
+            let id = track_list.len() - 1; // Assuming new track is last
+            let raw_id = track_list[id].id; // Get the actual ID
+            
+            let filename = std::path::Path::new(&path)
+                .file_name().unwrap_or_default().to_string_lossy().to_string();
+            
+            audio.set_track_name(id, filename);
+            
+            raw_id // Return ID for color generation
+        };
 
         // Force UI Update
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -302,13 +350,39 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
         let spp = (sr as f64) / pixels_per_second;
         let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
 
-        results.push(ImportResult {
+        // FIX 2: Generate Permanent Color
+        let available_colors = [
+            "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
+            "bg-emerald-500", "bg-orange-500", "bg-pink-500",
+            "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
+        ];
+        // [Refinement 2] Deterministic color based on ID
+        let random_idx = (track_id_for_color as usize) % available_colors.len();
+        let assigned_color = available_colors[random_idx].to_string();
+
+        // SAVE Color to State (So Undo remembers it)
+        if let Ok(mut colors) = state.track_colors.lock() {
+            colors.insert(track_id_for_color, assigned_color.clone());
+        }
+
+        // 1. Create the result object first
+        let result = ImportResult {
             mins: mins.to_vec(),
             maxs: maxs.to_vec(),
             duration: wf.duration_secs,
             bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
             bpm: detected_bpm,
-        });
+            color: assigned_color,
+        };
+
+        // 2. WRITE TO CACHE (This is the critical fix)
+        // We lock the cache briefly to store the data for future lookups
+        if let Ok(mut cache) = state.cache.lock() {
+            cache.insert(path.clone(), result.clone());
+        }
+
+        // 3. Push to results for the UI
+        results.push(result);
     }
 
     // --- DONE ---
@@ -322,7 +396,7 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
 }
 
 #[tauri::command]
-fn analyze_file(path: String) -> Result<ImportResult, String> {
+fn analyze_file(path: String, state: State<AppState>) -> Result<ImportResult, String> {
     // 1. Decode (Analysis)
     let (samples, sr, channels) = bpm::adapter::decode_to_vec(&path)
         .map_err(|e| format!("Failed to decode: {}", e))?;
@@ -340,13 +414,21 @@ fn analyze_file(path: String) -> Result<ImportResult, String> {
     let spp = (sr as f64) / pixels_per_second;
     let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
 
-    Ok(ImportResult {
+    let result = ImportResult {
         mins: mins.to_vec(),
         maxs: maxs.to_vec(),
         duration: wf.duration_secs,
         bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
         bpm: detected_bpm,
-    })
+        color: "".to_string(), // Frontend assigns color for clips, or we ignore
+    };
+
+    // CRITICAL FIX: Save to cache so Undo can find it
+    if let Ok(mut cache) = state.cache.lock() {
+        cache.insert(path.clone(), result.clone());
+    }
+
+    Ok(result)
 }
 
 #[tauri::command]
@@ -516,11 +598,71 @@ fn add_clip(
     Ok(())
 }
 
+// [Refinement 1] Create Track: Source of Truth
+// Returns the fully formed track data (ID, Name, Color) to the frontend.
 #[tauri::command]
-fn create_track(state: State<AppState>) -> Result<(), String> {
+fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    
+    // 1. Calculate Smart Name (Gap Filling) BEFORE creating the track
+    let existing_tracks = audio.get_tracks_list();
+    let mut used_numbers = Vec::new();
+    
+    for t in &existing_tracks {
+        // Check if name is "Track-XX"
+        if t.name.starts_with("Track-") {
+            if let Ok(num) = t.name.replace("Track-", "").parse::<u32>() {
+                used_numbers.push(num);
+            }
+        }
+    }
+    used_numbers.sort();
+
+    // Find first gap
+    let mut target_num = 1;
+    for num in used_numbers {
+        if num == target_num {
+            target_num += 1;
+        } else if num > target_num {
+            break;
+        }
+    }
+    let new_name = format!("Track-{:02}", target_num);
+
+
+    // 2. Create the Track
     audio.create_empty_track().map_err(|e| e.to_string())?;
-    Ok(())
+    
+    // 3. Get the new track info
+    let tracks = audio.get_tracks_list();
+    let info = tracks.last().ok_or("Track creation failed")?;
+    let raw_id = info.id; 
+    let track_id_display = raw_id + 1; 
+
+    // 4. Color Logic
+    let available_colors = [
+        "bg-brand-blue", "bg-brand-red", "bg-purple-500", 
+        "bg-emerald-500", "bg-orange-500", "bg-pink-500",
+        "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
+    ];
+    let color_idx = (raw_id as usize) % available_colors.len();
+    let color = available_colors[color_idx].to_string();
+    
+    // 5. Persist Metadata
+    let index = tracks.len() - 1; 
+    audio.set_track_name(index, new_name.clone());
+    state.track_colors.lock().unwrap().insert(raw_id, color.clone());
+    
+    Ok(LoadedTrack {
+        id: track_id_display, 
+        name: new_name,
+        color: color,
+        clips: vec![],
+        gain: 1.0,
+        pan: 0.0,
+        muted: false,
+        solo: false
+    })
 }
 
 #[tauri::command]
@@ -562,6 +704,20 @@ fn delete_clip(
 ) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
     audio.delete_clip(track_index, clip_index).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn undo(state: State<AppState>) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    audio.undo();
+    Ok(())
+}
+
+#[tauri::command]
+fn redo(state: State<AppState>) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    audio.redo();
+    Ok(())
 }
 
 // 1. Argument Struct
@@ -627,8 +783,8 @@ async fn get_project_state(
     drop(audio_runtime); // Release lock
 
     // 2. Build UI State (Reuse Helper)
-    let state = build_ui_state(&app, tracks_info, bpm, master_gain)?;
-
+    // Pass cache AND color store
+    let state = build_ui_state(&app, tracks_info, bpm, master_gain, true, &state.cache, &state.track_colors)?;
     Ok(state)
 }
 
@@ -716,8 +872,40 @@ async fn load_project(
     let tracks_info = audio_runtime.get_tracks_list();
     drop(audio_runtime); // Release lock
 
+    for info in &tracks_info {
+        for clip in &info.clips {
+             let path_key = clip.path.clone();
+             let needs_load = {
+                 let cache = state.cache.lock().unwrap();
+                 !cache.contains_key(&path_key)
+             };
+
+             if needs_load {
+                 let _ = app.emit("load-progress", format!("Loading {}", clip.path));
+                 if let Ok((samples, sr, ch)) = daw_modules::bpm::adapter::decode_to_vec(&clip.path) {
+                      let wf = Waveform::build_from_samples(&samples, sr, ch, 512);
+                      let pixels_per_second = 100.0;
+                      let spp = (sr as f64) / pixels_per_second;
+                      let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
+                      
+                      let data = ImportResult {
+                            mins: mins.to_vec(),
+                            maxs: maxs.to_vec(), 
+                            duration: wf.duration_secs,
+                            bins_per_second: pixels_per_second,
+                            bpm: None,
+                            color: String::new(),
+                      };
+                      
+                      state.cache.lock().unwrap().insert(path_key, data);
+                 }
+             }
+        }
+    }
+
     // 3. Build UI State (Reuse Helper)
-    let state = build_ui_state(&app, tracks_info, bpm, master_gain)?;
+    // Pass cache AND color store
+    let state = build_ui_state(&app, tracks_info, bpm, master_gain, false, &state.cache, &state.track_colors)?;
 
     let _ = app.emit("load-percent", 100.0);
     let _ = app.emit("load-progress", "Ready");
@@ -732,7 +920,172 @@ fn get_temp_path(filename: String) -> String {
     path.to_string_lossy().to_string()
 }
 
+// ==========================================================
+// 🚀 AI CHATBOT IMPLEMENTATION (NEW)
+// ==========================================================
+
+#[derive(serde::Deserialize)]
+struct GroqApiResponse {
+    choices: Vec<GroqChoice>,
+}
+
+#[derive(serde::Deserialize)]
+struct GroqChoice {
+    message: GroqMessage,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct GroqMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+struct AiErrorResponse {
+    action: String,
+    message: String,
+}
+
+#[tauri::command]
+async fn ask_ai(
+    user_input: String, 
+    track_context: String,
+    chat_history: Vec<GroqMessage>
+) -> Result<String, String> {
+    // 1. Setup Client with Strict Timeout (Prevent UI Freeze)
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8)) // 8-second hard limit
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // 2. Get API Key from Environment
+    // NOTE: In production, you might want to load this from a user config file
+    let api_key = std::env::var("GROQ_API_KEY").unwrap_or_else(|_| "".to_string());
+    
+    if api_key.is_empty() {
+         return Ok(serde_json::to_string(&AiErrorResponse {
+             action: "none".into(),
+             message: "Error: Missing GROQ_API_KEY environment variable.".into()
+         }).unwrap());
+    }
+
+    // 3. Construct System Prompt (Strict JSON Schema)
+    // 3. System Prompt (Strict JSON-Only API)
+    let system_prompt = format!(
+        "You are a JSON-only API for a DAW. You must output raw JSON. No markdown. No text.\n\
+        \n\
+        CONTEXT:\nTracks: [{}]\n\
+        USER REQUEST: '{}'\n\
+        \n\
+        SCHEMA:\n\
+        {{ \n\
+          \"steps\": [ \n\
+            {{ \n\
+              \"action\": \"play\" | \"pause\" | \"record\" | \"rewind\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"clarify\" | \"none\", \n\
+              \"parameters\": {{ \n\
+                \"track_id\": number (optional), \n\
+                \"value\": number (optional), \n\
+                \"time\": number (optional), \n\
+                \"mode\": \"audio\" (optional), \n\
+                \"direction\": \"forward\" | \"backward\" (optional), \n\
+                \"count\": number (optional) \n\
+              }} \n\
+            }} \n\
+          ], \n\
+          \"message\": \"Short confirmation text\", \n\
+          \"confidence\": 1.0 \n\
+        }}\n\
+        \n\
+        RULES:\n\
+        1. Output MUST start with {{ and end with }}.\n\
+        2. RESET LOGIC: 'Reset' means set_gain=1.0 and set_pan=0.0.\n\
+           - ONLY generate 'toggle_mute' if the track is currently muted (true).\n\
+           - ONLY generate 'toggle_solo' if the track is currently soloed (true).\n\
+        3. VOLUME: 0.0 to 2.0. Max=2.0. Normal=1.0.\n\
+        4. If user says 'Reset everything', generate these steps for ALL tracks in the context.\n\
+        \n\
+        EXAMPLES:\n\
+        User: 'Set max volume'\n\
+        JSON: {{ \"steps\": [ {{ \"action\": \"set_master_gain\", \"parameters\": {{ \"value\": 2.0 }} }} ], \"message\": \"Master volume maximized.\", \"confidence\": 1.0 }}\n\
+        \n\
+        User: 'Reset track 1' (Context says track 1 is Muted)\n\
+        JSON: {{ \"steps\": [ {{ \"action\": \"set_gain\", \"parameters\": {{ \"track_id\": 1, \"value\": 1.0 }} }}, {{ \"action\": \"set_pan\", \"parameters\": {{ \"track_id\": 1, \"value\": 0.0 }} }}, {{ \"action\": \"toggle_mute\", \"parameters\": {{ \"track_id\": 1 }} }} ], \"message\": \"Track 1 reset.\", \"confidence\": 1.0 }}",
+        track_context, user_input
+    );
+
+    // 4. Construct Message Chain (System -> History -> User)
+    let mut messages_payload = Vec::new();
+    
+    // A. System Prompt
+    messages_payload.push(serde_json::json!({ "role": "system", "content": system_prompt }));
+
+    // B. Chat History (The Memory)
+    // We limit history to last 6 messages to save tokens/speed
+    let history_limit = 6;
+    let start_index = if chat_history.len() > history_limit { chat_history.len() - history_limit } else { 0 };
+    
+    for msg in &chat_history[start_index..] {
+        // Map 'ai' or anything else to strict 'assistant' just in case
+        let clean_role = match msg.role.as_str() {
+            "user" => "user",
+            "system" => "system",
+            _ => "assistant", // Fallback for 'ai' or invalid roles
+        };
+        messages_payload.push(serde_json::json!({ "role": clean_role, "content": msg.content }));
+    }
+
+    // C. Current User Input
+    messages_payload.push(serde_json::json!({ "role": "user", "content": user_input }));
+
+    // 4. Construct Request Payload
+    let payload = serde_json::json!({
+        "model":   "qwen/qwen3-32b", //"qwen-2.5-72b-instruct",  //"llama3-70b-8192", // Fast & Good at JSON
+        "messages": messages_payload,
+        "response_format": { "type": "json_object" },
+
+        "temperature" : 0.0, // Low creativity = High accuracy for code
+        "max_tokens" : 600, // Prevent rambling
+        "top_p": 1.0,   // Standard sampling
+        "stream": false // We need full JSON to execute
+    });
+
+    // 5. Send Request
+    let res = client.post("https://api.groq.com/openai/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Network Error: {}", e))?;
+
+    // FIX 3: Capture the ACTUAL error message from Groq
+    if !res.status().is_success() {
+        let error_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        println!("❌ AI Error Body: {}", error_text); // Prints to your terminal
+        
+        return Ok(serde_json::to_string(&AiErrorResponse {
+            action: "none".into(),
+            // Send a sanitized message to UI, but you see full error in terminal
+            message: "I'm having trouble thinking right now (API Error).".into() 
+        }).unwrap());
+    }
+
+    // 6. Parse Response
+    let chat_res: GroqApiResponse = res.json().await.map_err(|e| format!("Parse Error: {}", e))?;
+    
+    if let Some(choice) = chat_res.choices.first() {
+        Ok(choice.message.content.clone())
+    } else {
+         Ok(serde_json::to_string(&AiErrorResponse {
+             action: "none".into(),
+             message: "AI returned empty response.".into()
+         }).unwrap())
+    }
+}
+
 fn main() {
+
+    dotenv().ok();
     let runtime = AudioRuntime::new(None).expect("Failed to init Audio Engine");
 
     tauri::Builder::default()
@@ -741,6 +1094,8 @@ fn main() {
         .manage(AppState {
             audio: Mutex::new(runtime),
             recorder: Mutex::new(None),
+            cache: Mutex::new(HashMap::new()),
+            track_colors: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             play,
@@ -775,8 +1130,12 @@ fn main() {
             update_eq,
             get_eq_state,
             get_output_devices,
-            get_input_devices
+            get_input_devices,
+            undo,
+            redo,
+            ask_ai
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+    
 }

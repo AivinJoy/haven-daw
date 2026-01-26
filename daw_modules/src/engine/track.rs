@@ -240,6 +240,64 @@ impl Clip {
         self.decoder.seek(file_pos);
     }
 
+    // [ADD THIS METHOD TO impl Clip]
+    /// Smart constructor for loading: Probes file for metadata, 
+    /// but respects the saved offset/duration constraints.
+    pub fn recover(
+        path: String,
+        start_time: Duration,
+        offset: Duration,
+        duration: Duration,
+        output_sr: u32,
+        output_ch: usize
+    ) -> anyhow::Result<Self> {
+        // 1. Probe the file to get REAL source metadata (SR, Channels, Length)
+        // We need this because the save file might not have technical file details
+        let (samples, source_sr, source_ch) = match adapter::decode_to_vec(&path) {
+            Ok((s, sr, ch)) => (s, sr, ch),
+            Err(e) => {
+                println!("⚠️ Clip Recovery Probe Failed: {}", e);
+                (Vec::new(), 44100, 2)
+            }
+        };
+
+        // Calculate REAL source duration
+        let source_dur_secs = if source_sr > 0 && source_ch > 0 {
+            samples.len() as f64 / source_ch as f64 / source_sr as f64
+        } else {
+            0.0
+        };
+        let source_duration = Duration::from_secs_f64(source_dur_secs);
+
+        println!("♻️ Recovered: {} | Src: {:.2}s | Trim: {:.2}s", path, source_dur_secs, duration.as_secs_f64());
+
+        // 2. Create Decoder
+        let decoder = DecoderHandle::new_for_engine(
+            path.clone(),
+            source_ch,
+            output_ch,
+            source_sr,
+            output_sr
+        )?;
+
+        // 3. Construct Clip using the PROBED source info + SAVED trim info
+        let mut clip = Self {
+            path,
+            start_time,
+            offset,          // <--- RESPECT SAVED OFFSET
+            duration,        // <--- RESPECT SAVED DURATION
+            source_duration, // <--- USE PROBED SOURCE LENGTH
+            source_sr,
+            source_ch,
+            decoder,
+        };
+
+        // 4. Seek to the correct offset immediately
+        clip.seek(start_time);
+
+        Ok(clip)
+    }
+
 }
 
 /// A single audio track in the engine.
@@ -320,6 +378,8 @@ impl Track {
     ) -> anyhow::Result<()> {
         
         // 1. Create the clip
+        // Note: Clip::new defaults to full length. 
+        // If you are calling this from a loader, use 'restore_clip' instead!
         let mut clip = Clip::new(path, start_time, sr, ch)?;
 
         // 3. Sync Position: If we know the current engine time, seek the clip immediately!
@@ -604,5 +664,29 @@ impl Track {
         }
 
         dst.len() / channels
+    }
+    // --- ADD THIS NEW METHOD ---
+    pub fn restore_clip(
+        &mut self,
+        index: usize,
+        path: String,
+        start: Duration,
+        offset: Duration,
+        dur: Duration,
+        out_sr: u32,
+        out_ch: usize
+    ) -> anyhow::Result<()> {
+        // Use the new recover method
+        let clip = Clip::recover(
+            path, start, offset, dur, out_sr, out_ch
+        )?;
+        
+        if index <= self.clips.len() {
+            self.clips.insert(index, clip);
+        } else {
+            self.clips.push(clip);
+        }
+        println!("♻️ Restored clip at index {}", index);
+        Ok(())
     }
 }

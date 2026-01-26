@@ -30,11 +30,11 @@
   
   // --- VOLUME LOGIC (75% = 1.0 Gain) ---
   function getSliderValue(gain: number) {
-      return Math.min(100, gain * 75);
+      return Math.min(100, gain * 50);
   }
 
   function fromSliderValue(val: number) {
-      return val / 75.0;
+      return val / 50.0;
   }
 
   // --- COLOR MAPPING ---
@@ -61,7 +61,7 @@
   }
 
   function resetVolume() {
-      volumeSlider = 75; // Visual 75%
+      volumeSlider = 50; // Visual 75%
       gain = 1.0; // Actual 1.0
       invoke('set_track_gain', { trackIndex: index, gain: 1.0 });
   }

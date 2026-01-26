@@ -99,14 +99,19 @@ impl Session {
                 
                 for clip_state in t_state.clips {
                     let start = std::time::Duration::from_secs_f64(clip_state.start_time);
+                    let offset = std::time::Duration::from_secs_f64(clip_state.offset);
+                    let duration = std::time::Duration::from_secs_f64(clip_state.duration);
                     
-                    // FIX: Use the captured 'sample_rate' and 'channels' variables here
-                    let _ = track.add_clip(
+                    // FIX: Use restore_clip instead of add_clip.
+                    // This ensures we respect the saved Offset and Duration (Split/Trim data).
+                    let _ = track.restore_clip(
+                        track.clips.len(), // Append to the end
                         clip_state.path, 
                         start, 
+                        offset,
+                        duration,
                         sample_rate, 
-                        channels,
-                        None
+                        channels
                     );
                 }
             }
