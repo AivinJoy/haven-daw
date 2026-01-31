@@ -940,6 +940,8 @@ async fn ask_ai(
                 \"track_id\": number (optional), \n\
                 \"value\": number (optional), \n\
                 \"time\": number (optional) \n\
+                \"mute_original\": boolean (optional), \n\
+                \"replace_original\": boolean (optional) \n\
               }} \n\
             }} \n\
           ], \n\
@@ -956,7 +958,15 @@ async fn ask_ai(
            - MONITOR: If context shows 'monitoring: true' (or 'is_monitoring: true'), generate 'toggle_monitor'.\n\
         3. SPECIFIC RESETS: If user says 'Reset monitoring', ONLY toggle monitoring if it is currently true.\n\
         4. Track IDs: Use the numeric IDs provided in the context.\n\
+        5. SEPARATION CLARIFICATION:\n\
+           - If the user asks to 'separate', 'split', or 'extract' stems AND has NOT specified what to do with the original track:\n\
+             Output \"action\": \"none\" and \"message\": \"Should I mute the original track or replace it?\"\n\
+           - If the user says 'Mute' or 'Mute it':\n\
+             Output \"action\": \"separate_stems\", \"parameters\": {{ \"track_id\": <CONTEXT_ID>, \"mute_original\": true }}\n\
+           - If the user says 'Replace' or 'Replace it' (meaning delete original):\n\
+             Output \"action\": \"separate_stems\", \"parameters\": {{ \"track_id\": <CONTEXT_ID>, \"replace_original\": true }}\n\
         ",
+        
         track_context, user_input
     );
 
@@ -1031,6 +1041,203 @@ async fn ask_ai(
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct SidecarJobResponse {
+    pub job_id: String,
+    pub status: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct SidecarStatusResponse {
+    pub status: String,
+    pub result: Option<HashMap<String, String>>, // Maps "vocals" -> "path/to/vocals.mp3"
+    pub error: Option<String>,
+}
+
+// --- AI SIDECAR ---
+// In production, use std::env::var or a config file
+fn get_ai_base_url() -> String {
+    std::env::var("AI_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
+}
+
+#[tauri::command]
+async fn separate_stems(
+    app: tauri::AppHandle,
+    track_index: usize,
+    mute_original: bool,
+    state: State<'_, AppState>
+) -> Result<(), String> {
+    
+    let base_url = get_ai_base_url(); // <--- FIX 1: Capture string once
+
+    // 1. PREPARATION (Brief Lock)
+    let (file_path, duration_secs) = {
+        let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+        let tracks = audio.get_tracks_list();
+        
+        if track_index >= tracks.len() {
+            return Err("Track index out of bounds".into());
+        }
+        
+        let clip = tracks[track_index].clips.first()
+            .ok_or("Track has no audio clips to separate")?;
+            
+        (clip.path.clone(), clip.duration)
+    };
+
+    // Timeout: 4x realtime or min 60s
+    let timeout_seconds = (duration_secs * 4.0).max(60.0) as usize;
+
+    println!("✂️ Separating: {} (Timeout: {}s)", file_path, timeout_seconds);
+    
+    let client = reqwest::Client::new();
+
+    // 2. CONNECT (Fast Fail)
+    let _ = app.emit("progress-update", ProgressPayload { 
+        message: "Connecting to AI...".into(), progress: 5.0, visible: true 
+    });
+
+    // FIX 2: Use base_url reference or clone to avoid move error
+    let health_check = client.get(format!("{}/health", base_url))
+        .timeout(Duration::from_secs(3)) 
+        .send().await;
+
+    if health_check.is_err() {
+        return Err("AI Server unreachable. Is 'ai_server' running?".into());
+    }
+
+    // 3. START JOB
+    let _ = app.emit("progress-update", ProgressPayload { 
+        message: "Uploading to GPU...".into(), progress: 10.0, visible: true 
+    });
+
+    // Send full config for Demucs
+    let res = client.post(format!("{}/process/separate", base_url))
+        .timeout(Duration::from_secs(10))
+        .json(&serde_json::json!({ 
+            "file_path": file_path, 
+            "stem_count": 4,
+            "model": "htdemucs",
+            "device": "cuda",
+            "format": "mp3",   
+            "bitrate": 320,    
+            "shifts": 2        
+        }))
+        .send().await
+        .map_err(|e| format!("Failed to start job: {}", e))?;
+
+    let job_data: SidecarJobResponse = res.json().await.map_err(|e| e.to_string())?;
+    let job_id = job_data.job_id;
+    // --- NEW: Tell Frontend the Job ID so it can be cancelled ---
+    let _ = app.emit("ai-job-started", job_id.clone());
+
+    // 4. SMART POLLING LOOP
+    let mut attempts = 0;
+    loop {
+        if attempts > timeout_seconds {
+            // TIMEOUT: Try to cancel on server side
+            let _ = client.post(format!("{}/jobs/{}/cancel", base_url, job_id))
+                .send().await;
+            return Err(format!("AI timed out after {} seconds.", timeout_seconds));
+        }
+        
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        
+        // Poll Status
+        let status_res = client.get(format!("{}/jobs/{}", base_url, job_id))
+            .timeout(Duration::from_secs(5))
+            .send().await
+            .map_err(|e| format!("Polling failed: {}", e))?;
+            
+        let status_data: SidecarStatusResponse = status_res.json().await.map_err(|e| e.to_string())?;
+        
+        // PROGRESS LOGIC: "Asymptotic Approach" (Never resets, slows down as it gets higher)
+        // Formula: 20 + (70 * (1 - e^(-0.05 * t))) -> Approaches 90%
+        let raw_progress = 1.0 - (-0.05 * (attempts as f64)).exp(); 
+        let visual_progress = 20.0 + (70.0 * raw_progress);
+
+        let stage_msg = match status_data.status.as_str() {
+            "pending" => "Queued...",
+            "processing" => "AI Processing...",
+            "completed" => "Finalizing...",
+            "cancelled" => "Cancelled by user.",
+            _ => "Thinking..."
+        };
+
+        let _ = app.emit("progress-update", ProgressPayload { 
+            message: stage_msg.into(), 
+            progress: visual_progress, 
+            visible: true 
+        });
+
+        if status_data.status == "completed" {
+            if let Some(stems) = status_data.result {
+                let _ = app.emit("progress-update", ProgressPayload { 
+                    message: "Importing Stems...".into(), progress: 98.0, visible: true 
+                });
+
+                // 5. IMPORT (Single Lock Block for Efficiency)
+                {
+                    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+                    
+                    // User Choice: Mute Original?
+                    if mute_original {
+                         audio.toggle_mute(track_index); 
+                    }
+
+                    for (stem_name, path) in stems {
+                        // VALIDATION: Ensure file exists
+                        if !std::path::Path::new(&path).exists() {
+                            println!("⚠️ Warning: Stem file missing: {}", path);
+                            continue;
+                        }
+
+                        match audio.add_track(path.clone()) {
+                            Ok(_) => {
+                                let list = audio.get_tracks_list();
+                                let idx = list.len() - 1;
+                                // Demucs gives "vocals", "drums", etc.
+                                audio.set_track_name(idx, stem_name.clone());
+                            },
+                            Err(e) => println!("Failed to import {}: {}", stem_name, e)
+                        }
+                    }
+                }
+            }
+            break;
+        } else if status_data.status == "failed" {
+            return Err(status_data.error.unwrap_or("Unknown AI Error".into()));
+        } else if status_data.status == "cancelled" {
+            return Err("Job was cancelled.".into());
+        }
+        
+        attempts += 1;
+    }
+
+    let _ = app.emit("progress-update", ProgressPayload { 
+        message: "Done!".into(), progress: 100.0, visible: false 
+    });
+    
+    // Force UI Refresh
+    let _ = app.emit("refresh-project", ());
+    
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_ai_job(job_id: String) -> Result<(), String> {
+    let base_url = get_ai_base_url();
+    let client = reqwest::Client::new();
+    
+    println!("🛑 Requesting cancellation for Job ID: {}", job_id);
+
+    let _ = client.post(format!("{}/jobs/{}/cancel", base_url, job_id))
+        .send().await
+        .map_err(|e| format!("Failed to send cancel request: {}", e))?;
+        
+    Ok(())
+}
+
 fn main() {
 
     dotenv().ok();
@@ -1080,7 +1287,9 @@ fn main() {
             get_input_devices,
             undo,
             redo,
-            ask_ai
+            ask_ai,
+            separate_stems,
+            cancel_ai_job
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

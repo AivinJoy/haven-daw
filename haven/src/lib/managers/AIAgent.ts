@@ -19,6 +19,10 @@ interface AIResponse {
             mode?: string;
             direction?: string;
             count?: number;
+            // --- ADD THESE LINES ---
+            mute_original?: boolean;
+            replace_original?: boolean;
+            job_id?: string;
         };
     }[];
     
@@ -163,6 +167,35 @@ class AIAgent {
         }
 
         switch (action) {
+
+            case 'separate_stems':
+                console.log("✂️ AI Separating Stems...");
+                
+                // 1. Determine Logic based on AI parameters
+                const replaceOriginal = parameters.replace_original === true;
+                const shouldMute = parameters.mute_original === true;
+
+                // 2. Call Rust Backend
+                // (If replacing, we don't need to mute, because we will delete it anyway)
+                await invoke('separate_stems', { 
+                    trackIndex: parameters.track_id - 1,
+                    muteOriginal: shouldMute && !replaceOriginal 
+                });
+
+                // 3. Handle Replacement (Delete original after separation)
+                if (replaceOriginal) {
+                    console.log("🗑️ Replacing original track (Deleting)...");
+                    // Small delay to ensure Rust has finished importing/unlocking
+                    await new Promise(r => setTimeout(r, 500)); 
+                    await invoke('delete_track', { trackIndex: parameters.track_id - 1 });
+                }
+                break;
+            case 'cancel_job':
+                 if (parameters?.job_id) {
+                     await invoke('cancel_ai_job', { jobId: parameters.job_id });
+                 }
+                 break;
+
             case 'set_gain':
                 const gain = Math.max(0, Math.min(2.0, parameters.value ?? 1.0));
                 await invoke('set_track_gain', { trackIndex: parameters.track_id - 1, gain });
@@ -194,7 +227,7 @@ class AIAgent {
                  }
                  break;
             case 'undo': await invoke('undo'); break;
-            case 'redo': await invoke('redo'); break;
+            case 'redo': await invoke('redo'); break;    
         }
 
         window.dispatchEvent(new CustomEvent('refresh-project')); 
