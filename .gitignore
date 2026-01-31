@@ -11,6 +11,11 @@ build/
 .env
 .env.local
 
+# --- Python Virtual Environment ---
+venv/
+.venv/
+env/
+
 # --- 2. Folders to EXCLUDE (The "Other" 4 folders) ---
 hellomusic/
 mp3player/
