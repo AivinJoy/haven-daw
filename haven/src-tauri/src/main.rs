@@ -935,13 +935,14 @@ async fn ask_ai(
         {{ \n\
           \"steps\": [ \n\
             {{ \n\
-              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"none\", \n\
+              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"none\", \n\
               \"parameters\": {{ \n\
                 \"track_id\": number (optional), \n\
                 \"value\": number (optional), \n\
                 \"time\": number (optional) \n\
                 \"mute_original\": boolean (optional), \n\
-                \"replace_original\": boolean (optional) \n\
+                \"replace_original\": boolean (optional), \n\
+                \"job_id\": string (optional) \n\
               }} \n\
             }} \n\
           ], \n\
@@ -1041,6 +1042,30 @@ async fn ask_ai(
     }
 }
 
+// --- SHARED HELPER: Decodes audio & generates waveform data ---
+fn analyze_audio_internal(path: &str, color: String) -> Result<ImportResult, String> {
+    // 1. Decode (Heavy CPU)
+    let (samples, sr, channels) = bpm::adapter::decode_to_vec(path)
+        .map_err(|e| format!("Failed to decode: {}", e))?;
+
+    // 2. Build Waveform
+    let wf = Waveform::build_from_samples(&samples, sr, channels, 512);
+
+    // 3. Calculate Bins
+    let pixels_per_second = 100.0;
+    let spp = (sr as f64) / pixels_per_second;
+    let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
+
+    Ok(ImportResult {
+        mins: mins.to_vec(),
+        maxs: maxs.to_vec(),
+        duration: wf.duration_secs,
+        bins_per_second: pixels_per_second,
+        bpm: None, // Stems inherit project BPM, so we skip detection to be faster
+        color,
+    })
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct SidecarJobResponse {
     pub job_id: String,
@@ -1065,6 +1090,7 @@ async fn separate_stems(
     app: tauri::AppHandle,
     track_index: usize,
     mute_original: bool,
+    replace_original: bool,
     state: State<'_, AppState>
 ) -> Result<(), String> {
     
@@ -1120,8 +1146,7 @@ async fn separate_stems(
             "model": "htdemucs",
             "device": "cuda",
             "format": "mp3",   
-            "bitrate": 320,    
-            "shifts": 2        
+            "bitrate": 320       
         }))
         .send().await
         .map_err(|e| format!("Failed to start job: {}", e))?;
@@ -1173,39 +1198,86 @@ async fn separate_stems(
         if status_data.status == "completed" {
             if let Some(stems) = status_data.result {
                 let _ = app.emit("progress-update", ProgressPayload { 
-                    message: "Importing Stems...".into(), progress: 98.0, visible: true 
+                    message: "Importing Stems...".into(), progress: 95.0, visible: true 
                 });
 
-                // 5. IMPORT (Single Lock Block for Efficiency)
+                // Map stores: Path -> (Color, TrackIndex)
+                let mut stem_info: std::collections::HashMap<String, (String, usize)> = std::collections::HashMap::new();
+
+                // --- A. AUDIO ENGINE UPDATE ---
                 {
                     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-                    
-                    // User Choice: Mute Original?
-                    if mute_original {
-                         audio.toggle_mute(track_index); 
+
+                    if replace_original {
+                        audio.delete_track(track_index).map_err(|e| e.to_string())?;
+                        std::thread::sleep(Duration::from_millis(50));
+                    } else if mute_original {
+                        audio.toggle_mute(track_index);
                     }
 
-                    for (stem_name, path) in stems {
-                        // VALIDATION: Ensure file exists
-                        if !std::path::Path::new(&path).exists() {
-                            println!("⚠️ Warning: Stem file missing: {}", path);
-                            continue;
-                        }
-
+                    for (stem_name, path) in &stems {
+                        if !std::path::Path::new(path).exists() { continue; }
+                        
                         match audio.add_track(path.clone()) {
                             Ok(_) => {
                                 let list = audio.get_tracks_list();
                                 let idx = list.len() - 1;
-                                // Demucs gives "vocals", "drums", etc.
                                 audio.set_track_name(idx, stem_name.clone());
+
+                                // FIX 1: Wrap in parentheses to make a Tuple
+                                let assigned_color = list[idx].color.clone();
+                                stem_info.insert(path.clone(), (assigned_color, idx));
                             },
-                            Err(e) => println!("Failed to import {}: {}", stem_name, e)
+                            Err(e) => println!("Failed to add track {}: {}", stem_name, e)
+                        }
+                    }
+                }
+
+                // --- B. VISUAL & DURATION UPDATE ---
+                for (stem_name, path) in stems {
+                    if !std::path::Path::new(&path).exists() { continue; }
+                    
+                    let path_clone = path.clone();
+                    
+                    // Retrieve tuple
+                    let (color, track_idx) = stem_info.get(&path).cloned()
+                        .unwrap_or(("#00AEFF".to_string(), 0));
+
+                    println!("🔍 Analyzing Stem: {}", stem_name);
+
+                    let task_result = tauri::async_runtime::spawn_blocking(move || {
+                        analyze_audio_internal(&path_clone, color) 
+                    }).await;
+
+                    match task_result {
+                        Ok(Ok(result)) => {
+                            // FIX 2: Use .clone() so we keep 'result' for the next step
+                            if let Ok(mut cache) = state.cache.lock() {
+                                cache.insert(path.clone(), result.clone()); 
+                                println!("✅ Analysis Cache Saved: {}", path);
+                            }
+
+                            // Update Engine Duration
+                            if let Ok(audio) = state.audio.lock() {
+                                if let Err(e) = audio.set_clip_duration(track_idx, result.duration) {
+                                    println!("⚠️ Failed to update duration for {}: {}", stem_name, e);
+                                } else {
+                                     println!("⏱️ Duration Synced: {:.2}s for Track {}", result.duration, track_idx);
+                                }
+                            }
+                        },
+                        Ok(Err(decode_err)) => {
+                            println!("❌ Failed to Analyze {}: {}", stem_name, decode_err);
+                        },
+                        Err(join_err) => {
+                            println!("❌ Thread Panicked for {}: {}", stem_name, join_err);
                         }
                     }
                 }
             }
             break;
-        } else if status_data.status == "failed" {
+        }
+        else if status_data.status == "failed" {
             return Err(status_data.error.unwrap_or("Unknown AI Error".into()));
         } else if status_data.status == "cancelled" {
             return Err("Job was cancelled.".into());

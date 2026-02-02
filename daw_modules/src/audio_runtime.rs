@@ -659,4 +659,19 @@ impl AudioRuntime {
             }
         }
     }
+
+    // --- ADD THIS NEW METHOD HERE ---
+    pub fn set_clip_duration(&self, track_index: usize, duration: f64) -> Result<(), String> {
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().get_mut(track_index) {
+                if let Some(clip) = track.clips.first_mut() {
+                    // Update the duration (convert f64 seconds to Duration)
+                    clip.duration = Duration::from_secs_f64(duration);
+                    return Ok(());
+                }
+            }
+            return Err("Track or clip not found".to_string());
+        }
+        Err("Failed to lock engine".to_string())
+    }
 }

@@ -87,7 +87,6 @@ def process_separation_task(job_id: str, file_path: str):
             "--device", "cuda" if torch.cuda.is_available() else "cpu",
             "--mp3",
             "--mp3-bitrate", "320",
-            "--shifts", "2",
             file_path
         ])
 
@@ -107,10 +106,16 @@ def process_separation_task(job_id: str, file_path: str):
         jobs[job_id]["result"] = stems
         print(f"✅ Job {job_id} Finished.")
 
-    except Exception as e:
+    except BaseException as e:
+        # We use BaseException to catch SystemExit (which Demucs throws on failure)
         print(f"❌ Job {job_id} Failed: {e}")
         jobs[job_id]["status"] = JobStatus.FAILED
-        jobs[job_id]["error"] = str(e)
+        
+        # Provide a helpful hint if it crashed
+        if isinstance(e, SystemExit):
+             jobs[job_id]["error"] = "AI Engine crashed. (Check server console: Likely missing FFmpeg or bad file format)"
+        else:
+             jobs[job_id]["error"] = str(e)
 
 
 # --- API LIFECYCLE ---

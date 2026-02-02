@@ -53,7 +53,7 @@ class AIAgent {
         // Filter out any failed/empty messages and map to {role, content}
         const chatHistory = previousMessages.map(m => ({
             role: m.role,
-            content: m.content
+            content: m.content || " "
         }));
 
         // 2. FETCH REAL TIME STATE (Crucial Fix)
@@ -107,7 +107,7 @@ class AIAgent {
 
             return {
                 role: 'assistant',
-                content: data.message,
+                content: data.message || "Done",
                 timestamp: Date.now(),
                 action: data.steps?.[0]?.action || data.action || 'none'
             };
@@ -179,16 +179,9 @@ class AIAgent {
                 // (If replacing, we don't need to mute, because we will delete it anyway)
                 await invoke('separate_stems', { 
                     trackIndex: parameters.track_id - 1,
-                    muteOriginal: shouldMute && !replaceOriginal 
+                    muteOriginal: shouldMute, 
+                    replaceOriginal: replaceOriginal
                 });
-
-                // 3. Handle Replacement (Delete original after separation)
-                if (replaceOriginal) {
-                    console.log("🗑️ Replacing original track (Deleting)...");
-                    // Small delay to ensure Rust has finished importing/unlocking
-                    await new Promise(r => setTimeout(r, 500)); 
-                    await invoke('delete_track', { trackIndex: parameters.track_id - 1 });
-                }
                 break;
             case 'cancel_job':
                  if (parameters?.job_id) {
