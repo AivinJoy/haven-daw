@@ -661,16 +661,19 @@ impl AudioRuntime {
     }
 
     // --- ADD THIS NEW METHOD HERE ---
-    pub fn set_clip_duration(&self, track_index: usize, duration: f64) -> Result<(), String> {
+    // UPDATED: Now takes 'track_id: u32' instead of index
+    pub fn set_clip_duration(&self, track_id: u32, duration: f64) -> Result<(), String> {
         if let Ok(mut eng) = self.engine.lock() {
-            if let Some(track) = eng.tracks_mut().get_mut(track_index) {
+            // Iterate to find the track with the matching ID
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
                 if let Some(clip) = track.clips.first_mut() {
-                    // Update the duration (convert f64 seconds to Duration)
                     clip.duration = Duration::from_secs_f64(duration);
                     return Ok(());
+                } else {
+                    return Err(format!("Track {} exists but has no clips (Empty Track)", track_id));
                 }
             }
-            return Err("Track or clip not found".to_string());
+            return Err(format!("Track ID {} not found", track_id));
         }
         Err("Failed to lock engine".to_string())
     }

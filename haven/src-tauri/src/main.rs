@@ -1201,8 +1201,8 @@ async fn separate_stems(
                     message: "Importing Stems...".into(), progress: 95.0, visible: true 
                 });
 
-                // Map stores: Path -> (Color, TrackIndex)
-                let mut stem_info: std::collections::HashMap<String, (String, usize)> = std::collections::HashMap::new();
+                // FIX 1: Store (Color, TrackID) -> TrackID is u32
+                let mut stem_info: std::collections::HashMap<String, (String, u32)> = std::collections::HashMap::new();
 
                 // --- A. AUDIO ENGINE UPDATE ---
                 {
@@ -1221,12 +1221,13 @@ async fn separate_stems(
                         match audio.add_track(path.clone()) {
                             Ok(_) => {
                                 let list = audio.get_tracks_list();
-                                let idx = list.len() - 1;
+                                let idx = list.len() - 1; 
                                 audio.set_track_name(idx, stem_name.clone());
 
-                                // FIX 1: Wrap in parentheses to make a Tuple
+                                // FIX 2: Capture ID instead of Index
                                 let assigned_color = list[idx].color.clone();
-                                stem_info.insert(path.clone(), (assigned_color, idx));
+                                let assigned_id = list[idx].id; // <--- Capture Stable ID
+                                stem_info.insert(path.clone(), (assigned_color, assigned_id));
                             },
                             Err(e) => println!("Failed to add track {}: {}", stem_name, e)
                         }
@@ -1239,8 +1240,8 @@ async fn separate_stems(
                     
                     let path_clone = path.clone();
                     
-                    // Retrieve tuple
-                    let (color, track_idx) = stem_info.get(&path).cloned()
+                    // Retrieve Color & ID (Default to 0 if missing)
+                    let (color, track_id) = stem_info.get(&path).cloned()
                         .unwrap_or(("#00AEFF".to_string(), 0));
 
                     println!("🔍 Analyzing Stem: {}", stem_name);
@@ -1251,18 +1252,17 @@ async fn separate_stems(
 
                     match task_result {
                         Ok(Ok(result)) => {
-                            // FIX 2: Use .clone() so we keep 'result' for the next step
                             if let Ok(mut cache) = state.cache.lock() {
                                 cache.insert(path.clone(), result.clone()); 
                                 println!("✅ Analysis Cache Saved: {}", path);
                             }
 
-                            // Update Engine Duration
+                            // FIX 3: Update Duration using ID
                             if let Ok(audio) = state.audio.lock() {
-                                if let Err(e) = audio.set_clip_duration(track_idx, result.duration) {
+                                if let Err(e) = audio.set_clip_duration(track_id, result.duration) {
                                     println!("⚠️ Failed to update duration for {}: {}", stem_name, e);
                                 } else {
-                                     println!("⏱️ Duration Synced: {:.2}s for Track {}", result.duration, track_idx);
+                                     println!("⏱️ Duration Synced: {:.2}s for Track ID {}", result.duration, track_id);
                                 }
                             }
                         },

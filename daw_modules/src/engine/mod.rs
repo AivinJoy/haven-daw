@@ -89,6 +89,7 @@ impl Engine {
     }
 
     // --- NEW: Add a Clip to an existing Track ---
+    // --- NEW: Add a Clip to an existing Track ---
     pub fn add_clip(&mut self, track_index: usize, path: String, start_time_secs: f64) -> anyhow::Result<()> {
         let sample_rate = self.sample_rate;
         let channels = self.channels;
@@ -99,8 +100,11 @@ impl Engine {
 
         if let Some(track) = self.tracks.get_mut(track_index) {
             track.add_clip(path, start_time, sample_rate, channels, current_pos)?;
+            Ok(()) // <--- Explicitly return Ok(()) on success
+        } else {
+            // FIX: Return an error if track is missing
+            Err(anyhow::anyhow!("Track index {} out of bounds", track_index))
         }
-        Ok(())
     }
 
     pub fn remove_track(&mut self, index: usize) -> anyhow::Result<()> {
@@ -114,10 +118,16 @@ impl Engine {
 
     // --- UPDATED: Wrapper for backward compatibility ---
     // Creates a track and adds the file as the first clip at 0.0s
+    // --- UPDATED: Wrapper for backward compatibility ---
     pub fn add_track(&mut self, path: String) -> anyhow::Result<TrackId> {
         let id = self.add_empty_track();
-        // Add the file as a clip starting at 0.0
-        self.add_clip(id.0 as usize, path, 0.0)?;
+        
+        // Use the actual index of the new track (last item)
+        let new_track_index = self.tracks.len() - 1;
+        
+        // FIX: Pass 'new_track_index' here, NOT 'id.0 as usize'
+        self.add_clip(new_track_index, path, 0.0)?;
+        
         Ok(id)
     }
 
