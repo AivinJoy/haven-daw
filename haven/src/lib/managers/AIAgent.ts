@@ -19,6 +19,10 @@ interface AIResponse {
             mode?: string;
             direction?: string;
             count?: number;
+            // --- ADD THESE LINES ---
+            mute_original?: boolean;
+            replace_original?: boolean;
+            job_id?: string;
         };
     }[];
     
@@ -28,6 +32,14 @@ interface AIResponse {
 
     message: string;
     confidence: number;
+}
+
+// Helper to define the structure of Recording Status
+interface RecordingState {
+    is_recording: boolean;
+    duration: number;
+    current_rms: number;
+    is_monitoring: boolean;
 }
 
 class AIAgent {
@@ -41,13 +53,30 @@ class AIAgent {
         // Filter out any failed/empty messages and map to {role, content}
         const chatHistory = previousMessages.map(m => ({
             role: m.role,
-            content: m.content
+            content: m.content || " "
         }));
+
+        // 2. FETCH REAL TIME STATE (Crucial Fix)
+        // We need to know if Monitoring is ON so the AI knows whether to turn it OFF.
+        let isMonitoring = false;
+        try {
+            const recState = await invoke<RecordingState>('get_recording_status');
+            isMonitoring = recState.is_monitoring;
+        } catch (e) {
+            console.warn("Could not fetch recording status for AI context", e);
+        }
         
         // 1. Normalize Context
+        // 1. Normalize Context
+        // We MUST include gain/pan/muted/solo so the AI knows what to reset
         const context = JSON.stringify(tracks.map(t => ({ 
             id: t.id, 
-            name: t.name.toLowerCase() 
+            name: t.name.toLowerCase(),
+            gain: t.gain,
+            pan: t.pan,
+            muted: t.muted,
+            solo: t.solo,
+            monitoring: isMonitoring
         })));
 
         try {
@@ -78,7 +107,7 @@ class AIAgent {
 
             return {
                 role: 'assistant',
-                content: data.message,
+                content: data.message || "Done",
                 timestamp: Date.now(),
                 action: data.steps?.[0]?.action || data.action || 'none'
             };
@@ -138,6 +167,28 @@ class AIAgent {
         }
 
         switch (action) {
+
+            case 'separate_stems':
+                console.log("✂️ AI Separating Stems...");
+                
+                // 1. Determine Logic based on AI parameters
+                const replaceOriginal = parameters.replace_original === true;
+                const shouldMute = parameters.mute_original === true;
+
+                // 2. Call Rust Backend
+                // (If replacing, we don't need to mute, because we will delete it anyway)
+                await invoke('separate_stems', { 
+                    trackIndex: parameters.track_id - 1,
+                    muteOriginal: shouldMute, 
+                    replaceOriginal: replaceOriginal
+                });
+                break;
+            case 'cancel_job':
+                 if (parameters?.job_id) {
+                     await invoke('cancel_ai_job', { jobId: parameters.job_id });
+                 }
+                 break;
+
             case 'set_gain':
                 const gain = Math.max(0, Math.min(2.0, parameters.value ?? 1.0));
                 await invoke('set_track_gain', { trackIndex: parameters.track_id - 1, gain });
@@ -169,7 +220,7 @@ class AIAgent {
                  }
                  break;
             case 'undo': await invoke('undo'); break;
-            case 'redo': await invoke('redo'); break;
+            case 'redo': await invoke('redo'); break;    
         }
 
         window.dispatchEvent(new CustomEvent('refresh-project')); 

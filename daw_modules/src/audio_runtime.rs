@@ -37,6 +37,7 @@ pub struct FrontendClipInfo {
 pub struct FrontendTrackInfo {
     pub id: u32,
     pub name: String,
+    pub color: String,
     pub gain: f32,
     pub pan: f32,
     pub muted: bool,
@@ -575,6 +576,7 @@ impl AudioRuntime {
             // 2. Create the TrackState
             crate::session::serialization::TrackState {
                 name: t.name.clone(), // Used to be 'path', now 'name'
+                color: t.color.clone(),
                 gain: t.gain,
                 pan: t.pan,
                 muted: t.muted,
@@ -618,6 +620,7 @@ impl AudioRuntime {
                 FrontendTrackInfo {
                     id: t.id.0,
                     name: t.name.clone(),
+                    color: t.color.clone(),
                     gain: t.gain,
                     pan: t.pan,
                     muted: t.muted,
@@ -655,5 +658,23 @@ impl AudioRuntime {
                 track.name = name;
             }
         }
+    }
+
+    // --- ADD THIS NEW METHOD HERE ---
+    // UPDATED: Now takes 'track_id: u32' instead of index
+    pub fn set_clip_duration(&self, track_id: u32, duration: f64) -> Result<(), String> {
+        if let Ok(mut eng) = self.engine.lock() {
+            // Iterate to find the track with the matching ID
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
+                if let Some(clip) = track.clips.first_mut() {
+                    clip.duration = Duration::from_secs_f64(duration);
+                    return Ok(());
+                } else {
+                    return Err(format!("Track {} exists but has no clips (Empty Track)", track_id));
+                }
+            }
+            return Err(format!("Track ID {} not found", track_id));
+        }
+        Err("Failed to lock engine".to_string())
     }
 }
