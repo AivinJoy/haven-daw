@@ -49,6 +49,21 @@ impl Engine {
         self.transport.tempo.bpm = bpm as f64;
     }
 
+    pub fn clear_state(&mut self) {
+        // 1. Remove all tracks
+        self.tracks.clear();
+        
+        // 2. Reset Global Transport
+        self.transport.playing = false; // ✅ Manual reset
+        self.transport.position = std::time::Duration::ZERO;
+        
+        // 3. Reset Global Parameters
+        self.master_gain = 1.0;
+        
+        // 4. CRITICAL: DO NOT reset 'next_track_id'. 
+        println!("✨ Engine State Cleared (ID Counter Preserved)");
+    }
+
     pub fn clear_tracks(&mut self) {
         self.tracks.clear();
     }
@@ -107,12 +122,12 @@ impl Engine {
         }
     }
 
-    pub fn remove_track(&mut self, index: usize) -> anyhow::Result<()> {
-        if index < self.tracks.len() {
+    pub fn remove_track(&mut self, target_id: TrackId) -> anyhow::Result<()> {
+        if let Some(index) = self.tracks.iter().position(|t| t.id == target_id) {
             self.tracks.remove(index);
             Ok(())
         } else {
-            Err(anyhow::anyhow!("Track index out of bounds"))
+            Err(anyhow::anyhow!("Track ID {:?} index not found", target_id))
         }
     }
 

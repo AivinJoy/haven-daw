@@ -218,11 +218,16 @@ impl AudioRuntime {
         Ok(())
     }
 
-    pub fn delete_track(&self, index: usize) -> anyhow::Result<()> {
+    // ✅ Takes a Stable ID (u32)
+    pub fn delete_track(&self, track_id: u32) -> Result<(), String> {
         if let Ok(mut eng) = self.engine.lock() {
-            eng.remove_track(index)?;
+            // Converts u32 -> TrackId struct and calls our safe engine method
+            eng.remove_track(crate::engine::TrackId(track_id))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        } else {
+            Err("Failed to lock engine".to_string())
         }
-        Ok(())
     }
 
     // --- ADD THIS NEW METHOD ---
@@ -241,31 +246,40 @@ impl AudioRuntime {
         Ok(())
     }
 
-    pub fn add_clip(&self, track_index: usize, path: String, start_time: f64) -> anyhow::Result<()> {
-        println!("➡️ Backend: Attempting to add clip to Track Index {}", track_index); // <--- DEBUG LOG
+    // ✅ UPDATED: Takes 'track_id: u32' for safety
+    pub fn add_clip(&self, track_id: u32, path: String, start_time: f64) -> anyhow::Result<()> {
+        println!("➡️ Backend: Adding clip to Track ID {}", track_id);
         
         if let Ok(mut eng) = self.engine.lock() {
-            match eng.add_clip(track_index, path.clone(), start_time) {
-                Ok(_) => println!("✅ Backend: Successfully added clip: {}", path),
-                Err(e) => {
-                    println!("❌ Backend: Failed to add clip! Error: {}", e);
-                    return Err(e); // Pass error up
+            // 1. Resolve ID to internal Index
+            if let Some((index, _)) = eng.tracks().iter().enumerate().find(|(_, t)| t.id.0 == track_id) {
+                match eng.add_clip(index, path.clone(), start_time) {
+                    Ok(_) => println!("✅ Backend: Successfully added clip"),
+                    Err(e) => {
+                        println!("❌ Backend: Failed to add clip! Error: {}", e);
+                        return Err(e);
+                    }
                 }
+            } else {
+                return Err(anyhow::anyhow!("Track ID {} not found", track_id));
             }
         }
         Ok(())
     }
 
-    pub fn move_clip(&self, track_index: usize, clip_index: usize, new_start: f64) -> anyhow::Result<()> {
-        let (track_id, old_start) = {
+    pub fn move_clip(&self, track_id: u32, clip_index: usize, new_start: f64) -> anyhow::Result<()> {
+        let old_start = {
              let eng = self.engine.lock().unwrap();
-             let track = eng.tracks().get(track_index).ok_or(anyhow::anyhow!("Track not found"))?;
-             let clip = track.clips.get(clip_index).ok_or(anyhow::anyhow!("Clip not found"))?;
-             (track.id, clip.start_time)
+             let track = eng.tracks().iter().find(|t| t.id.0 == track_id)
+                 .ok_or(anyhow::anyhow!("Track not found"))?;
+             
+             let clip = track.clips.get(clip_index)
+                 .ok_or(anyhow::anyhow!("Clip not found"))?;
+             clip.start_time
         };
 
         let cmd = Box::new(MoveClip {
-            track_id,
+            track_id: crate::engine::TrackId(track_id),
             clip_index,
             old_start,
             new_start: Duration::from_secs_f64(new_start),
@@ -277,14 +291,17 @@ impl AudioRuntime {
         Ok(())
     }
 
-    pub fn split_clip(&self, track_index: usize, time: f64) -> anyhow::Result<()> {
-        let track_id = {
+    pub fn split_clip(&self, track_id: u32, time: f64) -> anyhow::Result<()> {
+        // Verify track exists
+        {
              let eng = self.engine.lock().unwrap();
-             eng.tracks().get(track_index).map(|t| t.id)
-        }.ok_or(anyhow::anyhow!("Track not found"))?;
+             if !eng.tracks().iter().any(|t| t.id.0 == track_id) {
+                 return Err(anyhow::anyhow!("Track not found"));
+             }
+        }
     
         let cmd = Box::new(SplitClip {
-            track_id,
+            track_id: crate::engine::TrackId(track_id),
             split_time: Duration::from_secs_f64(time),
         });
     
@@ -334,43 +351,57 @@ impl AudioRuntime {
 
     // --- TRACK CONTROLS ---
 
-    pub fn toggle_mute(&self, track_index: usize) {
-        let (track_id, current_mute) = {
-            let eng = self.engine.lock().unwrap();
-            if let Some(t) = eng.tracks().get(track_index) {
-                (t.id, t.muted)
-            } else { return; }
-        };
+    // --- EXPLICIT STATE CONTROLS (Phase 2) ---
 
+    // ✅ Takes ID (u32) and State (bool)
+    // "True" = Muted/Silent. "False" = Audible.
+    pub fn set_track_mute(&self, track_id: u32, state: bool) -> Result<(), String> {
         let cmd = Box::new(SetTrackMute {
-            track_id,
-            new_state: !current_mute,
+            track_id: crate::engine::TrackId(track_id),
+            new_state: state,
         });
 
         if let Ok(mut session) = self.session.lock() {
-            let _ = session.apply(&self.engine, cmd);
-            println!("Track {} mute toggled", track_index);
+            session.apply(&self.engine, cmd).map_err(|e| e.to_string())?;
+            Ok(())
+        } else {
+            Err("Session lock failed".to_string())
         }
     }
 
-    // Non-destructive solo logic
-    pub fn toggle_solo(&self, track_index: usize) {
-        let track_id = {
+    // ✅ Takes ID (u32) and State (bool)
+    // "True" = Soloed. "False" = Normal.
+    pub fn set_track_solo(&self, track_id: u32, state: bool) -> Result<(), String> {
+        // Note: Ensure you updated 'SetTrackSolo' in commands.rs to take 'new_state' first!
+        let cmd = Box::new(SetTrackSolo { 
+            track_id: crate::engine::TrackId(track_id),
+            new_state: state,
+        });
+        
+        if let Ok(mut session) = self.session.lock() {
+            session.apply(&self.engine, cmd).map_err(|e| e.to_string())?;
+            Ok(())
+        } else {
+            Err("Session lock failed".to_string())
+        }
+    }
+
+    // Helper used by some controllers
+    pub fn solo_track(&self, track_index: usize) {
+        // 1. Resolve Index -> ID & State
+        let (track_id, current_state) = {
             let eng = self.engine.lock().unwrap();
-            eng.tracks().get(track_index).map(|t| t.id)
+            if let Some(t) = eng.tracks().get(track_index) {
+                (t.id.0, t.solo)
+            } else {
+                return;
+            }
         };
 
-        if let Some(tid) = track_id {
-            let cmd = Box::new(ToggleSolo { track_id: tid });
-            if let Ok(mut session) = self.session.lock() {
-                let _ = session.apply(&self.engine, cmd);
-                println!("Track {} solo toggled", track_index);
-            }
-        }
-    }
-
-    pub fn solo_track(&self, track_index: usize) {
-        self.toggle_solo(track_index);
+        // 2. Explicitly Set State
+        // We use the new API directly instead of calling a toggle wrapper
+        let _ = self.set_track_solo(track_id, !current_state);
+        println!("Track {} solo toggled via explicit logic", track_index);
     }
 
     pub fn clear_solo(&self) {
@@ -384,16 +415,18 @@ impl AudioRuntime {
     }
 
     // Absolute Gain Setter (for Sliders)
-    pub fn set_track_gain(&self, track_index: usize, gain: f32) {
-        let (track_id, old_gain) = {
+    // Absolute Gain Setter (Updated for Stable IDs)
+    pub fn set_track_gain(&self, track_id: u32, gain: f32) {
+        let old_gain = {
             let eng = self.engine.lock().unwrap();
-            if let Some(t) = eng.tracks().get(track_index) {
-                (t.id, t.gain)
+            // Look up by ID, not index
+            if let Some(t) = eng.tracks().iter().find(|t| t.id.0 == track_id) {
+                t.gain
             } else { return; }
         };
 
         let cmd = Box::new(SetTrackGain {
-            track_id,
+            track_id: crate::engine::TrackId(track_id),
             old_gain,
             new_gain: gain.clamp(0.0, 2.0),
         });
@@ -404,16 +437,18 @@ impl AudioRuntime {
     }
 
     // Absolute Pan Setter
-    pub fn set_track_pan(&self, track_index: usize, pan: f32) {
-        let (track_id, old_pan) = {
+    // Absolute Pan Setter (Updated for Stable IDs)
+    pub fn set_track_pan(&self, track_id: u32, pan: f32) {
+        let old_pan = {
             let eng = self.engine.lock().unwrap();
-            if let Some(t) = eng.tracks().get(track_index) {
-                (t.id, t.pan)
+            // Look up by ID
+            if let Some(t) = eng.tracks().iter().find(|t| t.id.0 == track_id) {
+                t.pan
             } else { return; }
         };
 
         let cmd = Box::new(SetTrackPan {
-            track_id,
+            track_id: crate::engine::TrackId(track_id),
             old_pan,
             new_pan: pan.clamp(-1.0, 1.0),
         });
@@ -433,6 +468,7 @@ impl AudioRuntime {
         };
         let new_gain = (old_gain + delta).clamp(0.0, 2.0);
         let cmd = Box::new(SetTrackGain { track_id, old_gain, new_gain });
+        // Send command
         if let Ok(mut session) = self.session.lock() {
             let _ = session.apply(&self.engine, cmd);
         }
@@ -459,13 +495,16 @@ impl AudioRuntime {
        Ok(())
     }
 
-    pub fn delete_clip(&self, track_index: usize, clip_index: usize) -> anyhow::Result<()> {
-        let (track_id, clip_data) = {
+    pub fn delete_clip(&self, track_id: u32, clip_index: usize) -> anyhow::Result<()> {
+        let clip_data = {
             let eng = self.engine.lock().unwrap();
-            let track = eng.tracks().get(track_index).ok_or(anyhow::anyhow!("Track not found"))?;
-            let clip = track.clips.get(clip_index).ok_or(anyhow::anyhow!("Clip not found"))?;
+            let track = eng.tracks().iter().find(|t| t.id.0 == track_id)
+                .ok_or(anyhow::anyhow!("Track not found"))?;
+                
+            let clip = track.clips.get(clip_index)
+                .ok_or(anyhow::anyhow!("Clip not found"))?;
             
-            let data = DeletedClipData {
+            DeletedClipData {
                 path: clip.path.clone(),
                 start_time: clip.start_time,
                 offset: clip.offset,
@@ -473,12 +512,11 @@ impl AudioRuntime {
                 source_duration: clip.source_duration,
                 source_sr: clip.source_sr,
                 source_ch: clip.source_ch,
-            };
-            (track.id, data)
+            }
         };
     
         let cmd = Box::new(DeleteClip {
-            track_id,
+            track_id: crate::engine::TrackId(track_id),
             clip_index,
             clip_data,
         });
@@ -491,24 +529,20 @@ impl AudioRuntime {
 
     // --- EQ COMMANDS ---
 
-    pub fn update_eq(&self, track_index: usize, band_index: usize, params: EqParams) {
-        let (track_id, old_params) = {
+    pub fn update_eq(&self, track_id: u32, band_index: usize, params: EqParams) {
+        let old_params = {
             let eng = self.engine.lock().unwrap();
-            if let Some(track) = eng.tracks().get(track_index) {
+            if let Some(track) = eng.tracks().iter().find(|t| t.id.0 == track_id) {
                 let current_state = track.track_eq.get_state(); 
                 if band_index < current_state.len() {
-                    (Some(track.id), Some(current_state[band_index]))
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            }
+                    Some(current_state[band_index])
+                } else { None }
+            } else { None }
         };
 
-        if let (Some(tid), Some(old)) = (track_id, old_params) {
+        if let Some(old) = old_params {
             let cmd = Box::new(UpdateEq {
-                track_id: tid,
+                track_id: crate::engine::TrackId(track_id),
                 band_index,
                 old_params: old,
                 new_params: params,
@@ -520,9 +554,9 @@ impl AudioRuntime {
         }
     }
 
-    pub fn get_eq_state(&self, track_index: usize) -> Vec<EqParams> {
+    pub fn get_eq_state(&self, track_id: u32) -> Vec<EqParams> {
         if let Ok(eng) = self.engine.lock() {
-            if let Some(track) = eng.tracks().get(track_index) {
+            if let Some(track) = eng.tracks().iter().find(|t| t.id.0 == track_id) {
                 return track.track_eq.get_state();
             }
         }
@@ -530,12 +564,35 @@ impl AudioRuntime {
     }
 
     // FIX: Corrected Reset Methods (No Delta, Just Reset)
+    // FIX: Corrected Reset Methods (Index -> ID Lookup)
     pub fn reset_track_gain(&self, track_index: usize) {
-        self.set_track_gain(track_index, 1.0);
+        // 1. Resolve Index to ID
+        let track_id = {
+            let eng = self.engine.lock().unwrap();
+            if let Some(t) = eng.tracks().get(track_index) {
+                t.id.0
+            } else {
+                return; // Track doesn't exist
+            }
+        };
+
+        // 2. Call safe setter with ID
+        self.set_track_gain(track_id, 1.0);
     }
 
     pub fn reset_track_pan(&self, track_index: usize) {
-        self.set_track_pan(track_index, 0.0);
+        // 1. Resolve Index to ID
+        let track_id = {
+            let eng = self.engine.lock().unwrap();
+            if let Some(t) = eng.tracks().get(track_index) {
+                t.id.0
+            } else {
+                return;
+            }
+        };
+
+        // 2. Call safe setter with ID
+        self.set_track_pan(track_id, 0.0);
     }
 
     // --- SAVE / LOAD / EXPORT (Primary for Main.rs) ---
@@ -676,5 +733,25 @@ impl AudioRuntime {
             return Err(format!("Track ID {} not found", track_id));
         }
         Err("Failed to lock engine".to_string())
+    }
+
+    // --- PHASE 3: SAFE PROJECT RESET ---
+    pub fn new_project(&self) {
+        // 1. Pause Audio Engine (Crucial to prevent deadlocks)
+        if let Ok(mut eng) = self.engine.lock() {
+            eng.transport.playing = false;
+        }
+
+        // 2. Clear History (Undo/Redo)
+        if let Ok(mut session) = self.session.lock() {
+            session.clear_history(); 
+        }
+
+        // 3. Clear Engine State
+        if let Ok(mut eng) = self.engine.lock() {
+            eng.clear_state();
+        }
+
+        println!("✨ Project Reset Complete (Runtime Level)");
     }
 }

@@ -475,19 +475,55 @@ impl DawController {
 
     fn mute_track(&mut self, idx: usize) {
         if let Some(audio) = &self.audio {
-            audio.toggle_mute(idx);
+            // 1. Get the list to verify the track exists and get its ID/State
+            let tracks = audio.get_tracks_list();
+
+            // 2. Find the track at the requested visual index
+            if let Some(track) = tracks.get(idx) {
+                // 3. Calculate the new state (Explicitly invert current state)
+                let new_state = !track.muted;
+                
+                // 4. Send the command using Stable ID (Safe against reordering)
+                // Note: We use .id directly (it is u32 in FrontendTrackInfo)
+                let _ = audio.set_track_mute(track.id, new_state);
+                
+                println!("Controller: Mute set to {} for Track ID {}", new_state, track.id);
+            }
         }
     }
 
     fn solo_track(&mut self, idx: usize) {
         if let Some(audio) = &self.audio {
-            audio.solo_track(idx);
+            // 1. Get list to map Index -> ID
+            let tracks = audio.get_tracks_list();
+            
+            // 2. Find the track at the visual index
+            if let Some(track) = tracks.get(idx) {
+                // 3. Explicitly toggle the state
+                let new_state = !track.solo;
+                
+                // 4. Send command using Stable ID
+                let _ = audio.set_track_solo(track.id, new_state);
+                
+                println!("Controller: Solo set to {} for Track ID {}", new_state, track.id);
+            }
         }
     }
 
     fn clear_solo(&mut self) {
         if let Some(audio) = &self.audio {
-            audio.clear_solo();
+            // 1. Get all tracks
+            let tracks = audio.get_tracks_list();
+            
+            // 2. Iterate and check which ones are actually soloed
+            for track in tracks {
+                if track.solo {
+                    // 3. Turn off solo explicitly using its ID
+                    // This ensures the Undo system records this action
+                    let _ = audio.set_track_solo(track.id, false);
+                }
+            }
+            println!("Controller: Cleared all solos");
         }
     }
 

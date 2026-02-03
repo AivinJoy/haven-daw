@@ -71,6 +71,11 @@ impl CommandManager {
     
     pub fn can_undo(&self) -> bool { !self.undo_stack.is_empty() }
     pub fn can_redo(&self) -> bool { !self.redo_stack.is_empty() }
+    pub fn clear(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        println!("✨ Undo/Redo History Cleared");
+    }
 }
 
 // ==========================================
@@ -149,21 +154,28 @@ impl Command for SetTrackMute {
     fn name(&self) -> &str { "Toggle Mute" }
 }
 
-pub struct ToggleSolo {
+pub struct SetTrackSolo {
     pub track_id: TrackId,
+    pub new_state: bool, // ✅ Explicit Target State
 }
 
-impl Command for ToggleSolo {
+impl Command for SetTrackSolo {
     fn execute(&self, engine: &mut Engine) -> Result<()> {
         if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
-            track.solo = !track.solo;
+            track.solo = self.new_state;
         }
         Ok(())
     }
+
     fn undo(&self, engine: &mut Engine) -> Result<()> {
-        self.execute(engine) // Toggle is its own undo
+        // Invert the state to undo
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            track.solo = !self.new_state;
+        }
+        Ok(())
     }
-    fn name(&self) -> &str { "Toggle Solo" }
+    
+    fn name(&self) -> &str { "Set Solo" }
 }
 
 pub struct MoveClip {

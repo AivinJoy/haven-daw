@@ -36,6 +36,10 @@ impl Session {
         self.command_manager.redo(&mut guard)
     }
 
+    pub fn clear_history(&mut self) {
+        self.command_manager.clear();
+    }
+
     // --- SAVE / LOAD IMPLEMENTATION ---
 
     pub fn save_project(&self, engine: &Arc<Mutex<Engine>>, path: &str, master_gain: f32) -> Result<()> {

@@ -6,11 +6,13 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::collections::HashMap;
 use tauri::{State, Emitter};
 use cpal::traits::{HostTrait, DeviceTrait};
 use dotenv::dotenv;
+use serde::Deserialize; // <--- ADD THIS
 
 // Import modules
 use daw_modules::audio_runtime::AudioRuntime;
@@ -25,6 +27,28 @@ struct AppState {
     audio: Mutex<AudioRuntime>,
     recorder: Mutex<Option<Recorder>>,
     cache: Mutex<HashMap<String, ImportResult>>,
+    is_resetting: AtomicBool,
+}
+
+// --- RAII GUARD FOR RESET SAFETY ---
+struct ResetGuard<'a>(&'a AtomicBool);
+
+impl<'a> ResetGuard<'a> {
+    fn new(flag: &'a AtomicBool) -> Result<Self, String> {
+        // atomic compare_exchange to ensure we are the ONLY one resetting
+        if flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            Ok(Self(flag))
+        } else {
+            Err("Project is currently resetting. Please wait.".into())
+        }
+    }
+}
+
+impl<'a> Drop for ResetGuard<'a> {
+    fn drop(&mut self) {
+        // Unlock immediately when this struct goes out of scope
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 // --- 2. Define Return Struct ---
@@ -57,7 +81,7 @@ fn build_ui_state(
         let color = info.color.clone();
 
         let raw_id = info.id; // Frontend uses 1-based ID
-        let track_id = raw_id + 1;
+        let track_id = raw_id;
         
         let mut loaded_clips = Vec::new();
 
@@ -180,6 +204,7 @@ fn get_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
 
 #[tauri::command]
 fn play(state: State<AppState>) -> Result<(), String> {
+    println!("▶️ Main: Play command received"); // <--- DEBUG LOG
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
     audio.play();
     Ok(())
@@ -394,18 +419,11 @@ fn analyze_file(path: String, state: State<AppState>) -> Result<ImportResult, St
 }
 
 #[tauri::command]
-fn move_clip(
-    track_index: usize, 
-    clip_index: usize, 
-    new_time: f64, 
-    state: State<AppState>
-) -> Result<(), String> {
+fn move_clip(track_index: usize, clip_index: usize, new_time: f64, state: State<AppState>) -> Result<(), String> {
+    let track_id = get_id_at_index(&state, track_index)?; // ✅ Resolve ID
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    
-    // Call the runtime logic we just added
-    audio.move_clip(track_index, clip_index, new_time)
-        .map_err(|e| e.to_string())?;
-        
+    // Note: Ensure your AudioRuntime::move_clip now accepts u32 track_id!
+    audio.move_clip(track_id, clip_index, new_time).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -485,42 +503,100 @@ fn seek(pos: f64, state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct GainArgs {
+    #[serde(alias = "trackId")] // Accept snake_case (Rust Standard)
+    track_id: u32,                // Accept camelCase (AI & JS)
+    #[serde(alias = "value")]    // Accept generic 'value' (AI Fallback)
+    gain: f32,
+}
+
+
 #[tauri::command]
-fn set_track_gain(track_index: usize, gain: f32, state: State<AppState>) -> Result<(), String> {
+fn set_track_gain(args: GainArgs, state: State<AppState>) -> Result<(), String> {
+    // println!("🎚️ Gain Cmd: ID {}, Value {}", args.trackId, args.gain); // Debug
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    audio.set_track_gain(track_index, gain);
+    audio.set_track_gain(args.track_id, args.gain);
     Ok(())
 }
 
-#[tauri::command]
-fn set_master_gain(gain: f32, state: State<AppState>) -> Result<(), String> {
-    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    audio.set_master_gain(gain);
-    Ok(())
+#[derive(serde::Deserialize)]
+struct MasterGainArgs {
+    #[serde(alias = "value")] // Accept generic 'value' from AI
+    gain: f32,
 }
 
 #[tauri::command]
-fn set_track_pan(track_index: usize, pan: f32, state: State<AppState>) -> Result<(), String> {
+fn set_master_gain(args: MasterGainArgs, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    audio.set_track_pan(track_index, pan);
+    audio.set_master_gain(args.gain);
     Ok(())
 }
+
+#[derive(Deserialize)]
+struct PanArgs {
+    #[serde(alias = "trackId")]
+    track_id: u32,
+    #[serde(alias = "value")]
+    pan: f32,
+}
+
+#[tauri::command]
+fn set_track_pan(args: PanArgs, state: State<AppState>) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    audio.set_track_pan(args.track_id, args.pan);
+    Ok(())
+}
+
+// --- TOGGLE COMMANDS (Keep these using INDEX for UI Buttons) ---
 
 #[tauri::command]
 fn toggle_mute(track_index: usize, state: State<AppState>) -> Result<(), String> {
+    let track_id = get_id_at_index(&state, track_index)?;
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    audio.toggle_mute(track_index);
-    Ok(())
-}
+    
+    // 1. Check current state
+    let tracks = audio.get_tracks_list();
+    let current_state = tracks.iter().find(|t| t.id == track_id)
+        .map(|t| t.muted)
+        .unwrap_or(false);
 
-// src-tauri/src/main.rs
+    // 2. Set Explicit Opposite State
+    audio.set_track_mute(track_id, !current_state).map_err(|e| e.to_string())
+}
 
 #[tauri::command]
 fn toggle_solo(track_index: usize, state: State<AppState>) -> Result<(), String> {
+    let track_id = get_id_at_index(&state, track_index)?;
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    // Call the new simpler logic
-    audio.toggle_solo(track_index); 
-    Ok(())
+    
+    let tracks = audio.get_tracks_list();
+    let current_state = tracks.iter().find(|t| t.id == track_id)
+        .map(|t| t.solo)
+        .unwrap_or(false);
+
+    audio.set_track_solo(track_id, !current_state).map_err(|e| e.to_string())
+}
+
+// --- AI EXPLICIT COMMANDS (Must match AI 'trackId') ---
+
+#[derive(Deserialize)]
+struct StateArgs {
+    #[serde(alias = "trackId")]
+    track_id: u32,
+    value: bool,
+}
+
+#[tauri::command]
+fn set_mute(args: StateArgs, state: State<AppState>) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    audio.set_track_mute(args.track_id, args.value).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_solo(args: StateArgs, state: State<AppState>) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    audio.set_track_solo(args.track_id, args.value).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -548,15 +624,13 @@ fn get_grid_lines(
 
 #[tauri::command]
 fn add_clip(
-    track_id: usize, 
+    track_id: u32, // Now strictly u32
     path: String, 
     start_time: f64, 
     state: State<AppState>
 ) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
-    // Note: track_id from frontend is 1-based, engine uses 0-based index?
-    // Adjust index as needed based on your logic.
-    audio.add_clip(track_id - 1, path, start_time).map_err(|e| e.to_string())?;
+    audio.add_clip(track_id, path, start_time).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -600,7 +674,7 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
     let info = tracks.last().ok_or("Track creation failed")?;
     
     let raw_id = info.id; 
-    let track_id_display = raw_id + 1; 
+    let track_id_display = raw_id; 
 
     // 4. Persist Metadata (Name only, Color is auto-handled)
     let index = tracks.len() - 1; 
@@ -618,12 +692,28 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
     })
 }
 
+// --- HELPER: Resolve Index -> ID ---
+// This bridges the gap between the Frontend (Indices) and Backend (IDs)
+fn get_id_at_index(state: &State<'_, AppState>, index: usize) -> Result<u32, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    
+    // We need to peek into the engine to find the ID
+    // Since audio_runtime wraps the engine, we might need a getter
+    // OR: If your AudioRuntime exposes 'get_tracks_list', utilize that.
+    let tracks = audio.get_tracks_list(); // Assuming this returns a list of track info
+    
+    if let Some(track) = tracks.get(index) {
+        // Return the ID of the track at this visual position
+        Ok(track.id) 
+    } else {
+        Err(format!("Index {} out of bounds (List size: {})", index, tracks.len()))
+    }
+}
+
 #[tauri::command]
-fn split_clip(
-    track_index: usize, 
-    time: f64, 
-    state: State<AppState>
-) -> Result<(), String> {
+fn split_clip(track_index: usize, time: f64, state: State<AppState>) -> Result<(), String> {
+    
+    let track_id = get_id_at_index(&state, track_index)?;
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
     
     // Frontend uses 1-based track IDs usually? 
@@ -632,7 +722,7 @@ fn split_clip(
     // Based on 'move_clip' in your file, it seems direct mapping or handled there.
     // Let's assume track_index matches the Vec index.
     
-    audio.split_clip(track_index, time).map_err(|e| e.to_string())?;
+    audio.split_clip(track_id, time).map_err(|e| e.to_string())?;
     
     Ok(())
 }
@@ -645,18 +735,17 @@ fn merge_clip_with_next(track_index: usize, clip_index: usize, state: State<AppS
 
 #[tauri::command]
 fn delete_track(track_index: usize, state: State<AppState>) -> Result<(), String> {
+    let track_id = get_id_at_index(&state, track_index)?;
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
-    audio.delete_track(track_index).map_err(|e| e.to_string())
+    audio.delete_track(track_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn delete_clip(
-    track_index: usize, 
-    clip_index: usize, 
-    state: State<AppState>
+fn delete_clip(track_index: usize, clip_index: usize, state: State<AppState>
 ) -> Result<(), String> {
+    let track_id = get_id_at_index(&state, track_index)?;
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
-    audio.delete_clip(track_index, clip_index).map_err(|e| e.to_string())
+    audio.delete_clip(track_id, clip_index).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -689,6 +778,8 @@ struct EqUpdateArgs {
 
 #[tauri::command]
 fn update_eq(args: EqUpdateArgs, state: State<AppState>) -> Result<(), String> {
+
+    let track_id = get_id_at_index(&state, args.track_index)?;
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
     
     // Map String to Enum
@@ -711,14 +802,15 @@ fn update_eq(args: EqUpdateArgs, state: State<AppState>) -> Result<(), String> {
         active: args.active,
     };
 
-    audio.update_eq(args.track_index, args.band_index, params);
+    audio.update_eq(track_id, args.band_index, params);
     Ok(())
 }
 
 #[tauri::command]
 fn get_eq_state(track_index: usize, state: State<AppState>) -> Result<Vec<daw_modules::effects::equalizer::EqParams>, String> {
+    let track_id = get_id_at_index(&state, track_index)?;
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
-    Ok(audio.get_eq_state(track_index))
+    Ok(audio.get_eq_state(track_id))
 }
 
 #[tauri::command]
@@ -873,6 +965,42 @@ fn get_temp_path(filename: String) -> String {
     path.to_string_lossy().to_string()
 }
 
+#[tauri::command]
+async fn reset_project(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    
+    // 1. ACQUIRE LOCK (RAII)
+    // If this fails, it means a reset is already happening.
+    let _guard = ResetGuard::new(&state.is_resetting)?;
+
+    // 2. CANCEL AI JOBS (Safety First)
+    // We fire this off to ensure no background threads try to write to dead tracks.
+    // In a real app, you might track active job IDs. For now, we assume the UI handles it.
+    let _ = app.emit("cancel-all-jobs", ()); 
+
+    // 3. RESET BACKEND (The Heavy Lifting)
+    {
+        let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+        audio.new_project(); // Calls Engine::clear_state() and Session::clear_history()
+    }
+    
+    // 4. CLEAR MEMORY
+    if let Ok(mut cache) = state.cache.lock() {
+        cache.clear();
+    }
+    if let Ok(mut rec) = state.recorder.lock() {
+        *rec = None;
+    }
+    
+    // 5. BROADCAST UI RESET
+    // This tells Svelte: "Delete all DOM elements immediately"
+    let _ = app.emit("project-reset", ());
+    
+    println!("🚀 Project Hard Reset Complete");
+    
+    Ok(()) 
+    // _guard is dropped here, automatically setting is_resetting = false
+}
+
 // ==========================================================
 // 🚀 AI CHATBOT IMPLEMENTATION (NEW)
 // ==========================================================
@@ -925,6 +1053,10 @@ async fn ask_ai(
     // 3. Construct System Prompt (Strict JSON Schema)
     // 3. System Prompt (Strict JSON-Only API)
     // 3. System Prompt (Refined for Reset Logic & JSON Stability)
+    // 3. System Prompt (Refined for Explicit State & Strict JSON)
+    // 3. System Prompt (Refined for Phase 3: Session Lifecycle & Safe Reset)
+    // 3. System Prompt (Corrected for Tauri CamelCase & Parameter Names)
+    // 3. System Prompt (Refined for CamelCase Compatibility)
     let system_prompt = format!(
         "You are a strict JSON API for a DAW. You speak ONLY JSON.\n\
         \n\
@@ -935,14 +1067,16 @@ async fn ask_ai(
         {{ \n\
           \"steps\": [ \n\
             {{ \n\
-              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"none\", \n\
+              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_track_gain\" | \"set_master_gain\" | \"set_track_pan\" | \"toggle_monitor\" | \"set_mute\" | \"set_solo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"reset_project\" | \"none\", \n\
               \"parameters\": {{ \n\
-                \"track_id\": number (optional), \n\
-                \"value\": number (optional), \n\
-                \"time\": number (optional) \n\
-                \"mute_original\": boolean (optional), \n\
-                \"replace_original\": boolean (optional), \n\
-                \"job_id\": string (optional) \n\
+                \"trackId\": number (optional, CamelCase), \n\
+                \"value\": number or boolean (optional, for mute/solo), \n\
+                \"gain\": number (optional, for gain commands), \n\
+                \"pan\": number (optional, for pan commands), \n\
+                \"time\": number (optional), \n\
+                \"muteOriginal\": boolean (optional), \n\
+                \"replaceOriginal\": boolean (optional), \n\
+                \"jobId\": string (optional) \n\
               }} \n\
             }} \n\
           ], \n\
@@ -950,22 +1084,24 @@ async fn ask_ai(
         }}\n\
         \n\
         RULES:\n\
-        1. OUTPUT RAW JSON ONLY. Do not use markdown formatting (no ```json). Do not include any text outside the braces.\n\
-        2. RESET LOGIC: When asked to 'Reset' a track or 'Reset Everything', you must neutralize all active states:\n\
-           - GAIN: Always set to 1.0.\n\
-           - PAN: Always set to 0.0.\n\
-           - MUTE: If context shows 'muted: true', generate 'toggle_mute'.\n\
-           - SOLO: If context shows 'solo: true', generate 'toggle_solo'.\n\
-           - MONITOR: If context shows 'monitoring: true' (or 'is_monitoring: true'), generate 'toggle_monitor'.\n\
-        3. SPECIFIC RESETS: If user says 'Reset monitoring', ONLY toggle monitoring if it is currently true.\n\
-        4. Track IDs: Use the numeric IDs provided in the context.\n\
+        1. OUTPUT RAW JSON ONLY. No markdown.\n\
+        2. COMPATIBILITY RULES (CRITICAL):\n\
+           - **Always use 'trackId' (CamelCase), NEVER 'track_id'.**\n\
+           - **For Gain:** Use action \"set_track_gain\" and parameter \"gain\".\n\
+           - **For Pan:** Use action \"set_track_pan\" and parameter \"pan\".\n\
+           - **For Mute/Solo:** Use parameter \"value\" (true/false).\n\
+        3. EXPLICIT STATE COMMANDS:\n\
+           - 'Mute' -> {{ \"action\": \"set_mute\", \"parameters\": {{ \"trackId\": X, \"value\": true }} }}\n\
+           - 'Unmute' -> {{ \"action\": \"set_mute\", \"parameters\": {{ \"trackId\": X, \"value\": false }} }}\n\
+           - 'Solo' -> {{ \"action\": \"set_solo\", \"parameters\": {{ \"trackId\": X, \"value\": true }} }}\n\
+           - 'Unsolo' -> {{ \"action\": \"set_solo\", \"parameters\": {{ \"trackId\": X, \"value\": false }} }}\n\
+        4. RESET LOGIC:\n\
+           - HARD RESET ('New Project'): {{ \"action\": \"reset_project\" }}\n\
+           - SOFT RESET ('Reset Mix'): Steps setting Gain=1.0, Pan=0.0, Mute=false, Solo=false.\n\
         5. SEPARATION CLARIFICATION:\n\
-           - If the user asks to 'separate', 'split', or 'extract' stems AND has NOT specified what to do with the original track:\n\
-             Output \"action\": \"none\" and \"message\": \"Should I mute the original track or replace it?\"\n\
-           - If the user says 'Mute' or 'Mute it':\n\
-             Output \"action\": \"separate_stems\", \"parameters\": {{ \"track_id\": <CONTEXT_ID>, \"mute_original\": true }}\n\
-           - If the user says 'Replace' or 'Replace it' (meaning delete original):\n\
-             Output \"action\": \"separate_stems\", \"parameters\": {{ \"track_id\": <CONTEXT_ID>, \"replace_original\": true }}\n\
+           - 'Separate' -> \"action\": \"none\", \"message\": \"Mute original or replace?\"\n\
+           - 'Separate & Mute' -> \"action\": \"separate_stems\", \"parameters\": {{ \"trackId\": X, \"muteOriginal\": true }}\n\
+        6. Use numeric 'trackId' from context.\n\
         ",
         
         track_context, user_input
@@ -1094,10 +1230,10 @@ async fn separate_stems(
     state: State<'_, AppState>
 ) -> Result<(), String> {
     
-    let base_url = get_ai_base_url(); // <--- FIX 1: Capture string once
+    let base_url = get_ai_base_url();
 
-    // 1. PREPARATION (Brief Lock)
-    let (file_path, duration_secs) = {
+    // 1. PREPARATION: Capture ID *NOW* so it's safe forever
+    let (file_path, duration_secs, target_track_id) = {
         let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
         let tracks = audio.get_tracks_list();
         
@@ -1108,22 +1244,20 @@ async fn separate_stems(
         let clip = tracks[track_index].clips.first()
             .ok_or("Track has no audio clips to separate")?;
             
-        (clip.path.clone(), clip.duration)
+        // CAPTURE ID HERE
+        (clip.path.clone(), clip.duration, tracks[track_index].id)
     };
 
-    // Timeout: 4x realtime or min 60s
     let timeout_seconds = (duration_secs * 4.0).max(60.0) as usize;
-
     println!("✂️ Separating: {} (Timeout: {}s)", file_path, timeout_seconds);
     
     let client = reqwest::Client::new();
 
-    // 2. CONNECT (Fast Fail)
+    // 2. CONNECT
     let _ = app.emit("progress-update", ProgressPayload { 
         message: "Connecting to AI...".into(), progress: 5.0, visible: true 
     });
 
-    // FIX 2: Use base_url reference or clone to avoid move error
     let health_check = client.get(format!("{}/health", base_url))
         .timeout(Duration::from_secs(3)) 
         .send().await;
@@ -1137,7 +1271,6 @@ async fn separate_stems(
         message: "Uploading to GPU...".into(), progress: 10.0, visible: true 
     });
 
-    // Send full config for Demucs
     let res = client.post(format!("{}/process/separate", base_url))
         .timeout(Duration::from_secs(10))
         .json(&serde_json::json!({ 
@@ -1153,22 +1286,18 @@ async fn separate_stems(
 
     let job_data: SidecarJobResponse = res.json().await.map_err(|e| e.to_string())?;
     let job_id = job_data.job_id;
-    // --- NEW: Tell Frontend the Job ID so it can be cancelled ---
     let _ = app.emit("ai-job-started", job_id.clone());
 
-    // 4. SMART POLLING LOOP
+    // 4. POLLING LOOP
     let mut attempts = 0;
     loop {
         if attempts > timeout_seconds {
-            // TIMEOUT: Try to cancel on server side
-            let _ = client.post(format!("{}/jobs/{}/cancel", base_url, job_id))
-                .send().await;
+            let _ = client.post(format!("{}/jobs/{}/cancel", base_url, job_id)).send().await;
             return Err(format!("AI timed out after {} seconds.", timeout_seconds));
         }
         
         tokio::time::sleep(Duration::from_millis(1000)).await;
         
-        // Poll Status
         let status_res = client.get(format!("{}/jobs/{}", base_url, job_id))
             .timeout(Duration::from_secs(5))
             .send().await
@@ -1176,11 +1305,9 @@ async fn separate_stems(
             
         let status_data: SidecarStatusResponse = status_res.json().await.map_err(|e| e.to_string())?;
         
-        // PROGRESS LOGIC: "Asymptotic Approach" (Never resets, slows down as it gets higher)
-        // Formula: 20 + (70 * (1 - e^(-0.05 * t))) -> Approaches 90%
+        // Visual Progress
         let raw_progress = 1.0 - (-0.05 * (attempts as f64)).exp(); 
         let visual_progress = 20.0 + (70.0 * raw_progress);
-
         let stage_msg = match status_data.status.as_str() {
             "pending" => "Queued...",
             "processing" => "AI Processing...",
@@ -1190,9 +1317,7 @@ async fn separate_stems(
         };
 
         let _ = app.emit("progress-update", ProgressPayload { 
-            message: stage_msg.into(), 
-            progress: visual_progress, 
-            visible: true 
+            message: stage_msg.into(), progress: visual_progress, visible: true 
         });
 
         if status_data.status == "completed" {
@@ -1201,7 +1326,6 @@ async fn separate_stems(
                     message: "Importing Stems...".into(), progress: 95.0, visible: true 
                 });
 
-                // FIX 1: Store (Color, TrackID) -> TrackID is u32
                 let mut stem_info: std::collections::HashMap<String, (String, u32)> = std::collections::HashMap::new();
 
                 // --- A. AUDIO ENGINE UPDATE ---
@@ -1209,10 +1333,15 @@ async fn separate_stems(
                     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
 
                     if replace_original {
-                        audio.delete_track(track_index).map_err(|e| e.to_string())?;
+                        // ✅ SAFE: Deleting by captured ID
+                        audio.delete_track(target_track_id).map_err(|e| e.to_string())?;
                         std::thread::sleep(Duration::from_millis(50));
                     } else if mute_original {
-                        audio.toggle_mute(track_index);
+                         // ✅ SAFE: Muting by captured ID
+                         // (Assuming you updated toggle_mute to take ID, or use wrapper)
+                         // Since we are inside main.rs where we only have audio_runtime, 
+                         // and we updated AudioRuntime::toggle_mute to take ID in Phase 1:
+                        audio.set_track_mute(target_track_id, true).map_err(|e| e.to_string())?;
                     }
 
                     for (stem_name, path) in &stems {
@@ -1224,9 +1353,9 @@ async fn separate_stems(
                                 let idx = list.len() - 1; 
                                 audio.set_track_name(idx, stem_name.clone());
 
-                                // FIX 2: Capture ID instead of Index
+                                // Capture New ID
                                 let assigned_color = list[idx].color.clone();
-                                let assigned_id = list[idx].id; // <--- Capture Stable ID
+                                let assigned_id = list[idx].id; 
                                 stem_info.insert(path.clone(), (assigned_color, assigned_id));
                             },
                             Err(e) => println!("Failed to add track {}: {}", stem_name, e)
@@ -1239,8 +1368,6 @@ async fn separate_stems(
                     if !std::path::Path::new(&path).exists() { continue; }
                     
                     let path_clone = path.clone();
-                    
-                    // Retrieve Color & ID (Default to 0 if missing)
                     let (color, track_id) = stem_info.get(&path).cloned()
                         .unwrap_or(("#00AEFF".to_string(), 0));
 
@@ -1254,30 +1381,23 @@ async fn separate_stems(
                         Ok(Ok(result)) => {
                             if let Ok(mut cache) = state.cache.lock() {
                                 cache.insert(path.clone(), result.clone()); 
-                                println!("✅ Analysis Cache Saved: {}", path);
                             }
 
-                            // FIX 3: Update Duration using ID
                             if let Ok(audio) = state.audio.lock() {
+                                // ✅ SAFE: Setting duration by ID
                                 if let Err(e) = audio.set_clip_duration(track_id, result.duration) {
-                                    println!("⚠️ Failed to update duration for {}: {}", stem_name, e);
+                                    println!("⚠️ Failed to update duration: {}", e);
                                 } else {
-                                     println!("⏱️ Duration Synced: {:.2}s for Track ID {}", result.duration, track_id);
+                                     println!("⏱️ Duration Synced for Track ID {}", track_id);
                                 }
                             }
                         },
-                        Ok(Err(decode_err)) => {
-                            println!("❌ Failed to Analyze {}: {}", stem_name, decode_err);
-                        },
-                        Err(join_err) => {
-                            println!("❌ Thread Panicked for {}: {}", stem_name, join_err);
-                        }
+                        _ => println!("❌ Failed to Analyze {}", stem_name),
                     }
                 }
             }
             break;
-        }
-        else if status_data.status == "failed" {
+        } else if status_data.status == "failed" {
             return Err(status_data.error.unwrap_or("Unknown AI Error".into()));
         } else if status_data.status == "cancelled" {
             return Err("Job was cancelled.".into());
@@ -1290,9 +1410,7 @@ async fn separate_stems(
         message: "Done!".into(), progress: 100.0, visible: false 
     });
     
-    // Force UI Refresh
     let _ = app.emit("refresh-project", ());
-    
     Ok(())
 }
 
@@ -1322,6 +1440,7 @@ fn main() {
             audio: Mutex::new(runtime),
             recorder: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
+            is_resetting: AtomicBool::new(false),
         })
         .invoke_handler(tauri::generate_handler![
             play,
@@ -1342,6 +1461,8 @@ fn main() {
             set_track_pan,
             toggle_mute,
             toggle_solo,
+            set_mute,
+            set_solo,
             set_master_gain,
             save_project,
             load_project,
@@ -1359,6 +1480,7 @@ fn main() {
             get_input_devices,
             undo,
             redo,
+            reset_project,
             ask_ai,
             separate_stems,
             cancel_ai_job
