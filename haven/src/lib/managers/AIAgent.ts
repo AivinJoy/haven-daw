@@ -166,7 +166,10 @@ class AIAgent {
             }
         }
 
-        const getIndex = (id: number) => tracks.findIndex(t => t.id === id);
+        const getIndex = (rawId: any) => {
+             const id = Number(rawId);
+             return tracks.findIndex(t => t.id === id);
+        };
 
         switch (action) {
 
@@ -200,13 +203,31 @@ class AIAgent {
             case 'set_gain':
                 const gainIdx = getIndex(parameters.track_id);
                 if (gainIdx !== -1) {
-                    const gain = Math.max(0, Math.min(2.0, parameters.value ?? 1.0));
+                    let rawVal = parameters.value ?? 1.0;
+                    
+                    // PROMPT FIX UPDATE:
+                    // The AI now correctly sends 0.0 - 2.0.
+                    // We ONLY convert if it accidentally sends a percentage (e.g. 50, 80, 100).
+                    if (rawVal > 2.0) {
+                        rawVal = rawVal / 50; // Convert 100 -> 2.0
+                    }
+                    // Else: Use the value exactly as AI sent it (e.g. 1.0 is Unity, 2.0 is Max)
+
+                    const gain = Math.max(0, Math.min(2.0, rawVal));
                     await invoke('set_track_gain', { trackIndex: gainIdx, gain });
                 }
                 break;    
             // --- NEW: Master Gain ---
             case 'set_master_gain':
-                const masterGain = Math.max(0, Math.min(2.0, parameters.value ?? 1.0));
+                let rawMasterVal = parameters.value ?? 1.0;
+
+                // PROMPT FIX UPDATE:
+                // Same logic for Master Gain. Trust the AI unless value is huge.
+                if (rawMasterVal > 2.0) {
+                    rawMasterVal = rawMasterVal / 50;
+                }
+
+                const masterGain = Math.max(0, Math.min(2.0, rawMasterVal));
                 await invoke('set_master_gain', { gain: masterGain });
                 break;
 

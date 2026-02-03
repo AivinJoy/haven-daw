@@ -939,7 +939,7 @@ async fn ask_ai(
               \"parameters\": {{ \n\
                 \"track_id\": number (optional), \n\
                 \"value\": number (optional), \n\
-                \"time\": number (optional) \n\
+                \"time\": number (optional), \n\
                 \"mute_original\": boolean (optional), \n\
                 \"replace_original\": boolean (optional), \n\
                 \"job_id\": string (optional) \n\
@@ -951,15 +951,20 @@ async fn ask_ai(
         \n\
         RULES:\n\
         1. OUTPUT RAW JSON ONLY. Do not use markdown formatting (no ```json). Do not include any text outside the braces.\n\
-        2. RESET LOGIC: When asked to 'Reset' a track or 'Reset Everything', you must neutralize all active states:\n\
+        2. GAIN/VOLUME SCALE:\n\
+            - Range is 0.0 (Silence) to 2.0 (Max Volume).\n\
+            - 1.0 is Unity/Default gain.\n\
+            - If user says 'Max', use 2.0.\n\
+            - If user says 'Half', use 1.0.\n\
+        3. RESET LOGIC: When asked to 'Reset' a track or 'Reset Everything', you must neutralize all active states:\n\
            - GAIN: Always set to 1.0.\n\
            - PAN: Always set to 0.0.\n\
            - MUTE: If context shows 'muted: true', generate 'toggle_mute'.\n\
            - SOLO: If context shows 'solo: true', generate 'toggle_solo'.\n\
            - MONITOR: If context shows 'monitoring: true' (or 'is_monitoring: true'), generate 'toggle_monitor'.\n\
-        3. SPECIFIC RESETS: If user says 'Reset monitoring', ONLY toggle monitoring if it is currently true.\n\
-        4. Track IDs: Use the numeric IDs provided in the context.\n\
-        5. SEPARATION CLARIFICATION:\n\
+        4. SPECIFIC RESETS: If user says 'Reset monitoring', ONLY toggle monitoring if it is currently true.\n\
+        5. Track IDs: Use the numeric IDs provided in the context.\n\
+        6. SEPARATION CLARIFICATION:\n\
            - If the user asks to 'separate', 'split', or 'extract' stems AND has NOT specified what to do with the original track:\n\
              Output \"action\": \"none\" and \"message\": \"Should I mute the original track or replace it?\"\n\
            - If the user says 'Mute' or 'Mute it':\n\
