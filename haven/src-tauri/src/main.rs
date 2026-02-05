@@ -1301,10 +1301,13 @@ async fn cancel_ai_job(job_id: String) -> Result<(), String> {
     Ok(())
 }
 
-// src-tauri/src/main.rs
 
 #[tauri::command]
-fn commit_pending_stems(job_id: String, state: State<AppState>) -> Result<(), String> {
+async fn commit_pending_stems(
+    app: tauri::AppHandle,
+    job_id: String,
+    state: State<'_, AppState>
+) -> Result<(), String> {
     
     // 1. Retrieve the pending data
     let group = {
@@ -1347,19 +1350,53 @@ fn commit_pending_stems(job_id: String, state: State<AppState>) -> Result<(), St
         }
     } // <--- Audio Lock Drops Here (Playback continues smoothly)
 
-    // 3. ANALYSIS PHASE (Heavy calculation, using the helper function)
-    for (path, color) in analysis_tasks {
-        // [FIX] This line uses the unused function!
-        match analyze_audio_internal(&path, color) {
-            Ok(result) => {
-                // Save to cache so the UI sees the waveform immediately
-                if let Ok(mut cache) = state.cache.lock() {
-                    cache.insert(path.clone(), result);
-                }
-            },
-            Err(e) => println!("Failed to analyze stem {}: {}", path, e)
+    // Notify UI: Start
+    let _ = app.emit("ai-progress", ProgressPayload { 
+        message: "Importing stems...".into(), progress: 0.0, visible: true 
+    });
+
+    let total = analysis_tasks.len();
+
+    // Move heavy work to a blocking thread to keep UI responsive
+    // Clone cache (expensive but safe) or just pass State if possible. 
+    // Actually, we can't easily pass State into spawn_blocking without Arc. 
+    // Easier approach: Calculate results in blocking, return them, then lock cache in async.
+
+    let computed_results = tauri::async_runtime::spawn_blocking(move || {
+        let mut results = Vec::new();
+        for (path, color) in analysis_tasks {
+            // Internal Helper (Heavy CPU)
+            match analyze_audio_internal(&path, color) {
+                Ok(res) => results.push((path, res)),
+                Err(e) => println!("Failed to analyze stem {}: {}", path, e),
+            }
+        }
+        results
+    }).await.map_err(|e| e.to_string())?;
+
+    // 4. Update Cache & UI Loop
+    for (i, (path, result)) in computed_results.into_iter().enumerate() {
+        
+        // Update UI Bubble
+        let _ = app.emit("ai-progress", ProgressPayload { 
+            message: format!("Analyzing stem {}/{}...", i + 1, total), 
+            progress: ((i as f64) / (total as f64)) * 100.0, 
+            visible: true 
+        });
+        
+        // Small delay to let user see the bubble (optional, feels more 'reasoning-like')
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // Save to cache
+        if let Ok(mut cache) = state.cache.lock() {
+            cache.insert(path, result);
         }
     }
+
+    // Notify UI: Done
+    let _ = app.emit("ai-progress", ProgressPayload { 
+        message: "Done.".into(), progress: 100.0, visible: false 
+    });
 
     Ok(())
 }
