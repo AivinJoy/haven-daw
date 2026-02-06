@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::collections::HashMap;
-use tauri::{State, Emitter};
+use tauri::{State, Emitter, Manager};
 use cpal::traits::{HostTrait, DeviceTrait};
 use dotenv::dotenv;
 
@@ -20,11 +20,20 @@ use daw_modules::bpm; // Import the new BPM module
 use daw_modules::engine::time::GridLine; // Import GridLine
 
 
+// [NEW STRUCT] Holds separation results waiting for user confirmation
+struct PendingStemGroup {
+    stems: HashMap<String, String>, // key: Stem Name (e.g., "vocals"), value: File Path
+    original_track_index: usize,
+    replace_original: bool,
+    mute_original: bool,
+}
+
 // --- 1. Global State ---
 struct AppState {
     audio: Mutex<AudioRuntime>,
     recorder: Mutex<Option<Recorder>>,
     cache: Mutex<HashMap<String, ImportResult>>,
+    pending_stems: Mutex<HashMap<String, PendingStemGroup>>,
 }
 
 // --- 2. Define Return Struct ---
@@ -939,7 +948,7 @@ async fn ask_ai(
               \"parameters\": {{ \n\
                 \"track_id\": number (optional), \n\
                 \"value\": number (optional), \n\
-                \"time\": number (optional) \n\
+                \"time\": number (optional), \n\
                 \"mute_original\": boolean (optional), \n\
                 \"replace_original\": boolean (optional), \n\
                 \"job_id\": string (optional) \n\
@@ -951,15 +960,20 @@ async fn ask_ai(
         \n\
         RULES:\n\
         1. OUTPUT RAW JSON ONLY. Do not use markdown formatting (no ```json). Do not include any text outside the braces.\n\
-        2. RESET LOGIC: When asked to 'Reset' a track or 'Reset Everything', you must neutralize all active states:\n\
+        2. GAIN/VOLUME SCALE:\n\
+            - Range is 0.0 (Silence) to 2.0 (Max Volume).\n\
+            - 1.0 is Unity/Default gain.\n\
+            - If user says 'Max', use 2.0.\n\
+            - If user says 'Half', use 1.0.\n\
+        3. RESET LOGIC: When asked to 'Reset' a track or 'Reset Everything', you must neutralize all active states:\n\
            - GAIN: Always set to 1.0.\n\
            - PAN: Always set to 0.0.\n\
            - MUTE: If context shows 'muted: true', generate 'toggle_mute'.\n\
            - SOLO: If context shows 'solo: true', generate 'toggle_solo'.\n\
            - MONITOR: If context shows 'monitoring: true' (or 'is_monitoring: true'), generate 'toggle_monitor'.\n\
-        3. SPECIFIC RESETS: If user says 'Reset monitoring', ONLY toggle monitoring if it is currently true.\n\
-        4. Track IDs: Use the numeric IDs provided in the context.\n\
-        5. SEPARATION CLARIFICATION:\n\
+        4. SPECIFIC RESETS: If user says 'Reset monitoring', ONLY toggle monitoring if it is currently true.\n\
+        5. Track IDs: Use the numeric IDs provided in the context.\n\
+        6. SEPARATION CLARIFICATION:\n\
            - If the user asks to 'separate', 'split', or 'extract' stems AND has NOT specified what to do with the original track:\n\
              Output \"action\": \"none\" and \"message\": \"Should I mute the original track or replace it?\"\n\
            - If the user says 'Mute' or 'Mute it':\n\
@@ -1115,183 +1129,160 @@ async fn separate_stems(
     let timeout_seconds = (duration_secs * 4.0).max(60.0) as usize;
 
     println!("✂️ Separating: {} (Timeout: {}s)", file_path, timeout_seconds);
+
+    let app_handle = app.clone();
     
-    let client = reqwest::Client::new();
+    tauri::async_runtime::spawn(async move {
 
-    // 2. CONNECT (Fast Fail)
-    let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Connecting to AI...".into(), progress: 5.0, visible: true 
-    });
+        let state_handle = app_handle.state::<AppState>();
+        let client = reqwest::Client::new();
 
-    // FIX 2: Use base_url reference or clone to avoid move error
-    let health_check = client.get(format!("{}/health", base_url))
-        .timeout(Duration::from_secs(3)) 
-        .send().await;
-
-    if health_check.is_err() {
-        return Err("AI Server unreachable. Is 'ai_server' running?".into());
-    }
-
-    // 3. START JOB
-    let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Uploading to GPU...".into(), progress: 10.0, visible: true 
-    });
-
-    // Send full config for Demucs
-    let res = client.post(format!("{}/process/separate", base_url))
-        .timeout(Duration::from_secs(10))
-        .json(&serde_json::json!({ 
-            "file_path": file_path, 
-            "stem_count": 4,
-            "model": "htdemucs",
-            "device": "cuda",
-            "format": "mp3",   
-            "bitrate": 320       
-        }))
-        .send().await
-        .map_err(|e| format!("Failed to start job: {}", e))?;
-
-    let job_data: SidecarJobResponse = res.json().await.map_err(|e| e.to_string())?;
-    let job_id = job_data.job_id;
-    // --- NEW: Tell Frontend the Job ID so it can be cancelled ---
-    let _ = app.emit("ai-job-started", job_id.clone());
-
-    // 4. SMART POLLING LOOP
-    let mut attempts = 0;
-    loop {
-        if attempts > timeout_seconds {
-            // TIMEOUT: Try to cancel on server side
-            let _ = client.post(format!("{}/jobs/{}/cancel", base_url, job_id))
-                .send().await;
-            return Err(format!("AI timed out after {} seconds.", timeout_seconds));
-        }
-        
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        
-        // Poll Status
-        let status_res = client.get(format!("{}/jobs/{}", base_url, job_id))
-            .timeout(Duration::from_secs(5))
-            .send().await
-            .map_err(|e| format!("Polling failed: {}", e))?;
-            
-        let status_data: SidecarStatusResponse = status_res.json().await.map_err(|e| e.to_string())?;
-        
-        // PROGRESS LOGIC: "Asymptotic Approach" (Never resets, slows down as it gets higher)
-        // Formula: 20 + (70 * (1 - e^(-0.05 * t))) -> Approaches 90%
-        let raw_progress = 1.0 - (-0.05 * (attempts as f64)).exp(); 
-        let visual_progress = 20.0 + (70.0 * raw_progress);
-
-        let stage_msg = match status_data.status.as_str() {
-            "pending" => "Queued...",
-            "processing" => "AI Processing...",
-            "completed" => "Finalizing...",
-            "cancelled" => "Cancelled by user.",
-            _ => "Thinking..."
-        };
-
-        let _ = app.emit("progress-update", ProgressPayload { 
-            message: stage_msg.into(), 
-            progress: visual_progress, 
-            visible: true 
+        // 2. CONNECT (Fast Fail)
+        let _ = app_handle.emit("ai-progress", ProgressPayload { 
+            message: "Connecting...".into(), progress: 5.0, visible: true 
         });
 
-        if status_data.status == "completed" {
-            if let Some(stems) = status_data.result {
-                let _ = app.emit("progress-update", ProgressPayload { 
-                    message: "Importing Stems...".into(), progress: 95.0, visible: true 
-                });
+        // FIX 2: Use base_url reference or clone to avoid move error
+        let health_check = client.get(format!("{}/health", base_url))
+            .timeout(Duration::from_secs(3)) 
+            .send().await;
 
-                // FIX 1: Store (Color, TrackID) -> TrackID is u32
-                let mut stem_info: std::collections::HashMap<String, (String, u32)> = std::collections::HashMap::new();
-
-                // --- A. AUDIO ENGINE UPDATE ---
-                {
-                    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-
-                    if replace_original {
-                        audio.delete_track(track_index).map_err(|e| e.to_string())?;
-                        std::thread::sleep(Duration::from_millis(50));
-                    } else if mute_original {
-                        audio.toggle_mute(track_index);
-                    }
-
-                    for (stem_name, path) in &stems {
-                        if !std::path::Path::new(path).exists() { continue; }
-                        
-                        match audio.add_track(path.clone()) {
-                            Ok(_) => {
-                                let list = audio.get_tracks_list();
-                                let idx = list.len() - 1; 
-                                audio.set_track_name(idx, stem_name.clone());
-
-                                // FIX 2: Capture ID instead of Index
-                                let assigned_color = list[idx].color.clone();
-                                let assigned_id = list[idx].id; // <--- Capture Stable ID
-                                stem_info.insert(path.clone(), (assigned_color, assigned_id));
-                            },
-                            Err(e) => println!("Failed to add track {}: {}", stem_name, e)
-                        }
-                    }
-                }
-
-                // --- B. VISUAL & DURATION UPDATE ---
-                for (stem_name, path) in stems {
-                    if !std::path::Path::new(&path).exists() { continue; }
-                    
-                    let path_clone = path.clone();
-                    
-                    // Retrieve Color & ID (Default to 0 if missing)
-                    let (color, track_id) = stem_info.get(&path).cloned()
-                        .unwrap_or(("#00AEFF".to_string(), 0));
-
-                    println!("🔍 Analyzing Stem: {}", stem_name);
-
-                    let task_result = tauri::async_runtime::spawn_blocking(move || {
-                        analyze_audio_internal(&path_clone, color) 
-                    }).await;
-
-                    match task_result {
-                        Ok(Ok(result)) => {
-                            if let Ok(mut cache) = state.cache.lock() {
-                                cache.insert(path.clone(), result.clone()); 
-                                println!("✅ Analysis Cache Saved: {}", path);
-                            }
-
-                            // FIX 3: Update Duration using ID
-                            if let Ok(audio) = state.audio.lock() {
-                                if let Err(e) = audio.set_clip_duration(track_id, result.duration) {
-                                    println!("⚠️ Failed to update duration for {}: {}", stem_name, e);
-                                } else {
-                                     println!("⏱️ Duration Synced: {:.2}s for Track ID {}", result.duration, track_id);
-                                }
-                            }
-                        },
-                        Ok(Err(decode_err)) => {
-                            println!("❌ Failed to Analyze {}: {}", stem_name, decode_err);
-                        },
-                        Err(join_err) => {
-                            println!("❌ Thread Panicked for {}: {}", stem_name, join_err);
-                        }
-                    }
-                }
-            }
-            break;
+        if health_check.is_err() {
+            // [CHANGE] Tell chat it failed
+            let _ = app_handle.emit("ai-progress", ProgressPayload { 
+                message: "Server unreachable.".into(), progress: 0.0, visible: false 
+            });
+            return
         }
-        else if status_data.status == "failed" {
-            return Err(status_data.error.unwrap_or("Unknown AI Error".into()));
-        } else if status_data.status == "cancelled" {
-            return Err("Job was cancelled.".into());
-        }
+
+        // 3. START JOB
+        let _ = app_handle.emit("ai-progress", ProgressPayload { 
+            message: "Uploading to GPU...".into(), progress: 10.0, visible: true 
+        });
+
+        // Send full config for Demucs
+        let res = client.post(format!("{}/process/separate", base_url))
+            .timeout(Duration::from_secs(10))
+            .json(&serde_json::json!({ 
+                "file_path": file_path, 
+                "stem_count": 4,
+                "model": "htdemucs",
+                "device": "cuda",
+                "format": "mp3",   
+                "bitrate": 320       
+            }))
+            .send().await;
         
-        attempts += 1;
-    }
+        // Handle Start Error
+        let response = match res {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = app_handle.emit("ai-progress", ProgressPayload { 
+                    message: format!("Failed: {}", e), progress: 0.0, visible: false 
+                });
+                return;
+            }
+        };
 
-    let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Done!".into(), progress: 100.0, visible: false 
+        let job_data_res: Result<SidecarJobResponse, _> = response.json().await;
+        if job_data_res.is_err() {
+             let _ = app_handle.emit("ai-progress", ProgressPayload { 
+                message: "Invalid API response".into(), progress: 0.0, visible: false 
+            });
+            return;
+        }
+
+        let job_id = job_data_res.unwrap().job_id;
+        // --- NEW: Tell Frontend the Job ID so it can be cancelled ---
+        let _ = app_handle.emit("ai-job-started", job_id.clone());
+
+        // 4. SMART POLLING LOOP
+        let mut attempts = 0;
+        loop {
+            if attempts > timeout_seconds {
+                // TIMEOUT: Try to cancel on server side
+                let _ = client.post(format!("{}/jobs/{}/cancel", base_url, job_id))
+                    .send().await;
+                let _ = app_handle.emit("ai-progress", ProgressPayload { 
+                    message: "Timed out.".into(), progress: 0.0, visible: false 
+                });
+                return
+            }
+
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+
+            // Poll Status
+            let status_res = client.get(format!("{}/jobs/{}", base_url, job_id))
+                .timeout(Duration::from_secs(5))
+                .send().await;
+
+            // Handle Polling Errors gracefully
+            if status_res.is_err() {
+                attempts += 1;
+                continue; 
+            }    
+
+            // Unwrap safely because we checked is_err
+            let status_data: SidecarStatusResponse = match status_res.unwrap().json().await {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            // PROGRESS LOGIC: "Asymptotic Approach" (Never resets, slows down as it gets higher)
+            // Formula: 20 + (70 * (1 - e^(-0.05 * t))) -> Approaches 90%
+            let raw_progress = 1.0 - (-0.05 * (attempts as f64)).exp(); 
+            let visual_progress = 20.0 + (70.0 * raw_progress);
+
+            let stage_msg = match status_data.status.as_str() {
+                "pending" => "Queued...",
+                "processing" => "Separating Audio...",
+                "completed" => "Finalizing...",
+                "cancelled" => "Cancelled by user.",
+                _ => "Thinking..."
+            };
+
+            let _ = app_handle.emit("ai-progress", ProgressPayload { 
+                message: stage_msg.into(), 
+                progress: visual_progress, 
+                visible: true 
+            });
+
+            if status_data.status == "completed" {
+                if let Some(stems) = status_data.result {
+
+                    // 1. Create the Pending Group
+                    let group = PendingStemGroup {
+                        stems: stems.clone(),
+                        original_track_index: track_index,
+                        replace_original,
+                        mute_original
+                    };
+                
+                    // 2. Store it in AppState (Do NOT touch the audio engine yet)
+                    if let Ok(mut pending) = state_handle.pending_stems.lock() {
+                        pending.insert(job_id.clone(), group);
+                    }
+                
+                    // 3. Notify Frontend to ask for confirmation
+                    let _ = app_handle.emit("ai-job-complete", job_id); 
+                }
+                break;
+            }
+            else if status_data.status == "failed" {
+                let _ = app_handle.emit("ai-progress", ProgressPayload { 
+                    message: "Failed.".into(), progress: 0.0, visible: false 
+                });
+                return;
+            } 
+            else if status_data.status == "cancelled" {
+                 let _ = app_handle.emit("ai-progress", ProgressPayload { 
+                    message: "Cancelled.".into(), progress: 0.0, visible: false 
+                });
+                return
+            }
+
+            attempts += 1;
+        }
     });
-    
-    // Force UI Refresh
-    let _ = app.emit("refresh-project", ());
     
     Ok(())
 }
@@ -1310,6 +1301,113 @@ async fn cancel_ai_job(job_id: String) -> Result<(), String> {
     Ok(())
 }
 
+
+#[tauri::command]
+async fn commit_pending_stems(
+    app: tauri::AppHandle,
+    job_id: String,
+    state: State<'_, AppState>
+) -> Result<(), String> {
+    
+    // 1. Retrieve the pending data
+    let group = {
+        let mut pending = state.pending_stems.lock().map_err(|_| "Failed to lock pending")?;
+        pending.remove(&job_id).ok_or("Job ID not found or already processed")?
+    };
+
+    // Store tasks for analysis so we can do it WITHOUT holding the audio lock
+    let mut analysis_tasks: Vec<(String, String)> = Vec::new();
+
+    // 2. AUDIO LOCK SCOPE (Short duration to prevent stuttering)
+    {
+        let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+
+        // A. Handle Original Track
+        let tracks_len = audio.get_tracks_list().len();
+        if group.original_track_index < tracks_len {
+            if group.replace_original {
+                audio.delete_track(group.original_track_index).map_err(|e| e.to_string())?;
+            } else if group.mute_original {
+                audio.toggle_mute(group.original_track_index); 
+            }
+        }
+
+        // B. Add New Stems to Engine
+        for (stem_name, path) in &group.stems {
+            if !std::path::Path::new(path).exists() { continue; }
+            
+            match audio.add_track(path.clone()) {
+                Ok(_) => {
+                    let list = audio.get_tracks_list();
+                    let idx = list.len() - 1; 
+                    audio.set_track_name(idx, stem_name.clone());
+                    
+                    // Capture path and assigned color for analysis
+                    analysis_tasks.push((path.clone(), list[idx].color.clone()));
+                },
+                Err(e) => println!("Failed to commit stem {}: {}", path, e)
+            }
+        }
+    } // <--- Audio Lock Drops Here (Playback continues smoothly)
+
+    // Notify UI: Start
+    let _ = app.emit("ai-progress", ProgressPayload { 
+        message: "Importing stems...".into(), progress: 0.0, visible: true 
+    });
+
+    let total = analysis_tasks.len();
+
+    // Move heavy work to a blocking thread to keep UI responsive
+    // Clone cache (expensive but safe) or just pass State if possible. 
+    // Actually, we can't easily pass State into spawn_blocking without Arc. 
+    // Easier approach: Calculate results in blocking, return them, then lock cache in async.
+
+    let computed_results = tauri::async_runtime::spawn_blocking(move || {
+        let mut results = Vec::new();
+        for (path, color) in analysis_tasks {
+            // Internal Helper (Heavy CPU)
+            match analyze_audio_internal(&path, color) {
+                Ok(res) => results.push((path, res)),
+                Err(e) => println!("Failed to analyze stem {}: {}", path, e),
+            }
+        }
+        results
+    }).await.map_err(|e| e.to_string())?;
+
+    // 4. Update Cache & UI Loop
+    for (i, (path, result)) in computed_results.into_iter().enumerate() {
+        
+        // Update UI Bubble
+        let _ = app.emit("ai-progress", ProgressPayload { 
+            message: format!("Analyzing stem {}/{}...", i + 1, total), 
+            progress: ((i as f64) / (total as f64)) * 100.0, 
+            visible: true 
+        });
+        
+        // Small delay to let user see the bubble (optional, feels more 'reasoning-like')
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // Save to cache
+        if let Ok(mut cache) = state.cache.lock() {
+            cache.insert(path, result);
+        }
+    }
+
+    // Notify UI: Done
+    let _ = app.emit("ai-progress", ProgressPayload { 
+        message: "Done.".into(), progress: 100.0, visible: false 
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn discard_pending_stems(job_id: String, state: State<AppState>) -> Result<(), String> {
+    let mut pending = state.pending_stems.lock().map_err(|_| "Failed to lock pending")?;
+    pending.remove(&job_id); // Just remove from memory
+    Ok(())
+}
+
 fn main() {
 
     dotenv().ok();
@@ -1322,6 +1420,7 @@ fn main() {
             audio: Mutex::new(runtime),
             recorder: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
+            pending_stems: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             play,
@@ -1361,7 +1460,9 @@ fn main() {
             redo,
             ask_ai,
             separate_stems,
-            cancel_ai_job
+            cancel_ai_job,
+            commit_pending_stems,
+            discard_pending_stems
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

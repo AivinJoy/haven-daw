@@ -1,6 +1,12 @@
+--index-url https://download.pytorch.org/whl/cu121
+
 fastapi
 uvicorn[standard]
 python-multipart
 requests
 demucs
 numpy<2.0.0
+
+torch
+torchvision
+torchaudio

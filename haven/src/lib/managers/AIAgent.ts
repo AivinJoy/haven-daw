@@ -166,6 +166,11 @@ class AIAgent {
             }
         }
 
+        const getIndex = (rawId: any) => {
+             const id = Number(rawId);
+             return tracks.findIndex(t => t.id === id);
+        };
+
         switch (action) {
 
             case 'separate_stems':
@@ -177,11 +182,17 @@ class AIAgent {
 
                 // 2. Call Rust Backend
                 // (If replacing, we don't need to mute, because we will delete it anyway)
-                await invoke('separate_stems', { 
-                    trackIndex: parameters.track_id - 1,
-                    muteOriginal: shouldMute, 
-                    replaceOriginal: replaceOriginal
-                });
+                const sepIdx = getIndex(parameters.track_id);
+                if (sepIdx !== -1) {
+
+                    await invoke('separate_stems', { 
+                        trackIndex: sepIdx,
+                        muteOriginal: shouldMute, 
+                        replaceOriginal: replaceOriginal
+                    });
+                }else{
+                    console.warn(`❌ AI tried to separate missing track ID: ${parameters.track_id}`);
+                }  
                 break;
             case 'cancel_job':
                  if (parameters?.job_id) {
@@ -190,33 +201,61 @@ class AIAgent {
                  break;
 
             case 'set_gain':
-                const gain = Math.max(0, Math.min(2.0, parameters.value ?? 1.0));
-                await invoke('set_track_gain', { trackIndex: parameters.track_id - 1, gain });
-                break;
+                const gainIdx = getIndex(parameters.track_id);
+                if (gainIdx !== -1) {
+                    let rawVal = parameters.value ?? 1.0;
+                    
+                    // PROMPT FIX UPDATE:
+                    // The AI now correctly sends 0.0 - 2.0.
+                    // We ONLY convert if it accidentally sends a percentage (e.g. 50, 80, 100).
+                    if (rawVal > 2.0) {
+                        rawVal = rawVal / 50; // Convert 100 -> 2.0
+                    }
+                    // Else: Use the value exactly as AI sent it (e.g. 1.0 is Unity, 2.0 is Max)
+
+                    const gain = Math.max(0, Math.min(2.0, rawVal));
+                    await invoke('set_track_gain', { trackIndex: gainIdx, gain });
+                }
+                break;    
             // --- NEW: Master Gain ---
             case 'set_master_gain':
-                const masterGain = Math.max(0, Math.min(2.0, parameters.value ?? 1.0));
+                let rawMasterVal = parameters.value ?? 1.0;
+
+                // PROMPT FIX UPDATE:
+                // Same logic for Master Gain. Trust the AI unless value is huge.
+                if (rawMasterVal > 2.0) {
+                    rawMasterVal = rawMasterVal / 50;
+                }
+
+                const masterGain = Math.max(0, Math.min(2.0, rawMasterVal));
                 await invoke('set_master_gain', { gain: masterGain });
                 break;
 
             case 'set_pan':
-                const pan = Math.max(-1, Math.min(1, parameters.value ?? 0));
-                await invoke('set_track_pan', { trackIndex: parameters.track_id - 1, pan });
+                const panIdx = getIndex(parameters.track_id);
+                if (panIdx !== -1) {
+                    const pan = Math.max(-1, Math.min(1, parameters.value ?? 0));
+                    await invoke('set_track_pan', { trackIndex: panIdx, pan });
+                }
                 break;
             case 'toggle_mute':
-                await invoke('toggle_mute', { trackIndex: parameters.track_id - 1 });
+                const muteIdx = getIndex(parameters.track_id);
+                if (muteIdx !== -1) await invoke('toggle_mute', { trackIndex: muteIdx });
                 break;
             case 'toggle_solo':
-                await invoke('toggle_solo', { trackIndex: parameters.track_id - 1 });
+                const soloIdx = getIndex(parameters.track_id);
+                if (soloIdx !== -1) await invoke('toggle_solo', { trackIndex: soloIdx });
                 break;
             case 'split_clip':
-                if (parameters.time !== undefined) {
-                    await invoke('split_clip', { trackIndex: parameters.track_id - 1, time: parameters.time });
+                const splitIdx = getIndex(parameters.track_id);
+                if (splitIdx !== -1 && parameters.time !== undefined) {
+                    await invoke('split_clip', { trackIndex: splitIdx, time: parameters.time });
                 }
                 break;
             case 'delete_track':
                  if (parameters.track_id) {
-                    await invoke('delete_track', { trackIndex: parameters.track_id - 1 });
+                    const delIdx = getIndex(parameters.track_id);
+                    if (delIdx !== -1) await invoke('delete_track', { trackIndex: delIdx });
                  }
                  break;
             case 'undo': await invoke('undo'); break;
