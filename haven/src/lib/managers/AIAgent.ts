@@ -158,18 +158,14 @@ class AIAgent {
 
         // ... [Keep existing Safety Check & Switch for gain/pan/split etc.] ...
         // Safety Check: Track Existence
-        if (parameters?.track_id) {
+        // We verify the ID exists, but we NO LONGER convert it to an index.
+        if (parameters?.track_id !== undefined) {
             const exists = tracks.some(t => t.id === parameters.track_id);
             if (!exists) {
                 console.warn("AI attempted action on missing track:", parameters.track_id);
                 return;
             }
         }
-
-        const getIndex = (rawId: any) => {
-             const id = Number(rawId);
-             return tracks.findIndex(t => t.id === id);
-        };
 
         switch (action) {
 
@@ -182,18 +178,14 @@ class AIAgent {
 
                 // 2. Call Rust Backend
                 // (If replacing, we don't need to mute, because we will delete it anyway)
-                const sepIdx = getIndex(parameters.track_id);
-                if (sepIdx !== -1) {
 
-                    await invoke('separate_stems', { 
-                        trackIndex: sepIdx,
-                        muteOriginal: shouldMute, 
-                        replaceOriginal: replaceOriginal
-                    });
-                }else{
-                    console.warn(`❌ AI tried to separate missing track ID: ${parameters.track_id}`);
-                }  
+                await invoke('separate_stems', { 
+                    trackId: parameters.track_id,
+                    muteOriginal: shouldMute, 
+                    replaceOriginal: replaceOriginal
+                });  
                 break;
+
             case 'cancel_job':
                  if (parameters?.job_id) {
                      await invoke('cancel_ai_job', { jobId: parameters.job_id });
@@ -201,8 +193,8 @@ class AIAgent {
                  break;
 
             case 'set_gain':
-                const gainIdx = getIndex(parameters.track_id);
-                if (gainIdx !== -1) {
+                
+                if (parameters.track_id !== undefined) {
                     let rawVal = parameters.value ?? 1.0;
                     
                     // PROMPT FIX UPDATE:
@@ -214,7 +206,10 @@ class AIAgent {
                     // Else: Use the value exactly as AI sent it (e.g. 1.0 is Unity, 2.0 is Max)
 
                     const gain = Math.max(0, Math.min(2.0, rawVal));
-                    await invoke('set_track_gain', { trackIndex: gainIdx, gain });
+                    await invoke('set_track_gain', { 
+                        trackId: parameters.track_id,
+                        gain
+                    });
                 }
                 break;    
             // --- NEW: Master Gain ---
@@ -232,30 +227,45 @@ class AIAgent {
                 break;
 
             case 'set_pan':
-                const panIdx = getIndex(parameters.track_id);
-                if (panIdx !== -1) {
+                
+                if (parameters.track_id !== undefined) {
                     const pan = Math.max(-1, Math.min(1, parameters.value ?? 0));
-                    await invoke('set_track_pan', { trackIndex: panIdx, pan });
+                    await invoke('set_track_pan', {
+                        trackId: parameters.track_id,
+                        pan 
+                    });
                 }
                 break;
             case 'toggle_mute':
-                const muteIdx = getIndex(parameters.track_id);
-                if (muteIdx !== -1) await invoke('toggle_mute', { trackIndex: muteIdx });
+                
+                if (parameters.track_id !== undefined){ 
+                    await invoke('toggle_mute', { 
+                        trackId: parameters.track_id 
+                    });
+                }    
                 break;
             case 'toggle_solo':
-                const soloIdx = getIndex(parameters.track_id);
-                if (soloIdx !== -1) await invoke('toggle_solo', { trackIndex: soloIdx });
+                
+                if (parameters.track_id !== undefined) {
+                    await invoke('toggle_solo', { 
+                        trackId: parameters.track_id 
+                    });
+                }    
                 break;
             case 'split_clip':
-                const splitIdx = getIndex(parameters.track_id);
-                if (splitIdx !== -1 && parameters.time !== undefined) {
-                    await invoke('split_clip', { trackIndex: splitIdx, time: parameters.time });
+               
+                if (parameters.track_id !== undefined && parameters.time !== undefined) {
+                    await invoke('split_clip', { 
+                        trackId: parameters.track_id, 
+                        time: parameters.time 
+                    });
                 }
                 break;
             case 'delete_track':
-                 if (parameters.track_id) {
-                    const delIdx = getIndex(parameters.track_id);
-                    if (delIdx !== -1) await invoke('delete_track', { trackIndex: delIdx });
+                 if (parameters.track_id != undefined ) {
+                    await invoke('delete_track', { 
+                        trackIndex: parameters.track_id 
+                    });
                  }
                  break;
             case 'undo': await invoke('undo'); break;
