@@ -90,6 +90,27 @@ class AIAgent {
             const data: AIResponse = JSON.parse(rawResponse);
             console.log("🧠 AI Plan:", data);
 
+            // --- FIX START: FORCE RECORD MODE IF USER ASKED FOR IT ---
+            // If user mentioned "record" or "mic", but AI forgot to send 'mode: record', we inject it.
+            const text = userInput.toLowerCase();
+            if (text.includes('record') || text.includes('mic')) {
+                // Helper to patch a step
+                const patchStep = (step: any) => {
+                    if (step.action === 'create_track') {
+                        step.parameters = step.parameters || {};
+                        // Only force it if AI didn't specify 'audio' or 'record' already
+                        if (!step.parameters.mode) {
+                            step.parameters.mode = 'record';
+                            console.log("🔧 Auto-fixed: Injected 'mode: record' based on user input.");
+                        }
+                    }
+                };
+
+                // Patch both formats
+                if (data.steps) data.steps.forEach(patchStep);
+                else if (data.action) patchStep(data);
+            }
+
             // CASE 1: New Multi-Step Format
             if (data.steps && Array.isArray(data.steps)) {
                 for (const step of data.steps) {
@@ -141,19 +162,19 @@ class AIAgent {
 
         // Create Track (Supports Count & Mode)
         if (action === 'create_track') {
-             const mode = parameters?.mode === 'audio' ? 'record' : 'default';
-             const count = parameters?.count || 1; // Default to 1 if missing
-
-             console.log(`🤖 Creating ${count} tracks (Mode: ${mode})`);
-
-             // Loop X times to create multiple tracks
-             for (let i = 0; i < count; i++) {
-                 window.dispatchEvent(new CustomEvent('ai-command', { detail: { action, mode } }));
-                 
-                 // Small delay to ensure order (optional but safer for UI)
-                 await new Promise(r => setTimeout(r, 50));
-             }
-             return;
+            // const rawMode = parameters?.mode; 
+            // const mode = (rawMode === 'record' || rawMode === 'audio') ? 'record' : 'default';
+            const mode = 'record';
+            const count = parameters?.count || 1; // Default to 1 if missing
+            console.log(`🤖 Creating ${count} tracks (Mode: ${mode})`);
+            // Loop X times to create multiple tracks
+            for (let i = 0; i < count; i++) {
+                window.dispatchEvent(new CustomEvent('ai-command', { detail: { action, mode } }));
+                
+                // Small delay to ensure order (optional but safer for UI)
+                await new Promise(r => setTimeout(r, 50));
+            }
+            return;
         }
 
         // ... [Keep existing Safety Check & Switch for gain/pan/split etc.] ...
@@ -264,7 +285,7 @@ class AIAgent {
             case 'delete_track':
                  if (parameters.track_id != undefined ) {
                     await invoke('delete_track', { 
-                        trackIndex: parameters.track_id 
+                        trackId: parameters.track_id 
                     });
                  }
                  break;

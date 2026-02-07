@@ -125,41 +125,44 @@
 
     // --- CORE: Optimistic Split Logic ---
     async function executeSplit(trackIndex: number, splitTime: number) {
-    if (trackIndex < 0 || trackIndex >= tracks.length) return;
-    const track = tracks[trackIndex];
-        
-    const clipIndex = track.clips.findIndex((c: any) =>
-      splitTime >= c.startTime && splitTime < c.startTime + c.duration
-    );
-    if (clipIndex === -1) return;
-        
-    const original = track.clips[clipIndex];
-    const relative = splitTime - original.startTime;
-        
-    // Prevent edge splits (0 duration clips)
-    if (relative <= 0.001 || relative >= original.duration - 0.001) return;
-        
-    const leftClip = { ...original, duration: relative };
-    const rightClip = {
-      ...original,
-      id: `clip-${Date.now()}-split`,
-      startTime: splitTime,
-      offset: (original.offset ?? 0) + relative,
-      duration: original.duration - relative
-    };
-  
-    // Replace original with left, insert right after it
-    track.clips.splice(clipIndex, 1, leftClip, rightClip);
-  
-    // Force reactivity
-    tracks = [...tracks];
-  
-    try {
-      await invoke("split_clip", { trackIndex, time: splitTime });
-    } catch (e) {
-      console.error("Backend split failed", e);
-      // Optional: refresh from backend state if you want to rollback safely
-    }
+        if (trackIndex < 0 || trackIndex >= tracks.length) return;
+        const track = tracks[trackIndex];
+            
+        const clipIndex = track.clips.findIndex((c: any) =>
+          splitTime >= c.startTime && splitTime < c.startTime + c.duration
+        );
+        if (clipIndex === -1) return;
+            
+        const original = track.clips[clipIndex];
+        const relative = splitTime - original.startTime;
+            
+        // Prevent edge splits (0 duration clips)
+        if (relative <= 0.001 || relative >= original.duration - 0.001) return;
+            
+        const leftClip = { ...original, duration: relative };
+        const rightClip = {
+          ...original,
+          id: `clip-${Date.now()}-split`,
+          startTime: splitTime,
+          offset: (original.offset ?? 0) + relative,
+          duration: original.duration - relative
+        };
+    
+        // Replace original with left, insert right after it
+        track.clips.splice(clipIndex, 1, leftClip, rightClip);
+    
+        // Force reactivity
+        tracks = [...tracks];
+    
+        try {
+          await invoke("split_clip", { 
+            trackId: track.id, 
+            time: splitTime 
+        });
+        } catch (e) {
+          console.error("Backend split failed", e);
+          // Optional: refresh from backend state if you want to rollback safely
+        }
     }
     
 
@@ -217,7 +220,10 @@
       tracks = [...tracks];
         
       try {
-        await invoke("merge_clip_with_next", { trackIndex, clipIndex });
+        await invoke("merge_clip_with_next", { 
+            trackId: t.id, 
+            clipIndex 
+        });
       } catch (e) {
         console.error("Backend merge failed", e);
         dispatch("refresh"); // rollback by reloading backend state only on error
@@ -248,7 +254,10 @@
 
         // 2. Sync with Backend
         try {
-            await invoke('delete_clip', { trackIndex, clipIndex });
+            await invoke('delete_clip', { 
+                trackId: tracks[trackIndex].id, 
+                clipIndex 
+            });
         } catch (e) {
             console.error("Failed to delete clip:", e);
             dispatch("refresh"); // Fallback: reload state from backend on error
@@ -290,7 +299,7 @@
             // Backend uses 0-based index, frontend uses 1-based ID
             // Ensure this matches your logic (track.id - 1)
             await invoke('move_clip', { 
-                trackIndex: trackId - 1, 
+                trackId: trackId, 
                 clipIndex: clipIndex,
                 newTime: newStartTime 
             });
