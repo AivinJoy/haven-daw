@@ -1090,11 +1090,17 @@ fn analyze_audio_internal(path: &str, color: String) -> Result<ImportResult, Str
     let spp = (sr as f64) / pixels_per_second;
     let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
 
+    let actual_bps = if wf.duration_secs > 0.0 { 
+        (mins.len() as f64) / wf.duration_secs 
+    } else { 
+        0.0 
+    };
+
     Ok(ImportResult {
         mins: mins.to_vec(),
         maxs: maxs.to_vec(),
         duration: wf.duration_secs,
-        bins_per_second: pixels_per_second,
+        bins_per_second: actual_bps,
         bpm: None, // Stems inherit project BPM, so we skip detection to be faster
         color,
     })
