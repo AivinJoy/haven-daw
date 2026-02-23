@@ -23,7 +23,7 @@ use daw_modules::engine::time::GridLine; // Import GridLine
 // [NEW STRUCT] Holds separation results waiting for user confirmation
 struct PendingStemGroup {
     stems: HashMap<String, String>, // key: Stem Name (e.g., "vocals"), value: File Path
-    original_track_index: usize,
+    original_track_id: u32,
     replace_original: bool,
     mute_original: bool,
 }
@@ -65,8 +65,7 @@ fn build_ui_state(
         // 1. Try to find existing color
         let color = info.color.clone();
 
-        let raw_id = info.id; // Frontend uses 1-based ID
-        let track_id = raw_id + 1;
+        let track_id = info.id as u32;
         
         let mut loaded_clips = Vec::new();
 
@@ -185,6 +184,17 @@ fn get_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
         .collect();
         
     Ok(list)
+}
+
+// Helper: Resolve Stable ID -> Mutable Index
+// Returns the current index of the track with the given ID.
+fn resolve_track_index(
+    tracks: &[daw_modules::audio_runtime::FrontendTrackInfo], 
+    target_id: u32
+) -> Result<usize, String> {
+    tracks.iter()
+        .position(|t| t.id as u32 == target_id)
+        .ok_or_else(|| format!("Track ID {} not found (it may have been deleted)", target_id))
 }
 
 #[tauri::command]
@@ -404,15 +414,18 @@ fn analyze_file(path: String, state: State<AppState>) -> Result<ImportResult, St
 
 #[tauri::command]
 fn move_clip(
-    track_index: usize, 
+    track_id: u32, 
     clip_index: usize, 
     new_time: f64, 
     state: State<AppState>
 ) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
     
     // Call the runtime logic we just added
-    audio.move_clip(track_index, clip_index, new_time)
+    audio.move_clip(index, clip_index, new_time)
         .map_err(|e| e.to_string())?;
         
     Ok(())
@@ -495,9 +508,13 @@ fn seek(pos: f64, state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_track_gain(track_index: usize, gain: f32, state: State<AppState>) -> Result<(), String> {
+fn set_track_gain(track_id: u32, gain: f32, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    audio.set_track_gain(track_index, gain);
+
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+
+    audio.set_track_gain(index, gain);
     Ok(())
 }
 
@@ -509,26 +526,38 @@ fn set_master_gain(gain: f32, state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_track_pan(track_index: usize, pan: f32, state: State<AppState>) -> Result<(), String> {
+fn set_track_pan(track_id: u32, pan: f32, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    audio.set_track_pan(track_index, pan);
+
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+
+    audio.set_track_pan(index, pan);
     Ok(())
 }
 
 #[tauri::command]
-fn toggle_mute(track_index: usize, state: State<AppState>) -> Result<(), String> {
+fn toggle_mute(track_id: u32, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    audio.toggle_mute(track_index);
+
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+
+    audio.toggle_mute(index);
     Ok(())
 }
 
 // src-tauri/src/main.rs
 
 #[tauri::command]
-fn toggle_solo(track_index: usize, state: State<AppState>) -> Result<(), String> {
+fn toggle_solo(track_id: u32, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+
     // Call the new simpler logic
-    audio.toggle_solo(track_index); 
+    audio.toggle_solo(index); 
     Ok(())
 }
 
@@ -557,7 +586,7 @@ fn get_grid_lines(
 
 #[tauri::command]
 fn add_clip(
-    track_id: usize, 
+    track_id: u32, 
     path: String, 
     start_time: f64, 
     state: State<AppState>
@@ -565,7 +594,10 @@ fn add_clip(
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
     // Note: track_id from frontend is 1-based, engine uses 0-based index?
     // Adjust index as needed based on your logic.
-    audio.add_clip(track_id - 1, path, start_time).map_err(|e| e.to_string())?;
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+
+    audio.add_clip(index, path, start_time).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -574,49 +606,18 @@ fn add_clip(
 #[tauri::command]
 fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    
-    // 1. Calculate Smart Name (Gap Filling) BEFORE creating the track
-    let existing_tracks = audio.get_tracks_list();
-    let mut used_numbers = Vec::new();
-    
-    for t in &existing_tracks {
-        // Check if name is "Track-XX"
-        if t.name.starts_with("Track-") {
-            if let Ok(num) = t.name.replace("Track-", "").parse::<u32>() {
-                used_numbers.push(num);
-            }
-        }
-    }
-    used_numbers.sort();
 
-    // Find first gap
-    let mut target_num = 1;
-    for num in used_numbers {
-        if num == target_num {
-            target_num += 1;
-        } else if num > target_num {
-            break;
-        }
-    }
-    let new_name = format!("Track-{:02}", target_num);
+    audio.create_empty_track().map_err(|e| e.to_string())?; //Creates new Track
 
-
-    // 2. Create the Track
-    audio.create_empty_track().map_err(|e| e.to_string())?;
-    
-    // 3. Get the new track info
     let tracks = audio.get_tracks_list();
-    let info = tracks.last().ok_or("Track creation failed")?;
-    
-    let raw_id = info.id; 
-    let track_id_display = raw_id + 1; 
+    let info = tracks.last().ok_or("Track Creation Failed")?;
 
-    // 4. Persist Metadata (Name only, Color is auto-handled)
-    let index = tracks.len() - 1; 
+    let new_name = format!("Track-{}", info.id); //Track name
+    let index = tracks.len() - 1;
     audio.set_track_name(index, new_name.clone());
     
     Ok(LoadedTrack {
-        id: track_id_display, 
+        id: info.id as u32, 
         name: new_name,
         color: info.color.clone(),
         clips: vec![],
@@ -629,7 +630,7 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
 
 #[tauri::command]
 fn split_clip(
-    track_index: usize, 
+    track_id: u32, 
     time: f64, 
     state: State<AppState>
 ) -> Result<(), String> {
@@ -640,32 +641,45 @@ fn split_clip(
     // If frontend passes ID (1, 2...), subtract 1.
     // Based on 'move_clip' in your file, it seems direct mapping or handled there.
     // Let's assume track_index matches the Vec index.
+
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
     
-    audio.split_clip(track_index, time).map_err(|e| e.to_string())?;
+    audio.split_clip(index, time).map_err(|e| e.to_string())?;
     
     Ok(())
 }
 
 #[tauri::command]
-fn merge_clip_with_next(track_index: usize, clip_index: usize, state: State<AppState>) -> Result<(), String> {
+fn merge_clip_with_next(track_id: u32, clip_index: usize, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
-    audio.merge_clip_with_next(track_index, clip_index).map_err(|e| e.to_string())
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+
+    audio.merge_clip_with_next(index, clip_index).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn delete_track(track_index: usize, state: State<AppState>) -> Result<(), String> {
+fn delete_track(track_id: u32, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
-    audio.delete_track(track_index).map_err(|e| e.to_string())
+
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+
+    audio.delete_track(index).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn delete_clip(
-    track_index: usize, 
+    track_id: u32, 
     clip_index: usize, 
     state: State<AppState>
 ) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
-    audio.delete_clip(track_index, clip_index).map_err(|e| e.to_string())
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+
+    audio.delete_clip(index, clip_index).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -685,7 +699,7 @@ fn redo(state: State<AppState>) -> Result<(), String> {
 // 1. Argument Struct
 #[derive(serde::Deserialize)]
 struct EqUpdateArgs {
-    track_index: usize,
+    track_id: u32,
     band_index: usize,
     filter_type: String, 
     freq: f32,
@@ -699,6 +713,9 @@ struct EqUpdateArgs {
 #[tauri::command]
 fn update_eq(args: EqUpdateArgs, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
+
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, args.track_id)?;
     
     // Map String to Enum
     let filter_type = match args.filter_type.as_str() {
@@ -720,14 +737,17 @@ fn update_eq(args: EqUpdateArgs, state: State<AppState>) -> Result<(), String> {
         active: args.active,
     };
 
-    audio.update_eq(args.track_index, args.band_index, params);
+    audio.update_eq(index, args.band_index, params);
     Ok(())
 }
 
 #[tauri::command]
-fn get_eq_state(track_index: usize, state: State<AppState>) -> Result<Vec<daw_modules::effects::equalizer::EqParams>, String> {
+fn get_eq_state(track_id: u32, state: State<AppState>) -> Result<Vec<daw_modules::effects::equalizer::EqParams>, String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
-    Ok(audio.get_eq_state(track_index))
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+
+    Ok(audio.get_eq_state(index))
 }
 
 #[tauri::command]
@@ -1070,11 +1090,17 @@ fn analyze_audio_internal(path: &str, color: String) -> Result<ImportResult, Str
     let spp = (sr as f64) / pixels_per_second;
     let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
 
+    let actual_bps = if wf.duration_secs > 0.0 { 
+        (mins.len() as f64) / wf.duration_secs 
+    } else { 
+        0.0 
+    };
+
     Ok(ImportResult {
         mins: mins.to_vec(),
         maxs: maxs.to_vec(),
         duration: wf.duration_secs,
-        bins_per_second: pixels_per_second,
+        bins_per_second: actual_bps,
         bpm: None, // Stems inherit project BPM, so we skip detection to be faster
         color,
     })
@@ -1102,7 +1128,7 @@ fn get_ai_base_url() -> String {
 #[tauri::command]
 async fn separate_stems(
     app: tauri::AppHandle,
-    track_index: usize,
+    track_id: u32,
     mute_original: bool,
     replace_original: bool,
     state: State<'_, AppState>
@@ -1113,13 +1139,14 @@ async fn separate_stems(
     // 1. PREPARATION (Brief Lock)
     let (file_path, duration_secs) = {
         let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-        let tracks = audio.get_tracks_list();
+        let list = audio.get_tracks_list();
+        let index = resolve_track_index(&list, track_id)?;
         
-        if track_index >= tracks.len() {
+        if index >= list.len() {
             return Err("Track index out of bounds".into());
         }
         
-        let clip = tracks[track_index].clips.first()
+        let clip = list[index].clips.first()
             .ok_or("Track has no audio clips to separate")?;
             
         (clip.path.clone(), clip.duration)
@@ -1252,7 +1279,7 @@ async fn separate_stems(
                     // 1. Create the Pending Group
                     let group = PendingStemGroup {
                         stems: stems.clone(),
-                        original_track_index: track_index,
+                        original_track_id: track_id,
                         replace_original,
                         mute_original
                     };
@@ -1323,12 +1350,12 @@ async fn commit_pending_stems(
         let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
 
         // A. Handle Original Track
-        let tracks_len = audio.get_tracks_list().len();
-        if group.original_track_index < tracks_len {
+        let list = audio.get_tracks_list();
+        if let Ok(index) = resolve_track_index(&list, group.original_track_id) { 
             if group.replace_original {
-                audio.delete_track(group.original_track_index).map_err(|e| e.to_string())?;
+                audio.delete_track(index).map_err(|e| e.to_string())?;
             } else if group.mute_original {
-                audio.toggle_mute(group.original_track_index); 
+                audio.toggle_mute(index); 
             }
         }
 

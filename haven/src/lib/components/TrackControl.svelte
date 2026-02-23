@@ -57,29 +57,29 @@
       const val = parseFloat((e.target as HTMLInputElement).value);
       volumeSlider = val;
       gain = fromSliderValue(val);
-      invoke('set_track_gain', { trackIndex: index, gain: gain });
+      invoke('set_track_gain', { trackId: id, gain: gain });
   }
 
   function resetVolume() {
       volumeSlider = 50; // Visual 75%
       gain = 1.0; // Actual 1.0
-      invoke('set_track_gain', { trackIndex: index, gain: 1.0 });
+      invoke('set_track_gain', { trackId: id, gain: 1.0 });
   }
 
   function toggleMute() {
       muted = !muted;
-      invoke('toggle_mute', { trackIndex: index });
+      invoke('toggle_mute', { trackId: id });
   }
 
   function toggleSolo() {
       solo = !solo;
-      invoke('toggle_solo', { trackIndex: index });
+      invoke('toggle_solo', { trackId: id });
   }
 
   // PAN HANDLER
   function updatePan(val: number) {
       pan = val;
-      invoke('set_track_pan', { trackIndex: index, pan: pan });
+      invoke('set_track_pan', { trackId: id, pan: pan });
   }
 
 </script>

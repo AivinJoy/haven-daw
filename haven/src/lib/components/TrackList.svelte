@@ -36,19 +36,19 @@
   // --- MENU STATE ---
   let showMenu = $state(false);
   let menuPos = $state({ x: 0, y: 0 });
-  let activeTrackIndex = $state(-1);
+  let activeTrackId = $state(-1);
 
   function handleTrackMenu(e: MouseEvent, index: number) {
       e.stopPropagation(); // Prevent track selection
       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
       menuPos = { x: e.clientX, y: e.clientY };
-      activeTrackIndex = index;
+      activeTrackId = index;
       showMenu = true;
   }
 
   function handleDelete() {
-      if (activeTrackIndex !== -1) {
-          dispatch('delete', activeTrackIndex);
+      if (activeTrackId !== -1) {
+          dispatch('delete', activeTrackId);
       }
       showMenu = false;
   }
@@ -121,7 +121,7 @@
             { 
                 label: "Open EQ", 
                 action: () => {
-                    dispatch('openEq', activeTrackIndex); // <--- Dispatch EQ event
+                    dispatch('openEq', activeTrackId); // <--- Dispatch EQ event
                     showMenu = false;
                 }
             },

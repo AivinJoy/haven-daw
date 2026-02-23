@@ -21,7 +21,7 @@
     let isPlaying = $state(false);
     let currentTime = $state(0); 
     let showEqWindow = $state(false);
-    let eqTrackIndex = $state(0);
+    let eqTrackId = $state(0);
     
     // --- GLOBAL BPM STATE ---
     let bpm = $state(120); 
@@ -241,11 +241,11 @@
     }
 
     async function handleDeleteTrack(event: CustomEvent<number>) {
-        const index = event.detail;
+        const trackId = event.detail;
         
         // 1. Call Backend
         try {
-            await invoke('delete_track', { trackIndex: index });
+            await invoke('delete_track', { trackId: trackId });
             console.log("🗑️ Track deleted");
             // 2. Sync State (Safest way to ensure IDs stay aligned)
             await refreshProjectState();
@@ -256,7 +256,7 @@
     }
 
     function handleOpenEq(event: CustomEvent<number>) {
-        eqTrackIndex = event.detail; // TrackList sends the index (0, 1, 2...)
+        eqTrackId = event.detail; // TrackList sends the index (0, 1, 2...)
         showEqWindow = true;
     }
 
@@ -662,7 +662,7 @@
   {/if}
   {#if showEqWindow}
         <EqWindow 
-            trackIndex={eqTrackIndex} 
+            trackId={eqTrackId} 
             onClose={() => showEqWindow = false} 
         />
     {/if}

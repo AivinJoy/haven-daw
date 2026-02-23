@@ -69,7 +69,16 @@
       // Prefer backend-provided bins/sec. Fallbacks are still kept.
       let binsPerSecond = waveform.binsPerSecond ?? 100;
       if ((!waveform.binsPerSecond || waveform.binsPerSecond <= 0) && waveform.duration > 0) {
-        binsPerSecond = totalBins / waveform.duration;
+        // binsPerSecond = totalBins / waveform.duration;
+
+        const rawBps = totalBins / waveform.duration;
+
+        if (Math.abs(rawBps - Math.round(rawBps)) < 0.1) {
+          binsPerSecond = Math.round(rawBps);
+        }else {
+          binsPerSecond = rawBps;
+        }
+
       }
 
       const startBinIndex = Math.floor(offset * binsPerSecond);
@@ -77,7 +86,7 @@
 
 
       // 3. Slice the data (Clamp to bounds)
-      const safeStart = Math.max(0, Math.min(startBinIndex, totalBins - 1));
+      const safeStart = Math.max(0, Math.min(startBinIndex, totalBins));
       const safeEnd = Math.max(safeStart, Math.min(endBinIndex, totalBins));
 
       // 4. Create Slices

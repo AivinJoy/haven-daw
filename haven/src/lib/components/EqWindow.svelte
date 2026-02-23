@@ -4,7 +4,7 @@
   import { onMount } from "svelte";
   import Knob from "./Knob.svelte";
 
-  let { trackIndex, onClose } = $props();
+  let { trackId, onClose } = $props();
 
   let loading = $state(true);
   let bands = $state<any[]>([]); 
@@ -32,7 +32,7 @@
 
   onMount(async () => {
     try {
-      bands = await invoke("get_eq_state", { trackIndex });
+      bands = await invoke("get_eq_state", { trackId });
       loading = false;
     } catch (e) {
       console.error("Failed to load EQ:", e);
@@ -47,7 +47,7 @@
     // 2. Send to Backend
     try {
       const args = {
-        track_index: trackIndex,
+        track_index: trackId,
         band_index: bandIndex,
         filter_type: bands[bandIndex].filter_type,
         freq: parseFloat(bands[bandIndex].freq),
