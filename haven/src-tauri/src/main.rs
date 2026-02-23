@@ -751,6 +751,35 @@ fn get_eq_state(track_id: u32, state: State<AppState>) -> Result<Vec<daw_modules
 }
 
 #[tauri::command]
+fn update_compressor(
+    track_id: u32, 
+    params: daw_modules::effects::compressor::CompressorParams, 
+    state: State<AppState>
+) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+    
+    // Note: You will need to add this wrapper method to audio_runtime.rs / engine.rs 
+    // exactly like you did for 'audio.update_eq(...)'!
+    audio.update_compressor(index, params);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_compressor_state(
+    track_id: u32, 
+    state: State<AppState>
+) -> Result<daw_modules::effects::compressor::CompressorParams, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+
+    // Note: You will need to add this wrapper method to audio_runtime.rs / engine.rs
+    Ok(audio.get_compressor_state(index))
+}
+
+#[tauri::command]
 async fn get_project_state(
     app: tauri::AppHandle, 
     state: State<'_, AppState>
@@ -1481,6 +1510,8 @@ fn main() {
             delete_track,
             update_eq,
             get_eq_state,
+            update_compressor,
+            get_compressor_state,
             get_output_devices,
             get_input_devices,
             undo,

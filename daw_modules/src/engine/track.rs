@@ -18,6 +18,7 @@ use ringbuf::SharedRb;
 use crate::decoder::{spawn_decoder_with_ctrl, DecoderCmd};
 use crate::bpm::adapter;
 use crate::effects::equalizer::TrackEq;
+use crate::effects::compressor::CompressorNode;
 
 /// Identifier for a track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -312,6 +313,7 @@ pub struct Track {
     state: TrackState,
     pub clips: Vec<Clip>,
     pub track_eq: TrackEq,
+    pub track_compressor: CompressorNode,
     // --- Track Start Time (for Drag & Drop) ---
 }
 
@@ -367,6 +369,7 @@ impl Track {
             state: TrackState::Stopped,
             clips: Vec::new(),
             track_eq: TrackEq::new(sample_rate, channels),
+            track_compressor: CompressorNode::new(sample_rate as f32),
         }
     }
 
@@ -639,6 +642,8 @@ impl Track {
         // We do this BEFORE gain/pan so the EQ is "Pre-Fader" (standard mixing practice)
         if active_clips > 0 {
            self.track_eq.process_buffer(dst, channels);
+
+           self.track_compressor.process(dst);
         }
 
         // Apply Gain/Pan only if we actually mixed something

@@ -13,6 +13,7 @@
     import Loader from '$lib/components/Loader.svelte';
     import { recordingManager } from '$lib/managers/RecordingManager';
     import EqWindow from "$lib/components/EqWindow.svelte";
+    import CompressorWindow from "$lib/components/CompressorWindow.svelte";
     import AIChatbot from '$lib/components/AIChatbot.svelte';
 
     // --- STATE ---
@@ -22,6 +23,8 @@
     let currentTime = $state(0); 
     let showEqWindow = $state(false);
     let eqTrackId = $state(0);
+    let showCompressorWindow = $state(false); // <--- ADD THIS
+    let compressorTrackId = $state(0);
     
     // --- GLOBAL BPM STATE ---
     let bpm = $state(120); 
@@ -258,6 +261,12 @@
     function handleOpenEq(event: CustomEvent<number>) {
         eqTrackId = event.detail; // TrackList sends the index (0, 1, 2...)
         showEqWindow = true;
+    }
+
+    function handleOpenCompressor(event: CustomEvent<number>) {
+        console.log("🔥 OPEN COMPRESSOR CLICKED FOR TRACK:", event.detail);
+        compressorTrackId = event.detail;
+        showCompressorWindow = true;
     }
 
     // --- NEW HELPER: Exclusive Arming ---
@@ -604,66 +613,73 @@
 
 <main class="h-screen w-screen bg-[#0f0f16] text-white overflow-hidden relative font-sans flex flex-col">
   
-  {#if view === 'landing' || showModal}
-    <div class="absolute inset-0 z-50">
-        <LandingModal on:select={view === 'landing' ? handleInitialSelection : handleModalSelection} />
-    </div>
-  {/if}
+    {#if view === 'landing' || showModal}
+      <div class="absolute inset-0 z-50">
+          <LandingModal on:select={view === 'landing' ? handleInitialSelection : handleModalSelection} />
+      </div>
+    {/if}
 
-  {#if view === 'studio'}
-    <Header bind:projectName={projectName}/>
-    
-    <TopToolbar
-        bind:masterGain={masterGain} 
-        isPlaying={isPlaying} 
-        currentTime={currentTime}
-        bind:bpm={bpm}
-        isRecording={isRecordingMode} 
-        on:play={togglePlayback} 
-        on:pause={togglePlayback}
-        on:rewind={rewind}
-        on:record={() => {
-            if (isRecordingMode) {
-                stopRecordingLogic();
-            } else {
-                startRecordingLogic();
-            }    
-        }}
-        on:record-add={() => addNewTrack('record')}
-        on:new={() => window.location.reload()}
-        on:load={handleLoad}
-        on:save={handleSave}
-        on:export={handleExport} 
-    />
-
-    <div class="flex-1 flex overflow-hidden relative">
-        <TrackList 
-            bind:tracks={tracks} 
-            on:requestAdd={handleAddRequest}
-            on:select={handleTrackSelect}
-            on:toggleMonitor={handleToggleMonitor}
-            on:delete={handleDeleteTrack}
-            on:openEq={handleOpenEq}
+    {#if view === 'studio'}
+        <Header bind:projectName={projectName}/>
+      
+        <TopToolbar
+            bind:masterGain={masterGain} 
+            isPlaying={isPlaying} 
+            currentTime={currentTime}
+            bind:bpm={bpm}
+            isRecording={isRecordingMode} 
+            on:play={togglePlayback} 
+            on:pause={togglePlayback}
+            on:rewind={rewind}
+            on:record={() => {
+                if (isRecordingMode) {
+                    stopRecordingLogic();
+                } else {
+                    startRecordingLogic();
+                }    
+            }}
+            on:record-add={() => addNewTrack('record')}
+            on:new={() => window.location.reload()}
+            on:load={handleLoad}
+            on:save={handleSave}
+            on:export={handleExport} 
         />
-        
-        <Timeline 
-            bind:tracks={tracks} 
-            currentTime={currentTime} 
-            bpm={bpm} 
-            on:seek={(e) => seekTo(e.detail)}
-            on:select={handleTrackSelect}
-            on:refresh={refreshProjectState}
-        /> 
 
-    </div>
+        <div class="flex-1 flex overflow-hidden relative">
+            <TrackList 
+                bind:tracks={tracks} 
+                on:requestAdd={handleAddRequest}
+                on:select={handleTrackSelect}
+                on:toggleMonitor={handleToggleMonitor}
+                on:delete={handleDeleteTrack}
+                on:openEq={handleOpenEq}
+                on:openCompressor={handleOpenCompressor}
+            />
 
-    <AIChatbot {tracks} />
+            <Timeline 
+                bind:tracks={tracks} 
+                currentTime={currentTime} 
+                bpm={bpm} 
+                on:seek={(e) => seekTo(e.detail)}
+                on:select={handleTrackSelect}
+                on:refresh={refreshProjectState}
+            /> 
 
-  {/if}
-  {#if showEqWindow}
-        <EqWindow 
-            trackId={eqTrackId} 
-            onClose={() => showEqWindow = false} 
+        </div>
+
+        <AIChatbot {tracks} />
+
+    {/if}
+    {#if showEqWindow}
+          <EqWindow 
+              trackId={eqTrackId} 
+              onClose={() => showEqWindow = false} 
+          />
+    {/if}
+    {#if showCompressorWindow}
+        <CompressorWindow 
+            trackId={compressorTrackId} 
+            onClose={() => showCompressorWindow = false} 
         />
     {/if}
 

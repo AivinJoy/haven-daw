@@ -11,6 +11,7 @@ use crate::engine::Engine;
 use crate::session::{Session, commands::*}; 
 use crate::engine::time::GridLine;
 use crate::effects::equalizer::EqParams; // <--- Import this
+use crate::effects::compressor::CompressorParams;
 
 /// Owns Engine + CPAL stream and exposes a simple control API.
 pub struct AudioRuntime {
@@ -527,6 +528,46 @@ impl AudioRuntime {
             }
         }
         Vec::new()
+    }
+
+    pub fn update_compressor(&self, track_index: usize, params: CompressorParams) {
+        let (track_id, old_params) = {
+            let eng = self.engine.lock().unwrap();
+            if let Some(track) = eng.tracks().get(track_index) {
+                (Some(track.id), Some(track.track_compressor.get_params()))
+            } else {
+                (None, None)
+            }
+        };
+
+        if let (Some(tid), Some(old)) = (track_id, old_params) {
+            let cmd = Box::new(UpdateCompressor {
+                track_id: tid,
+                old_params: old,
+                new_params: params,
+            });
+            
+            if let Ok(mut session) = self.session.lock() {
+                let _ = session.apply(&self.engine, cmd);
+            }
+        }
+    }
+
+    pub fn get_compressor_state(&self, track_index: usize) -> CompressorParams {
+        if let Ok(eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks().get(track_index) {
+                return track.track_compressor.get_params();
+            }
+        }
+        // Fallback default if track isn't found
+        CompressorParams {
+            is_active: true,
+            threshold_db: -20.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 50.0,
+            makeup_gain_db: 0.0,
+        }
     }
 
     // FIX: Corrected Reset Methods (No Delta, Just Reset)
