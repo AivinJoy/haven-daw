@@ -4,7 +4,7 @@
       Menu, Undo, Redo, Timer, Play, Pause, Circle, Square, 
       SlidersHorizontal, Volume2, Save, Share, SkipBack 
     } from 'lucide-svelte';
-    import { createEventDispatcher } from 'svelte';
+    import { createEventDispatcher, onMount, onDestroy } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { save, open as openDialog } from '@tauri-apps/plugin-dialog';
     import MenuDropdown from './MenuDropdown.svelte';
@@ -23,10 +23,10 @@
     // Local state
     let timeSignature = $state('4 / 4');
     
-    let masterVolume = $state(masterGain * 50);
+    let masterVolume = $state(masterGain * 80);
     // Watch for external changes (e.g. AI updates masterGain -> Update Slider)
     $effect(() => {
-        masterVolume = Math.min(100, masterGain * 50);
+        masterVolume = Math.min(100, masterGain * 80);
     });
 
     let isMenuOpen = $state(false);
@@ -52,17 +52,50 @@
         return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}.${ms}`;
     }
 
+    // --- ADDED: MASTER METER POLLING LOGIC ---
+    let meterScale = $state(0);
+    let meterRunning = false;
+    let reqId: number;
+
+    function toDB(linear: number) {
+        if (linear <= 0.00001) return -60;
+        return Math.max(-60, 20 * Math.log10(linear));
+    }
+
+    const pollMasterMeter = async () => {
+        if (!meterRunning) return;
+        try {
+            // Fetch L and R peaks lock-free from Rust
+            const [peakL, peakR] = await invoke<[number, number]>('get_master_meter');
+            // Since it's a single horizontal bar, we display the louder of the two channels
+            const maxPeak = Math.max(peakL, peakR);
+            // Map -60dB -> 0% width, 0dB -> 100% width
+            meterScale = Math.max(0, Math.min(1.0, (toDB(maxPeak) + 60) / 60));
+        } catch(e) {}
+        reqId = requestAnimationFrame(pollMasterMeter);
+    };
+
+    onMount(() => {
+        meterRunning = true;
+        pollMasterMeter();
+    });
+
+    onDestroy(() => {
+        meterRunning = false;
+        cancelAnimationFrame(reqId);
+    });
+
     // --- MASTER VOLUME ---
     function updateMaster(e: Event) {
         const val = parseFloat((e.target as HTMLInputElement).value);
         masterVolume = val;
         // Update the bound prop (Parent will handle backend sync if bound, or we do it here)
-        masterGain = val / 50.0; 
+        masterGain = val / 80.0; 
         invoke('set_master_gain', { gain: masterGain });
     }
 
     function resetMaster() {
-        masterVolume = 50; // Visual Center
+        masterVolume = 80; // Visual Center
         masterGain = 1.0;  // Unity Gain
         invoke('set_master_gain', { gain: 1.0 });
     }
@@ -204,11 +237,33 @@
 
         <div class="flex items-center gap-2 mx-2 group">
             <Volume2 size={16} class="text-white/40 group-hover:text-white transition-colors" />
-            <input 
-                type="range" min="0" max="100" value={masterVolume} oninput={updateMaster} ondblclick={resetMaster}
-                style="background: linear-gradient(to right, #a855f7 0%, #a855f7 {masterVolume}%, rgba(255,255,255,0.1) {masterVolume}%, rgba(255,255,255,0.1) 100%);"
-                class="w-24 h-1 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white [&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(168,85,247,0.5)] hover:[&::-webkit-slider-thumb]:scale-110 transition-all"
-            />
+            
+            <div class="relative w-26 h-2.5 bg-[#0f0f16] rounded-full flex items-center overflow-hidden border border-white/10 shadow-inner">
+                
+                <div class="absolute inset-0 w-full h-full" 
+                     style="background: linear-gradient(to right, #4ade80 0%, #4ade80 80%, #eab308 80%, #eab308 95%, #ef4444 95%, #ef4444 100%);">
+                </div>
+                
+                <div class="absolute right-0 top-0 bottom-0 bg-[#0f0f16]" 
+                     style="width: {(1 - meterScale) * 100}%; transition: width 0.05s linear;">
+                </div>
+                
+                <div class="absolute right-0 top-0 bottom-0 bg-black/50 backdrop-blur-sm z-10 border-l border-white/20" 
+                     style="width: {100 - masterVolume}%;">
+                </div>
+
+                <input 
+                    type="range" min="0" max="100" 
+                    value={masterVolume} 
+                    oninput={updateMaster} 
+                    ondblclick={resetMaster}
+                    class="absolute inset-0 w-full h-full z-20 appearance-none bg-transparent cursor-pointer outline-none
+                           [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:h-3.5 
+                           [&::-webkit-slider-thumb]:bg-white [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(0,0,0,0.8)]
+                           hover:[&::-webkit-slider-thumb]:scale-110 transition-all"
+                    title="Master Volume"
+                />
+            </div>
         </div>
 
         <div class="h-6 w-px bg-white/10 mx-2"></div>

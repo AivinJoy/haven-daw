@@ -19,6 +19,7 @@ use crate::decoder::{spawn_decoder_with_ctrl, DecoderCmd};
 use crate::bpm::adapter;
 use crate::effects::equalizer::TrackEq;
 use crate::effects::compressor::CompressorNode;
+use crate::engine::metering::{MeterState, TrackMeters}; // <--- ADD IMPORT
 
 /// Identifier for a track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -314,6 +315,8 @@ pub struct Track {
     pub clips: Vec<Clip>,
     pub track_eq: TrackEq,
     pub track_compressor: CompressorNode,
+    pub meters: std::sync::Arc<TrackMeters>, // <--- Shared with UI
+    meter_state: MeterState,                 // <--- Owned by Audio Thread
     // --- Track Start Time (for Drag & Drop) ---
 }
 
@@ -370,6 +373,8 @@ impl Track {
             clips: Vec::new(),
             track_eq: TrackEq::new(sample_rate, channels),
             track_compressor: CompressorNode::new(sample_rate as f32),
+            meters: TrackMeters::new(),                       // <--- ADDED
+            meter_state: MeterState::new(sample_rate as f32), // <--- ADDED
         }
     }
 
@@ -670,6 +675,9 @@ impl Track {
                 }
             }
         }
+
+        // --- ADDED: Calculate meters exactly as they sound post-fader ---
+        self.meter_state.process_block(dst, channels, &self.meters);
 
         dst.len() / channels
     }

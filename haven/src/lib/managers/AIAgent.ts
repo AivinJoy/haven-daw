@@ -66,18 +66,47 @@ class AIAgent {
             console.warn("Could not fetch recording status for AI context", e);
         }
         
-        // 1. Normalize Context
-        // 1. Normalize Context
-        // We MUST include gain/pan/muted/solo so the AI knows what to reset
-        const context = JSON.stringify(tracks.map(t => ({ 
-            id: t.id, 
-            name: t.name.toLowerCase(),
-            gain: t.gain,
-            pan: t.pan,
-            muted: t.muted,
-            solo: t.solo,
-            monitoring: isMonitoring
-        })));
+        // --- ADDED: Fetch Real-time Telemetry (RMS & Peak) ---
+        let liveMeters: any[] = [];
+        try {
+            liveMeters = await invoke('get_track_meters');
+        } catch (e) {
+            console.warn("Could not fetch AI telemetry", e);
+        }
+        
+        // 1. Normalize Context (Keeping your clean JSON approach!)
+        let context = JSON.stringify(tracks.map(t => {
+            // Find telemetry for this specific track
+            const telemetry = liveMeters.find(m => m.track_id === t.id);
+            let rmsDb = -60.0;
+            let peakDb = -60.0;
+
+            if (telemetry) {
+                const maxRms = Math.max(telemetry.rms_l, telemetry.rms_r);
+                const maxPeak = Math.max(telemetry.peak_l, telemetry.peak_r);
+                // Convert to Number to keep the JSON clean (no strings)
+                rmsDb = maxRms > 0.00001 ? Number((20 * Math.log10(maxRms)).toFixed(1)) : -60.0;
+                peakDb = maxPeak > 0.00001 ? Number((20 * Math.log10(maxPeak)).toFixed(1)) : -60.0;
+            }
+            return { 
+                id: t.id, 
+                name: t.name.toLowerCase(),
+                gain: t.gain,
+                pan: t.pan,
+                muted: t.muted,
+                solo: t.solo,
+                monitoring: isMonitoring,
+                telemetry_rms_db: rmsDb,   // <--- Added!
+                telemetry_peak_db: peakDb  // <--- Added!
+            };
+        }));
+
+        // Append the AI instructions to the JSON string so the AI knows how to use the new data
+        context += `\n\nCRITICAL INSTRUCTIONS FOR AUDIO LEVELING:
+            You now have 'telemetry_rms_db' (Perceived Loudness) and 'telemetry_peak_db' (True Peak) in the JSON context.
+            - If the user asks to "balance the mix", "fix the levels", or says "it's too quiet", DO NOT GUESS.
+            - A standard vocal RMS sits around -18dB to -12dB. If it is -30dB, it is objectively too quiet. Use 'set_track_gain' to increase it.
+            - If 'telemetry_peak_db' is 0.0 dBFS or higher, the track is CLIPPING. You MUST reduce its 'set_track_gain' immediately.`;
 
         try {
             // 2. Call Backend
@@ -289,6 +318,42 @@ class AIAgent {
                     });
                  }
                  break;
+            case 'update_eq':
+                if (parameters.track_id !== undefined && parameters.band_index !== undefined) {
+                    console.log("🎛️ AI updating EQ:", parameters);
+                    await invoke('update_eq', {
+                        args: {
+                            track_id: parameters.track_id,
+                            band_index: parameters.band_index,
+                            filter_type: parameters.filter_type || "Peaking",
+                            freq: parameters.freq || 1000.0,
+                            q: parameters.q || 1.0,
+                            gain: parameters.gain || 0.0,
+                            active: true
+                        }
+                    });
+                } else {
+                    console.warn("AI sent update_eq without track_id or band_index");
+                }
+                break;
+
+            case 'update_compressor':
+                if (parameters.track_id !== undefined) {
+                    console.log("🗜️ AI updating Compressor:", parameters);
+                    await invoke('update_compressor', {
+                        trackId: parameters.track_id,
+                        params: {
+                            is_active: true,
+                            threshold_db: parameters.threshold_db ?? -20.0,
+                            ratio: parameters.ratio ?? 4.0,
+                            attack_ms: parameters.attack_ms ?? 5.0,
+                            release_ms: parameters.release_ms ?? 50.0,
+                            makeup_gain_db: parameters.makeup_gain_db ?? 0.0
+                        }
+                    });
+                }
+                break;     
+
             case 'undo': await invoke('undo'); break;
             case 'redo': await invoke('redo'); break;    
         }

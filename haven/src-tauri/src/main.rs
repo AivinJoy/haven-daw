@@ -519,10 +519,28 @@ fn set_track_gain(track_id: u32, gain: f32, state: State<AppState>) -> Result<()
 }
 
 #[tauri::command]
+fn get_master_gain(state: tauri::State<AppState>) -> Result<f32, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    Ok(audio.master_gain())
+}
+
+#[tauri::command]
 fn set_master_gain(gain: f32, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
     audio.set_master_gain(gain);
     Ok(())
+}
+
+#[tauri::command]
+fn get_master_meter(state: tauri::State<AppState>) -> Result<(f32, f32), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    Ok(audio.get_master_meter())
+}
+
+#[tauri::command]
+fn get_track_meters(state: tauri::State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    Ok(audio.get_meters())
 }
 
 #[tauri::command]
@@ -626,6 +644,12 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
         muted: false,
         solo: false
     })
+}
+
+#[tauri::command]
+fn get_all_meters(state: State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    Ok(audio.get_meters())
 }
 
 #[tauri::command]
@@ -993,14 +1017,24 @@ async fn ask_ai(
         {{ \n\
           \"steps\": [ \n\
             {{ \n\
-              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"none\", \n\
+              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"update_eq\" | \"update_compressor\" | \"none\", \n\
               \"parameters\": {{ \n\
                 \"track_id\": number (optional), \n\
                 \"value\": number (optional), \n\
                 \"time\": number (optional), \n\
                 \"mute_original\": boolean (optional), \n\
                 \"replace_original\": boolean (optional), \n\
-                \"job_id\": string (optional) \n\
+                \"job_id\": string (optional), \n\
+                \"band_index\": number (optional, 0-3), \n\
+                \"filter_type\": \"LowPass\" | \"HighPass\" | \"Peaking\" | \"LowShelf\" | \"HighShelf\" | \"Notch\" | \"BandPass\" (optional), \n\
+                \"freq\": number (optional), \n\
+                \"q\": number (optional), \n\
+                \"gain\": number (optional, -24.0 to 24.0), \n\
+                \"threshold_db\": number (optional, -60.0 to 0.0), \n\
+                \"ratio\": number (optional, 1.0 to 20.0), \n\
+                \"attack_ms\": number (optional), \n\
+                \"release_ms\": number (optional), \n\
+                \"makeup_gain_db\": number (optional) \n\
               }} \n\
             }} \n\
           ], \n\
@@ -1029,8 +1063,10 @@ async fn ask_ai(
              Output \"action\": \"separate_stems\", \"parameters\": {{ \"track_id\": <CONTEXT_ID>, \"mute_original\": true }}\n\
            - If the user says 'Replace' or 'Replace it' (meaning delete original):\n\
              Output \"action\": \"separate_stems\", \"parameters\": {{ \"track_id\": <CONTEXT_ID>, \"replace_original\": true }}\n\
+        7. EQ & COMPRESSION LOGIC:\n\
+           - To EQ, use 'update_eq'. Choose a band (0=Lows, 1=LowMids, 2=HighMids, 3=Highs). For boosting vocals/presence, use 'Peaking', freq 3000-5000, gain +2.0 to +4.0. To cut mud, freq 200-300, gain -2.0 to -4.0. Default Q is 1.0.\n\
+           - To Compress, use 'update_compressor'. Standard settings: threshold -20.0, ratio 4.0, attack 5.0, release 50.0.\n\
         ",
-        
         track_context, user_input
     );
 
@@ -1498,11 +1534,15 @@ fn main() {
             toggle_mute,
             toggle_solo,
             set_master_gain,
+            get_master_gain,
+            get_master_meter,
+            get_track_meters,
             save_project,
             load_project,
             export_project,
             get_temp_path,
             add_clip,
+            get_all_meters,
             split_clip,
             get_project_state,
             merge_clip_with_next,
