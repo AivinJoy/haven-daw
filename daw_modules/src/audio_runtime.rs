@@ -44,6 +44,8 @@ pub struct FrontendTrackInfo {
     pub muted: bool,
     pub solo: bool,
     pub clips: Vec<FrontendClipInfo>,
+    pub compressor: Option<CompressorParams>,
+    pub eq: Option<Vec<EqParams>>,
 }
 
 pub struct EngineSnapshot {
@@ -623,6 +625,8 @@ impl AudioRuntime {
                 muted: t.muted,
                 solo: t.solo,
                 clips, // Add the list of clips
+                compressor: Some(t.track_compressor.get_params()),
+                eq: Some(t.track_eq.get_state()),
             }
         }).collect();
 
@@ -667,6 +671,8 @@ impl AudioRuntime {
                     muted: t.muted,
                     solo: t.solo,
                     clips, // <--- Add the clips here
+                    compressor: Some(t.track_compressor.get_params()),
+                    eq: Some(t.track_eq.get_state()),
                 }
             }).collect()
         } else {

@@ -205,4 +205,14 @@ impl TrackEq {
     pub fn get_state(&self) -> Vec<EqParams> {
         self.bands.iter().map(|b| b.params).collect()
     }
+
+    pub fn set_state(&mut self, state: Vec<EqParams>) {
+        // Loop through the saved parameters and apply them to the corresponding bands
+        for (i, params) in state.into_iter().enumerate() {
+            // Check to make sure we don't exceed the number of bands your EQ supports
+            if i < self.bands.len() {
+                self.bands[i].update(params); // <--- CHANGED FROM set_params TO update
+            }
+        }
+    }
 }
