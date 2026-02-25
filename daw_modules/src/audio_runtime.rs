@@ -14,6 +14,7 @@ use crate::session::{Session, commands::*};
 use crate::engine::time::GridLine;
 use crate::effects::equalizer::EqParams; // <--- Import this
 use crate::effects::compressor::CompressorParams;
+use crate::analyzer::AnalysisProfile;
 
 
 // --- ADDED: The Lock-Free AI / UI Command Queue ---
@@ -88,6 +89,13 @@ pub struct FrontendTrackInfo {
 
 pub struct EngineSnapshot {
     pub tracks: Vec<TrackSnapshot>,
+}
+
+// --- NEW: Struct for AI Context ---
+#[derive(serde::Serialize)]
+pub struct TrackAnalysisPayload {
+    pub track_id: u32,
+    pub analysis: Option<AnalysisProfile>,
 }
 
 impl AudioRuntime {
@@ -772,6 +780,27 @@ impl AudioRuntime {
                     hold_r: f32::from_bits(meters.hold_r.load(std::sync::atomic::Ordering::Relaxed)),
                     rms_l: f32::from_bits(meters.rms_l.load(std::sync::atomic::Ordering::Relaxed)),
                     rms_r: f32::from_bits(meters.rms_r.load(std::sync::atomic::Ordering::Relaxed)),
+                });
+            }
+        }
+        results
+    }
+
+    // --- NEW: Expose offline analysis data for AI ---
+    pub fn get_all_track_analysis(&self) -> Vec<TrackAnalysisPayload> {
+        let mut results = Vec::new();
+        if let Ok(eng) = self.engine.lock() {
+            for t in eng.tracks() {
+                // Safely lock the analysis profile. If it's still computing, it will return None.
+                let profile = if let Ok(guard) = t.analysis.lock() {
+                    guard.clone()
+                } else {
+                    None
+                };
+                
+                results.push(TrackAnalysisPayload {
+                    track_id: t.id.0,
+                    analysis: profile,
                 });
             }
         }

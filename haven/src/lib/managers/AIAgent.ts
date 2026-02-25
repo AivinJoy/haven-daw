@@ -66,28 +66,20 @@ class AIAgent {
             console.warn("Could not fetch recording status for AI context", e);
         }
         
-        // --- ADDED: Fetch Real-time Telemetry (RMS & Peak) ---
-        let liveMeters: any[] = [];
+        // --- NEW: Fetch Integrated Offline Track Analysis ---
+        let trackAnalysis: any[] = [];
         try {
-            liveMeters = await invoke('get_track_meters');
+            trackAnalysis = await invoke('get_track_analysis');
         } catch (e) {
-            console.warn("Could not fetch AI telemetry", e);
+            console.warn("Could not fetch integrated AI track analysis", e);
         }
         
-        // 1. Normalize Context (Keeping your clean JSON approach!)
+        // 1. Normalize Context (Clean JSON approach)
         let context = JSON.stringify(tracks.map(t => {
-            // Find telemetry for this specific track
-            const telemetry = liveMeters.find(m => m.track_id === t.id);
-            let rmsDb = -60.0;
-            let peakDb = -60.0;
-
-            if (telemetry) {
-                const maxRms = Math.max(telemetry.rms_l, telemetry.rms_r);
-                const maxPeak = Math.max(telemetry.peak_l, telemetry.peak_r);
-                // Convert to Number to keep the JSON clean (no strings)
-                rmsDb = maxRms > 0.00001 ? Number((20 * Math.log10(maxRms)).toFixed(1)) : -60.0;
-                peakDb = maxPeak > 0.00001 ? Number((20 * Math.log10(maxPeak)).toFixed(1)) : -60.0;
-            }
+            // Find the analysis profile for this track
+            const data = trackAnalysis.find(a => a.track_id === t.id);
+            const profile = data?.analysis; // Will be null if still computing
+            
             return { 
                 id: t.id, 
                 name: t.name.toLowerCase(),
@@ -96,17 +88,37 @@ class AIAgent {
                 muted: t.muted,
                 solo: t.solo,
                 monitoring: isMonitoring,
-                telemetry_rms_db: rmsDb,   // <--- Added!
-                telemetry_peak_db: peakDb  // <--- Added!
+                // AI gets the true statistical average of the track
+                analysis: profile ? {
+                    integrated_rms_db: Number(profile.integrated_rms_db.toFixed(1)),
+                    max_sample_peak_db: Number(profile.max_sample_peak_db.toFixed(1)),
+                    crest_factor_db: Number(profile.crest_factor_db.toFixed(1)),
+                    spectral_centroid_hz: Math.round(profile.spectral_centroid_hz),
+                    energy_lows_pct: Number(profile.energy_lows_pct.toFixed(2)),
+                    energy_mids_pct: Number(profile.energy_mids_pct.toFixed(2)),
+                    energy_highs_pct: Number(profile.energy_highs_pct.toFixed(2))
+                } : "computing..."
             };
         }));
 
-        // Append the AI instructions to the JSON string so the AI knows how to use the new data
-        context += `\n\nCRITICAL INSTRUCTIONS FOR AUDIO LEVELING:
-            You now have 'telemetry_rms_db' (Perceived Loudness) and 'telemetry_peak_db' (True Peak) in the JSON context.
-            - If the user asks to "balance the mix", "fix the levels", or says "it's too quiet", DO NOT GUESS.
-            - A standard vocal RMS sits around -18dB to -12dB. If it is -30dB, it is objectively too quiet. Use 'set_track_gain' to increase it.
-            - If 'telemetry_peak_db' is 0.0 dBFS or higher, the track is CLIPPING. You MUST reduce its 'set_track_gain' immediately.`;
+        // Append Advanced AI Engineering Instructions
+        context += `\n\nCRITICAL INSTRUCTIONS FOR AUDIO ENGINEERING:
+            You now have a professional 'analysis' profile for each track. Use it to make mixing decisions:
+            
+            1. LEVELING (RMS & PEAK):
+               - 'integrated_rms_db' is perceived loudness. Target -18dB to -14dB. If it's -30dB, it is objectively too quiet; use 'set_gain' > 1.0.
+               - If 'max_sample_peak_db' is near 0.0 dBFS, it is CLIPPING. Reduce 'set_gain'.
+
+            2. COMPRESSION (CREST FACTOR):
+               - 'crest_factor_db' (Peak minus RMS) reveals dynamics. 
+               - HIGH Crest Factor (>12dB): The track is "Transient" (e.g., Drums, Percussion, Plucks). Use fast attack (1-5ms), fast release (50ms), ratio 4:1 to 8:1.
+               - LOW Crest Factor (<6dB): The track is "Sustained" (e.g., Synth Pads, distorted guitars, heavy bass). Needs little to no compression, or very slow attack (30ms+), low ratio (2:1).
+
+            3. EQ (SPECTRAL CENTROID & ENERGY):
+               - Look at 'energy_lows_pct', 'mids', and 'highs' to identify the instrument.
+               - High 'energy_lows_pct' (>0.5) = Bass/Kick. Boost lows, cut highs.
+               - High 'energy_mids_pct' = Vocals/Guitars. To increase presence, boost 'Peaking' at freq 2000-4000Hz. To remove "mud", cut at freq 250-400Hz.
+               - If a track is clashing, use EQ to carve out space based on their centroids.`;
 
         try {
             // 2. Call Backend
@@ -173,7 +185,20 @@ class AIAgent {
     }
 
     private async executeAction(step: any, tracks: any[]) {
-        const { action, parameters } = step;
+        let { action, parameters } = step;
+
+        // --- SAFEGUARDS against AI hallucinations ---
+        if (action === 'unsolo') action = 'toggle_solo';
+        if (action === 'unmute') action = 'toggle_mute';
+        
+        // Ensure parameters object exists
+        if (!parameters) parameters = {};
+
+        // UI SAFEGUARD: Default track_id to 0 if the user/AI didn't specify one
+        if (parameters.track_id === undefined || parameters.track_id === null) {
+            parameters.track_id = 0;
+        }
+
         console.log("🤖 AI Action:", action, parameters);
 
         if (!action || action === 'none' || action === 'clarify') return;
@@ -277,9 +302,30 @@ class AIAgent {
                 break;
 
             case 'set_pan':
-                
                 if (parameters.track_id !== undefined) {
-                    const pan = Math.max(-1, Math.min(1, parameters.value ?? 0));
+                    let rawPan = parameters.value;
+
+                    // UI SAFEGUARD 1: If AI forgot the value entirely, assume Center
+                    if (rawPan === undefined || rawPan === null) {
+                        rawPan = 0.0;
+                    }
+
+                    // UI SAFEGUARD 2: If the AI hallucinates a string instead of a number
+                    if (typeof rawPan === 'string') {
+                        const strVal = (rawPan as string).toLowerCase();
+                        if (strVal.includes('left')) rawPan = -1.0;
+                        else if (strVal.includes('right')) rawPan = 1.0;
+                        else rawPan = 0.0; // Center fallback
+                    }
+                    
+                    // UI SAFEGUARD 3: If AI uses percentages (100 instead of 1.0)
+                    if (rawPan > 1.0 || rawPan < -1.0) {
+                        rawPan = rawPan / 100.0; 
+                    }
+                    
+                    // Final Clamp to ensure UI Knob never glitches out of bounds
+                    const pan = Math.max(-1.0, Math.min(1.0, rawPan));
+                    
                     await invoke('set_track_pan', {
                         trackId: parameters.track_id,
                         pan 
@@ -357,6 +403,11 @@ class AIAgent {
             case 'undo': await invoke('undo'); break;
             case 'redo': await invoke('redo'); break;    
         }
+
+        // --- FIX: UI RACE CONDITION ---
+        // Give the Rust lock-free audio thread 50ms to actually process 
+        // the pan/gain/mute commands before we fetch the updated state.
+        await new Promise(resolve => setTimeout(resolve, 50));
 
         window.dispatchEvent(new CustomEvent('refresh-project')); 
     }

@@ -679,6 +679,13 @@ fn get_all_meters(state: State<AppState>) -> Result<Vec<daw_modules::audio_runti
     Ok(audio.get_meters())
 }
 
+// --- NEW: Tauri command for AI analysis ---
+#[tauri::command]
+fn get_track_analysis(state: State<AppState>) -> Result<Vec<daw_modules::audio_runtime::TrackAnalysisPayload>, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    Ok(audio.get_all_track_analysis())
+}
+
 #[tauri::command]
 fn split_clip(
     track_id: u32, 
@@ -1044,9 +1051,9 @@ async fn ask_ai(
         {{ \n\
           \"steps\": [ \n\
             {{ \n\
-              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"update_eq\" | \"update_compressor\" | \"none\", \n\
+              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"unmute\" | \"unsolo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"update_eq\" | \"update_compressor\" | \"none\", \n\
               \"parameters\": {{ \n\
-                \"track_id\": number (optional), \n\
+                \"track_id\": number (optional, default to 0), \n\
                 \"value\": number (optional), \n\
                 \"time\": number (optional), \n\
                 \"mute_original\": boolean (optional), \n\
@@ -1065,34 +1072,38 @@ async fn ask_ai(
               }} \n\
             }} \n\
           ], \n\
-          \"message\": \"Short confirmation text\" \n\
+          \"message\": \"Short confirmation text or detailed conversational answer\" \n\
         }}\n\
         \n\
         RULES:\n\
-        1. OUTPUT RAW JSON ONLY. Do not use markdown formatting (no ```json). Do not include any text outside the braces.\n\
-        2. GAIN/VOLUME SCALE:\n\
-            - Range is 0.0 (Silence) to 2.0 (Max Volume).\n\
-            - 1.0 is Unity/Default gain.\n\
-            - If user says 'Max', use 2.0.\n\
-            - If user says 'Half', use 1.0.\n\
-        3. RESET LOGIC: When asked to 'Reset' a track or 'Reset Everything', you must neutralize all active states:\n\
+        1. CRITICAL: YOU MUST OUTPUT A VALID JSON OBJECT. NO PLAIN TEXT.\n\
+        2. STRICT DATA TYPES (PREVENT API CRASH): \n\
+           - For 'value', 'track_id', and all numerical fields, YOU MUST USE REAL NUMBERS (e.g., 1.0, -1.0, 0). \n\
+           - NEVER use strings like \"full\", \"max\", \"left\", or \"right\" for numbers. \n\
+           - If the user does not specify a track number, you MUST assume \"track_id\": 0.\n\
+           - NEVER output a parameter with a 'null' value. If a parameter is not needed, omit the key completely.\n\
+        3. CONVERSATION VS COMMANDS:\n\
+           - If user ASKS A QUESTION: Use action \"none\" and put the answer in \"message\".\n\
+           - If user ISSUES A COMMAND: Use the correct action ('set_gain', 'set_pan', etc.). NEVER use \"none\" for a command.\n\
+        4. GAIN/VOLUME SCALE:\n\
+            - Range is 0.0 (Silence) to 2.0 (Max Volume). 1.0 is Unity.\n\
+            - If user says 'max volume', use 'set_gain' with \"value\": 2.0.\n\
+            - If user says 'half volume', use 'set_gain' with \"value\": 0.5.\n\
+        5. PAN SCALE:\n\
+            - Range is -1.0 (Full Left) to 1.0 (Full Right). 0.0 is Center.\n\
+            - If user says 'pan right' or 'right pan full', use 'set_pan' with \"value\": 1.0.\n\
+            - If user says 'pan left' or 'left pan full', use 'set_pan' with \"value\": -1.0.\n\
+        6. MUTE & SOLO LOGIC:\n\
+            - Use 'toggle_mute', 'unmute', 'toggle_solo', or 'unsolo' as actions where appropriate.\n\
+        7. RESET LOGIC: When asked to 'Reset' a track or 'Reset Everything', neutralize active states:\n\
            - GAIN: Always set to 1.0.\n\
            - PAN: Always set to 0.0.\n\
-           - MUTE: If context shows 'muted: true', generate 'toggle_mute'.\n\
-           - SOLO: If context shows 'solo: true', generate 'toggle_solo'.\n\
-           - MONITOR: If context shows 'monitoring: true' (or 'is_monitoring: true'), generate 'toggle_monitor'.\n\
-        4. SPECIFIC RESETS: If user says 'Reset monitoring', ONLY toggle monitoring if it is currently true.\n\
-        5. Track IDs: Use the numeric IDs provided in the context.\n\
-        6. SEPARATION CLARIFICATION:\n\
-           - If the user asks to 'separate', 'split', or 'extract' stems AND has NOT specified what to do with the original track:\n\
-             Output \"action\": \"none\" and \"message\": \"Should I mute the original track or replace it?\"\n\
-           - If the user says 'Mute' or 'Mute it':\n\
-             Output \"action\": \"separate_stems\", \"parameters\": {{ \"track_id\": <CONTEXT_ID>, \"mute_original\": true }}\n\
-           - If the user says 'Replace' or 'Replace it' (meaning delete original):\n\
-             Output \"action\": \"separate_stems\", \"parameters\": {{ \"track_id\": <CONTEXT_ID>, \"replace_original\": true }}\n\
-        7. EQ & COMPRESSION LOGIC:\n\
-           - To EQ, use 'update_eq'. Choose a band (0=Lows, 1=LowMids, 2=HighMids, 3=Highs). For boosting vocals/presence, use 'Peaking', freq 3000-5000, gain +2.0 to +4.0. To cut mud, freq 200-300, gain -2.0 to -4.0. Default Q is 1.0.\n\
-           - To Compress, use 'update_compressor'. Standard settings: threshold -20.0, ratio 4.0, attack 5.0, release 50.0.\n\
+           - MUTE: If context shows 'muted: true', generate 'unmute'.\n\
+           - SOLO: If context shows 'solo: true', generate 'unsolo'.\n\
+           - MONITOR: If context shows 'monitoring: true', generate 'toggle_monitor'.\n\
+        8. EQ & COMPRESSION LOGIC:\n\
+           - To EQ, use 'update_eq'. Bands: 0=Lows, 1=LowMids, 2=HighMids, 3=Highs. Default Q is 1.0.\n\
+           - To Compress, use 'update_compressor'. Standard: threshold -20.0, ratio 4.0, attack 5.0, release 50.0.\n\
         ",
         track_context, user_input
     );
@@ -1570,6 +1581,7 @@ fn main() {
             get_temp_path,
             add_clip,
             get_all_meters,
+            get_track_analysis,
             split_clip,
             get_project_state,
             merge_clip_with_next,
