@@ -11,6 +11,8 @@ pub use time::TempoMap;
 
 use std::time::Duration;
 use rand::seq::IndexedRandom;
+use metering::{TrackMeters, MeterState}; // <--- ADD THIS IMPORT
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct Transport {
@@ -24,6 +26,8 @@ pub struct Engine {
     pub sample_rate: u32,
     pub channels: usize,
     pub master_gain: f32, // <--- New Field
+    pub master_meter: Arc<TrackMeters>, // <--- NEW: Lock-free atomic state
+    master_meter_state: MeterState,     // <--- NEW: Stateful DSP Calculator
     tracks: Vec<Track>,
     mixer: Mixer,
     next_id: u32,
@@ -40,6 +44,8 @@ impl Engine {
             sample_rate,
             channels,
             master_gain: 1.0, // <--- FIXED: Initialized here (Default 1.0 = 100%)
+            master_meter: TrackMeters::new(),                        // <--- NEW
+            master_meter_state: MeterState::new(sample_rate as f32), // <--- NEW
             tracks: Vec::new(),
             mixer: Mixer::new(channels),
             next_id: 0,
@@ -197,61 +203,65 @@ impl Engine {
         }
     }
 
-    pub fn render(&mut self, out: &mut [f32]) {
+    pub fn render(&mut self, out: &mut [f32], live_in: &[f32]) {
+        // 1. Always start with a silent buffer
         out.fill(0.0);
 
-        if !self.transport.playing {
-            return;
-        }
+        // 2. Only mix tracks and apply gain if we are playing
+        if self.transport.playing {
+            let channels = self.channels;
+            let frames = out.len() / channels;
 
-        let channels = self.channels;
-        let frames = out.len() / channels;
+            self.mixer.begin_block(frames);
 
-        self.mixer.begin_block(frames);
+            let current_pos = self.transport.position;
+            let sr = self.sample_rate;
 
-        let current_pos = self.transport.position;
-        let sr = self.sample_rate;
+            // --- NON-DESTRUCTIVE SOLO LOGIC ---
+            let any_solo = self.tracks.iter().any(|t| t.solo);
 
-        // --- NON-DESTRUCTIVE SOLO LOGIC ---
-        // Check if ANY track has solo enabled
-        let any_solo = self.tracks.iter().any(|t| t.solo);
+            for track in &mut self.tracks {
+                let is_audible = if any_solo {
+                    track.solo
+                } else {
+                    !track.muted
+                };
 
-        for track in &mut self.tracks {
-            // Determine if this specific track should make sound
-            let is_audible = if any_solo {
-                // Solo Mode: Ignore Mute, only play if THIS track is soloed
-                track.solo
-            } else {
-                // Normal Mode: Play if NOT muted
-                !track.muted
-            };
+                let effectively_audible = is_audible && track.gain > 0.001;
 
-            let effectively_audible = is_audible && track.gain > 0.001;
-
-            // Note: We access track.state inside render_track or check it here
-            // Assuming render_into handles the "is state == Playing" check, 
-            // but we can check here to save a function call:
-            if matches!(track.state(), TrackState::Playing) {
-                 self.mixer.render_track(
-                    track, 
-                    frames, 
-                    channels, 
-                    current_pos,
-                    sr, 
-                    effectively_audible);
+                if matches!(track.state(), TrackState::Playing) {
+                     self.mixer.render_track(
+                        track, 
+                        frames, 
+                        channels, 
+                        current_pos,
+                        sr, 
+                        effectively_audible);
+                }
             }
-        }
 
-        self.mixer.mix_into(out, channels);
+            self.mixer.mix_into(out, channels);
 
-        // Apply Master Gain
-        if (self.master_gain - 1.0).abs() > 0.001 {
-            for sample in out.iter_mut() {
-                *sample *= self.master_gain;
+            // --- NEW: Add Live Monitor Audio BEFORE Master Gain ---
+            for (i, sample) in out.iter_mut().enumerate() {
+                *sample += live_in[i];
             }
+
+            // Apply Master Gain
+            if (self.master_gain - 1.0).abs() > 0.001 {
+                for sample in out.iter_mut() {
+                    *sample *= self.master_gain;
+                }
+            }
+
+            // Advance Transport Time
+            let secs = frames as f64 / self.sample_rate as f64;
+            self.transport.position += Duration::from_secs_f64(secs);
         }
 
-        let secs = frames as f64 / self.sample_rate as f64;
-        self.transport.position += Duration::from_secs_f64(secs);
+        // 3. ALWAYS process meter (Ultra-Clean Architecture)
+        // If playing = true, it measures the real audio.
+        // If playing = false, it measures the 0.0 buffer and gracefully decays to -inf.
+        self.master_meter_state.process_block(out, self.channels, &self.master_meter);
     }
 }

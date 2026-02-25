@@ -15,7 +15,7 @@ use anyhow::Result;
 use ringbuf::{HeapRb, traits::Split};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
     Mutex,
 };
@@ -24,7 +24,8 @@ use std::thread;
 pub struct Recorder {
     input: AudioInput,
     writer_handle: Option<thread::JoinHandle<()>>,
-    monitor: Monitor,
+    pub monitor: Option<Monitor>, // <--- CHANGED to Option
+    pub monitor_enabled: Arc<AtomicBool>, // <--- NEW: Lock-free toggle
     live_waveform: Arc<Mutex<LiveWaveform>>,
     record_samples: Arc<AtomicU64>,
 }
@@ -38,7 +39,7 @@ impl Recorder {
         let (prod_rec, cons_rec) = rb_rec.split();
 
         // Ring buffer for monitoring (smaller, low-latency)
-        let mon_capacity = 48_000 / 20;
+        let mon_capacity = 192_000;
         let rb_mon = HeapRb::<f32>::new(mon_capacity);
         let (prod_mon, cons_mon) = rb_mon.split();
 
@@ -65,21 +66,22 @@ impl Recorder {
         });
 
 
-        // Monitor output (initially muted)
-        let monitor = Monitor::new(cons_mon)?;
-        monitor.set_enabled(false);
+        // FIX 2: Pass 'channels' to the monitor so it doesn't interleave stereo into mono
+        let monitor = Monitor::new(cons_mon, channels)?;
+        let monitor_enabled = monitor.enabled.clone();
 
         Ok(Self {
             input,
             writer_handle: Some(writer_handle),
-            monitor,
+            monitor: Some(monitor),
+            monitor_enabled,
             live_waveform,
             record_samples,
         })
     }
 
     pub fn is_monitor_enabled(&self) -> bool {
-        self.monitor.is_enabled()
+        self.monitor_enabled.load(Ordering::Relaxed)
     }
 
     pub fn stop(mut self) {
@@ -98,8 +100,11 @@ impl Recorder {
     }
 
     pub fn toggle_monitor(&mut self) -> Result<()> {
-        self.monitor.toggle();
-        if self.monitor.is_enabled() {
+        // Flip the lock-free boolean
+        let cur = self.monitor_enabled.load(Ordering::Relaxed);
+        self.monitor_enabled.store(!cur, Ordering::Relaxed);
+        
+        if self.is_monitor_enabled() {
             println!("\n🎧 Monitor ON");
         } else {
             println!("\n🎧 Monitor OFF");

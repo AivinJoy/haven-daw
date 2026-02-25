@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{Ordering};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
@@ -15,11 +15,6 @@ use crate::engine::time::GridLine;
 use crate::effects::equalizer::EqParams; // <--- Import this
 use crate::effects::compressor::CompressorParams;
 
-// --- ADDED: The lock-free master output state ---
-pub struct MasterMeterState {
-    pub peak_l: AtomicU32,
-    pub peak_r: AtomicU32,
-}
 
 // --- ADDED: The Lock-Free AI / UI Command Queue ---
 pub enum EngineCommand {
@@ -35,6 +30,8 @@ pub enum EngineCommand {
     SetTrackGain(usize, f32),
     SetTrackPan(usize, f32),
     UpdateCompressor(usize, CompressorParams),
+    SetMonitor(crate::recorder::monitor::Monitor), // <--- NEW
+    ClearMonitor, // <--- NEW
 }
 
 
@@ -58,7 +55,8 @@ pub struct AudioRuntime {
     command_tx: SyncSender<EngineCommand>,
     // --- ADDED: A safe map of Track ID -> Lock-Free Atomics ---
     meter_registry: Arc<Mutex<std::collections::HashMap<u32, std::sync::Arc<crate::engine::metering::TrackMeters>>>>,
-    master_meter: Arc<MasterMeterState>,
+    master_meter: Arc<crate::engine::metering::TrackMeters>, // <--- CHANGED TYPE
+    pub recorder: Arc<Mutex<Option<crate::recorder::Recorder>>>, // <--- NEW
 }
 
 pub struct TrackSnapshot {
@@ -125,21 +123,14 @@ impl AudioRuntime {
         let gain_cb = master_gain.clone();
 
         let mut scratch_buffer: Vec<f32> = Vec::with_capacity(1024);
+        let mut live_scratch: Vec<f32> = Vec::with_capacity(1024);
+        let mut active_monitor: Option<crate::recorder::monitor::Monitor> = None; // <--- Exclusive to audio thread
 
-        // --- ADDED: Initialize the lock-free master meter state ---
-        let master_meter = Arc::new(MasterMeterState {
-            peak_l: AtomicU32::new(0),
-            peak_r: AtomicU32::new(0),
-        });
-        let master_meter_cb = master_meter.clone();
-        
-        // --- ADDED: DSP Decay Constants ---
-        let release_time_sec = 0.300; // 300ms visual falloff
-        let decay_coeff = (-1.0 / (release_time_sec * sample_rate as f32)).exp();
-        #[allow(unused_mut)]
-        let mut stored_peak_l = 0.0f32;
-        #[allow(unused_mut)]
-        let mut stored_peak_r = 0.0f32;
+        // We wrap the recorder so the UI and the Audio Thread can both access it
+        let recorder = Arc::new(Mutex::new(None::<crate::recorder::Recorder>));
+
+       // --- NEW: Grab the lock-free reference directly from the Engine ---
+        let master_meter = engine.lock().unwrap().master_meter.clone(); 
 
         let stream = device.build_output_stream(
             &config,
@@ -149,6 +140,8 @@ impl AudioRuntime {
                     // --- 1. PROCESS AI & UI COMMANDS LOCK-FREE ---
                     while let Ok(cmd) = command_rx.try_recv() {
                         match cmd {
+                            EngineCommand::SetMonitor(m) => active_monitor = Some(m), // <--- Grab ownership
+                            EngineCommand::ClearMonitor => active_monitor = None,     // <--- Drop it
                             EngineCommand::Play => eng.play(),
                             EngineCommand::Pause => eng.pause(),
                             EngineCommand::TogglePlay => {
@@ -195,54 +188,31 @@ impl AudioRuntime {
                     let frames = data.len() / device_channels as usize;
                     if scratch_buffer.len() != frames * 2 {
                         scratch_buffer.resize(frames * 2, 0.0);
+                        live_scratch.resize(frames * 2, 0.0); // <--- NEW
                     }
-                
+                    
+                    // --- PROCESS MONITOR LOCK-FREE ---
+                    live_scratch.fill(0.0);
+                    if let Some(mon) = active_monitor.as_mut() {
+                        mon.process_into(&mut live_scratch, 2);
+                    }
+
                     // 5. RENDER STEREO: Engine writes strictly to our 2-channel scratch buffer
-                    eng.render(&mut scratch_buffer);
-
-                    // --- ADDED: Master Peak Analysis ---
-                    let mut max_l = 0.0f32;
-                    let mut max_r = 0.0f32;
+                    eng.render(&mut scratch_buffer, &live_scratch);
                 
-                    // 6. MAP CHANNELS: Copy Scratch -> Device Buffer
+                   // 6. MAP CHANNELS: Copy Scratch -> Device Buffer cleanly
                     let mut scratch_idx = 0;
-                    // Process the device buffer in chunks (one chunk = one time frame across all channels)
                     for frame in data.chunks_mut(device_channels as usize) {
-                    
-                        // Fast copy of Left and Right
-                        let l = scratch_buffer[scratch_idx];
-                        let r = scratch_buffer[scratch_idx + 1];
-
-                        // Capture absolute peaks for the visual meter
-                        max_l = max_l.max(l.abs());
-                        max_r = max_r.max(r.abs());
-                    
                         if frame.len() >= 2 {
-                            frame[0] = l; // Channel 1 (Left)
-                            frame[1] = r; // Channel 2 (Right)
+                            frame[0] = scratch_buffer[scratch_idx];     // Left
+                            frame[1] = scratch_buffer[scratch_idx + 1]; // Right
                         }
-                    
-                        // Silence remaining channels (3, 4, 5, 6, 7, 8...)
+                        // Silence remaining channels
                         for sample in frame.iter_mut().skip(2) {
                             *sample = 0.0;
                         }
-                    
                         scratch_idx += 2;
                     }
-
-                    // --- ADDED: Apply Block-Scaled Decay ---
-                    let block_decay = decay_coeff.powf(frames as f32);
-                    
-                    if max_l > stored_peak_l { stored_peak_l = max_l; } 
-                    else { stored_peak_l = (stored_peak_l * block_decay) + 1e-20 - 1e-20; }
-                    
-                    if max_r > stored_peak_r { stored_peak_r = max_r; } 
-                    else { stored_peak_r = (stored_peak_r * block_decay) + 1e-20 - 1e-20; }
-
-                    // --- ADDED: Lock-Free Write to UI ---
-                    master_meter_cb.peak_l.store(stored_peak_l.to_bits(), Ordering::Relaxed);
-                    master_meter_cb.peak_r.store(stored_peak_r.to_bits(), Ordering::Relaxed);
-
                 } else {
                     data.fill(0.0);
                 }
@@ -264,6 +234,7 @@ impl AudioRuntime {
             command_tx, //store the transmitter
             meter_registry,
             master_meter,
+            recorder,
         })
     }
 
@@ -414,10 +385,17 @@ impl AudioRuntime {
 
     // --- GLOBAL SETTINGS ---
 
-    pub fn get_master_meter(&self) -> (f32, f32) {
-        let l = f32::from_bits(self.master_meter.peak_l.load(Ordering::Relaxed));
-        let r = f32::from_bits(self.master_meter.peak_r.load(Ordering::Relaxed));
-        (l, r)
+    // --- GLOBAL SETTINGS ---
+
+    // --- GLOBAL SETTINGS ---
+
+    pub fn get_master_meter(&self) -> (f32, f32, f32, f32) {
+        // FIX: Pull hold_l/hold_r (decayed) instead of peak_l/peak_r (instant)
+        let p_l = f32::from_bits(self.master_meter.hold_l.load(Ordering::Relaxed));
+        let p_r = f32::from_bits(self.master_meter.hold_r.load(Ordering::Relaxed));
+        let r_l = f32::from_bits(self.master_meter.rms_l.load(Ordering::Relaxed));
+        let r_r = f32::from_bits(self.master_meter.rms_r.load(Ordering::Relaxed));
+        (p_l, p_r, r_l, r_r)
     }
 
     pub fn set_master_gain(&self, gain: f32) {
@@ -481,6 +459,13 @@ impl AudioRuntime {
     // Absolute Pan Setter
     pub fn set_track_pan(&self, track_index: usize, pan: f32) {
         let _ = self.command_tx.try_send(EngineCommand::SetTrackPan(track_index, pan.clamp(-1.0, 1.0)));
+    }
+
+    pub fn set_monitor(&self, monitor: crate::recorder::monitor::Monitor) {
+        let _ = self.command_tx.try_send(EngineCommand::SetMonitor(monitor));
+    }
+    pub fn clear_monitor(&self) {
+        let _ = self.command_tx.try_send(EngineCommand::ClearMonitor);
     }
 
     // Relative Adjusters (Kept for Keyboard Shortcuts in daw_controller)

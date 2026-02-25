@@ -22,12 +22,39 @@
 
     // Local state
     let timeSignature = $state('4 / 4');
+
+
+    // Maps a true dB value to a UI Percentage (0-100)
+    function dbToPercent(db: number) {
+        if (db <= -60) return 0;
+        if (db <= 0) {
+            return ((db + 60) / 60) * 80; // Bottom 80% covers -60dB to 0dB
+        } else {
+            return 80 + (db / 6) * 20;    // Top 20% covers 0dB to +6dB
+        }
+    }
+
+    // Maps a UI Percentage (0-100) back to a true dB value
+    function percentToDb(percent: number) {
+        if (percent <= 0) return -60;
+        if (percent <= 80) {
+            return (percent / 80) * 60 - 60;
+        } else {
+            return ((percent - 80) / 20) * 6;
+        }
+    }
     
-    let masterVolume = $state(masterGain * 80);
-    // Watch for external changes (e.g. AI updates masterGain -> Update Slider)
+    let masterVolume = $state(80); // 0.0dB now sits perfectly at 80%
     $effect(() => {
-        masterVolume = Math.min(100, masterGain * 80);
+        let currentDb = masterGain <= 0.00001 ? -60 : 20 * Math.log10(masterGain);
+        masterVolume = Math.max(0, Math.min(100, dbToPercent(currentDb)));
     });
+
+    let faderDbDisplay = $derived(
+        masterGain <= 0.001 
+            ? '-inf' 
+            : (masterGain > 1.01 ? '+' : '') + (20 * Math.log10(masterGain)).toFixed(1)
+    );
 
     let isMenuOpen = $state(false);
 
@@ -52,8 +79,28 @@
         return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}.${ms}`;
     }
 
+    // --- MASTER VOLUME ---
+    function updateMaster(e: Event) {
+        const val = parseFloat((e.target as HTMLInputElement).value);
+        masterVolume = val;
+        
+        // Use our new taper curve!
+        const targetDb = percentToDb(val);
+        masterGain = targetDb <= -59.5 ? 0 : Math.pow(10, targetDb / 20);
+        
+        invoke('set_master_gain', { gain: masterGain });
+    }
+
+    function resetMaster() {
+        masterVolume = 80;   // 80% perfectly equals 0.0 dB
+        masterGain = 1.0;    // Unity Gain
+        invoke('set_master_gain', { gain: 1.0 });
+    }
+
     // --- ADDED: MASTER METER POLLING LOGIC ---
     let meterScale = $state(0);
+    let rmsScale = $state(0); // <--- NEW: RMS State
+    let displayDb = $state('-inf');
     let meterRunning = false;
     let reqId: number;
 
@@ -65,12 +112,19 @@
     const pollMasterMeter = async () => {
         if (!meterRunning) return;
         try {
-            // Fetch L and R peaks lock-free from Rust
-            const [peakL, peakR] = await invoke<[number, number]>('get_master_meter');
-            // Since it's a single horizontal bar, we display the louder of the two channels
-            const maxPeak = Math.max(peakL, peakR);
-            // Map -60dB -> 0% width, 0dB -> 100% width
-            meterScale = Math.max(0, Math.min(1.0, (toDB(maxPeak) + 60) / 60));
+            // Fetch Peak and RMS from the new struct
+            const { peak_l, peak_r, rms_l, rms_r } = await invoke<{peak_l: number, peak_r: number, rms_l: number, rms_r: number}>('get_master_meter');
+            
+            const maxPeak = Math.max(peak_l, peak_r);
+            const maxRms = Math.max(rms_l, rms_r);
+
+            const pDb = toDB(maxPeak);
+
+            // Format text: show "-inf" if silent, otherwise format to 1 decimal with optional '+' sign
+            displayDb = pDb <= -59.5 ? '-inf' : (pDb > 0 ? '+' : '') + pDb.toFixed(1);
+
+            meterScale = Math.max(0, Math.min(1.0, dbToPercent(pDb) / 100));
+            rmsScale = Math.max(0, Math.min(1.0, dbToPercent(toDB(maxRms)) / 100));
         } catch(e) {}
         reqId = requestAnimationFrame(pollMasterMeter);
     };
@@ -84,21 +138,6 @@
         meterRunning = false;
         cancelAnimationFrame(reqId);
     });
-
-    // --- MASTER VOLUME ---
-    function updateMaster(e: Event) {
-        const val = parseFloat((e.target as HTMLInputElement).value);
-        masterVolume = val;
-        // Update the bound prop (Parent will handle backend sync if bound, or we do it here)
-        masterGain = val / 80.0; 
-        invoke('set_master_gain', { gain: masterGain });
-    }
-
-    function resetMaster() {
-        masterVolume = 80; // Visual Center
-        masterGain = 1.0;  // Unity Gain
-        invoke('set_master_gain', { gain: 1.0 });
-    }
 
   // --- NEW FUNCTIONS ---
     
@@ -238,18 +277,24 @@
         <div class="flex items-center gap-2 mx-2 group">
             <Volume2 size={16} class="text-white/40 group-hover:text-white transition-colors" />
             
-            <div class="relative w-26 h-2.5 bg-[#0f0f16] rounded-full flex items-center overflow-hidden border border-white/10 shadow-inner">
-                
-                <div class="absolute inset-0 w-full h-full" 
-                     style="background: linear-gradient(to right, #4ade80 0%, #4ade80 80%, #eab308 80%, #eab308 95%, #ef4444 95%, #ef4444 100%);">
-                </div>
-                
-                <div class="absolute right-0 top-0 bottom-0 bg-[#0f0f16]" 
-                     style="width: {(1 - meterScale) * 100}%; transition: width 0.05s linear;">
-                </div>
-                
-                <div class="absolute right-0 top-0 bottom-0 bg-black/50 backdrop-blur-sm z-10 border-l border-white/20" 
-                     style="width: {100 - masterVolume}%;">
+            <div class="relative w-26 h-2.5 flex items-center">
+ 
+                <div class="absolute inset-0 w-full h-full bg-[#0f0f16] rounded-full overflow-hidden border border-white/10 shadow-inner">
+                    <div class="absolute inset-0 w-full h-full" 
+                         style="background: linear-gradient(to right, #4ade80 0%, #4ade80 56%, #eab308 56%, #eab308 72%, #ef4444 72%, #ef4444 100%);">
+                    </div>
+                 
+                    <div class="absolute right-0 top-0 bottom-0 bg-[#0f0f16]" 
+                         style="width: {(1 - meterScale) * 100}%; transition: width 0.05s linear;">
+                    </div>
+
+                    <div class="absolute left-0 top-0 bottom-0 bg-white/40 border-r border-white/60" 
+                         style="width: {rmsScale * 100}%; transition: width 0.05s linear;">
+                    </div>
+                    
+                    <div class="absolute right-0 top-0 bottom-0 bg-black/50 backdrop-blur-sm z-10 border-l border-white/20" 
+                         style="width: {100 - masterVolume}%;">
+                    </div>
                 </div>
 
                 <input 
@@ -258,11 +303,15 @@
                     oninput={updateMaster} 
                     ondblclick={resetMaster}
                     class="absolute inset-0 w-full h-full z-20 appearance-none bg-transparent cursor-pointer outline-none
-                           [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:h-3.5 
-                           [&::-webkit-slider-thumb]:bg-white [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(0,0,0,0.8)]
-                           hover:[&::-webkit-slider-thumb]:scale-110 transition-all"
+                           [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 
+                           [&::-webkit-slider-thumb]:bg-transparent [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white
+                           [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:shadow-[0_0_5px_rgba(0,0,0,0.8)]
+                           hover:[&::-webkit-slider-thumb]:scale-110 [&::-webkit-slider-thumb]:transition-transform"
                     title="Master Volume"
                 />
+            </div>
+            <div class="w-8 text-right font-mono text-[10px] text-white/50 group-hover:text-white/90 transition-colors pointer-events-none tracking-tighter">
+                {faderDbDisplay}
             </div>
         </div>
 

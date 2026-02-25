@@ -31,6 +31,8 @@ pub struct MeterState {
     decay_coeff: f32,
     stored_peak_l: f32,
     stored_peak_r: f32,
+    stored_rms_l: f32, // <--- NEW: Track RMS decay
+    stored_rms_r: f32, // <--- NEW: Track RMS decay
     hold_frames_l: usize,
     hold_frames_r: usize,
     hold_duration_frames: usize,
@@ -50,6 +52,8 @@ impl MeterState {
             decay_coeff,
             stored_peak_l: 0.0,
             stored_peak_r: 0.0,
+            stored_rms_l: 0.0, // <--- NEW
+            stored_rms_r: 0.0, // <--- NEW
             hold_frames_l: 0,
             hold_frames_r: 0,
             hold_duration_frames,
@@ -87,6 +91,10 @@ impl MeterState {
         // 2. Scale decay perfectly to the current block size
         let block_decay = self.decay_coeff.powf(block_size as f32);
 
+        // --- NEW: Smooth RMS using a 1-pole filter so it fades gracefully ---
+        self.stored_rms_l = (self.stored_rms_l * block_decay) + (rms_l * (1.0 - block_decay));
+        self.stored_rms_r = (self.stored_rms_r * block_decay) + (rms_r * (1.0 - block_decay));
+
         // 3. Process Left Channel (Instant Attack, Peak Hold, Scaled Decay)
         if max_l > self.stored_peak_l {
             self.stored_peak_l = max_l;
@@ -120,7 +128,8 @@ impl MeterState {
         meters.peak_r.store(max_r.to_bits(), Ordering::Relaxed);
         meters.hold_l.store(self.stored_peak_l.to_bits(), Ordering::Relaxed);
         meters.hold_r.store(self.stored_peak_r.to_bits(), Ordering::Relaxed);
-        meters.rms_l.store(rms_l.to_bits(), Ordering::Relaxed);
-        meters.rms_r.store(rms_r.to_bits(), Ordering::Relaxed);
+        // --- NEW: Store the smoothed RMS values instead of the raw ones ---
+        meters.rms_l.store(self.stored_rms_l.to_bits(), Ordering::Relaxed);
+        meters.rms_r.store(self.stored_rms_r.to_bits(), Ordering::Relaxed);
     }
 }

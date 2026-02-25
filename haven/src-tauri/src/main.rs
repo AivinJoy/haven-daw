@@ -444,9 +444,14 @@ struct RecordingState {
 #[tauri::command]
 fn start_recording(path: String, state: State<AppState>) -> Result<(), String> {
     let mut rec_guard = state.recorder.lock().map_err(|_| "Failed to lock recorder")?;
+    let mut new_recorder = Recorder::start(PathBuf::from(path)).map_err(|e| e.to_string())?;
     
-    // Use the path provided by the frontend
-    let new_recorder = Recorder::start(PathBuf::from(path)).map_err(|e| e.to_string())?;
+    // Detach the monitor and send it to the Audio Thread natively!
+    if let Some(monitor) = new_recorder.monitor.take() {
+        if let Ok(audio) = state.audio.lock() {
+            audio.set_monitor(monitor);
+        }
+    }
     
     *rec_guard = Some(new_recorder);
     Ok(())
@@ -494,6 +499,10 @@ fn stop_recording(state: State<AppState>) -> Result<(), String> {
     if let Some(rec) = rec_guard.take() {
         rec.stop();
     }
+    // Tell the audio thread to drop the monitor connection
+    if let Ok(audio) = state.audio.lock() {
+        audio.clear_monitor();
+    }
     Ok(())
 }
 
@@ -531,10 +540,28 @@ fn set_master_gain(gain: f32, state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct MasterMeterState {
+    peak_l: f32,
+    peak_r: f32,
+    rms_l: f32,
+    rms_r: f32,
+}
+
 #[tauri::command]
-fn get_master_meter(state: tauri::State<AppState>) -> Result<(f32, f32), String> {
+fn get_master_meter(state: tauri::State<AppState>) -> Result<MasterMeterState, String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    Ok(audio.get_master_meter())
+    
+    // NOTE: Update your AudioRuntime::get_master_meter() to return a 4-tuple: 
+    // (peak_l, peak_r, rms_l, rms_r) decoded from the atomic bits
+    let (peak_l, peak_r, rms_l, rms_r) = audio.get_master_meter();
+    
+    Ok(MasterMeterState {
+        peak_l,
+        peak_r,
+        rms_l,
+        rms_r,
+    })
 }
 
 #[tauri::command]

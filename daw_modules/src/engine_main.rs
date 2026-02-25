@@ -72,11 +72,22 @@ fn start_engine_stream(engine: Arc<Mutex<Engine>>) -> Result<cpal::Stream, anyho
     let err_fn = |err| eprintln!("Engine output error: {err}");
     let engine_cb = engine.clone();
 
+    // --- NEW: A dummy buffer for the live microphone input ---
+    let mut live_scratch: Vec<f32> = Vec::new();
+
     let stream = device.build_output_stream(
         &config,
         move |data: &mut [f32], _| {
+            // Resize and silence the dummy buffer to match the output buffer
+            if live_scratch.len() != data.len() {
+                live_scratch.resize(data.len(), 0.0);
+            } else {
+                live_scratch.fill(0.0);
+            }
+
             if let Ok(mut eng) = engine_cb.lock() {
-                eng.render(data);
+                // --- NEW: Pass the dummy live_scratch buffer here ---
+                eng.render(data, &live_scratch);
             } else {
                 data.fill(0.0);
             }
