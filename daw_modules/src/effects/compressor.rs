@@ -1,3 +1,5 @@
+// daw_modules\src\effects\compressor.rs
+
 use std::sync::atomic::{AtomicU32, AtomicBool, Ordering}; // <--- ADDED AtomicBool
 
 // Note: In later steps, we will map these into audio_processor_dynamics::Compressor 
@@ -45,7 +47,7 @@ impl CompressorNode {
     /// Initialize a new Compressor with default tracking settings
     pub fn new(sample_rate: f32) -> Self {
         Self {
-            is_active: AtomicBool::new(true), // <--- Default to ON
+            is_active: AtomicBool::new(false), // <--- Default to ON
             // Default: -20dB threshold, 4:1 ratio, 5ms attack, 50ms release
             threshold_db: f32_to_atomic(-20.0),
             ratio: f32_to_atomic(4.0),

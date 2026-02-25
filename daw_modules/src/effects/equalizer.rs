@@ -150,7 +150,7 @@ impl TrackEq {
             freq: 75.0,
             q: 0.707,
             gain: 0.0,
-            active: true, 
+            active: false, 
         }));
 
         // Band 2: Peaking

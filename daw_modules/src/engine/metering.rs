@@ -46,7 +46,7 @@ impl MeterState {
         let decay_coeff = (-1.0 / (release_time_sec * sample_rate)).exp();
         
         // 500ms Peak Hold 
-        let hold_duration_frames = (0.500 * sample_rate) as usize; 
+        let hold_duration_frames = 0;
 
         Self {
             decay_coeff,

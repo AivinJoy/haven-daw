@@ -586,7 +586,7 @@ impl AudioRuntime {
         }
         // Fallback default if track isn't found
         CompressorParams {
-            is_active: true,
+            is_active: false,
             threshold_db: -20.0,
             ratio: 4.0,
             attack_ms: 5.0,
