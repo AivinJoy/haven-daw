@@ -1095,15 +1095,21 @@ async fn ask_ai(
             - If user says 'pan left' or 'left pan full', use 'set_pan' with \"value\": -1.0.\n\
         6. MUTE & SOLO LOGIC:\n\
             - Use 'toggle_mute', 'unmute', 'toggle_solo', or 'unsolo' as actions where appropriate.\n\
-        7. RESET LOGIC: When asked to 'Reset' a track or 'Reset Everything', neutralize active states:\n\
-           - GAIN: Always set to 1.0.\n\
-           - PAN: Always set to 0.0.\n\
-           - MUTE: If context shows 'muted: true', generate 'unmute'.\n\
-           - SOLO: If context shows 'solo: true', generate 'unsolo'.\n\
-           - MONITOR: If context shows 'monitoring: true', generate 'toggle_monitor'.\n\
+        7. RESET LOGIC (CRITICAL FOR MUTE/SOLO): When asked to 'Reset' a track or 'Reset Everything', you must neutralize active states by outputting multiple steps:\n\
+           - ALWAYS include 'set_gain' with \"value\": 1.0.\n\
+           - ALWAYS include 'set_pan' with \"value\": 0.0.\n\
+           - DO NOT include 'unmute' UNLESS the context explicitly says 'muted: true'.\n\
+           - DO NOT include 'unsolo' UNLESS the context explicitly says 'solo: true'.\n\
         8. EQ & COMPRESSION LOGIC:\n\
            - To EQ, use 'update_eq'. Bands: 0=Lows, 1=LowMids, 2=HighMids, 3=Highs. Default Q is 1.0.\n\
            - To Compress, use 'update_compressor'. Standard: threshold -20.0, ratio 4.0, attack 5.0, release 50.0.\n\
+        \n\
+        EXAMPLES OF CORRECT BEHAVIOR:\n\
+        User: \"max the volume of track 0\"\n\
+        Assistant: {{\"steps\": [{{\"action\": \"set_gain\", \"parameters\": {{\"track_id\": 0, \"value\": 2.0}}}}], \"message\": \"Track 0 volume set to maximum.\"}}\n\
+        \n\
+        User: \"reset track 0\" (Assume context says muted: false, solo: false)\n\
+        Assistant: {{\"steps\": [{{\"action\": \"set_gain\", \"parameters\": {{\"track_id\": 0, \"value\": 1.0}}}}, {{\"action\": \"set_pan\", \"parameters\": {{\"track_id\": 0, \"value\": 0.0}}}}], \"message\": \"Track 0 reset.\"}}\n\
         ",
         track_context, user_input
     );
@@ -1135,7 +1141,7 @@ async fn ask_ai(
 
     // 4. Construct Request Payload
     let payload = serde_json::json!({
-        "model":   "qwen/qwen3-32b", //"qwen-2.5-72b-instruct",  //"llama3-70b-8192", // Fast & Good at JSON
+        "model":   "llama-3.3-70b-versatile",  //"qwen/qwen3-32b", //"qwen-2.5-72b-instruct",  //"llama3-70b-8192", // Fast & Good at JSON
         "messages": messages_payload,
         "response_format": { "type": "json_object" },
 
