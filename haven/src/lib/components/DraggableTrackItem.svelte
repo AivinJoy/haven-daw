@@ -121,5 +121,6 @@
         offset={clip.offset || 0}
         zoom={zoom} 
         name={clip.name}
+        clipNumber={clip.clipNumber}
      />
 </div>

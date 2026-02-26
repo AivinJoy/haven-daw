@@ -215,18 +215,19 @@ impl Command for DeleteClip {
         Ok(())
     }
     fn undo(&self, engine: &mut Engine) -> Result<()> {
-        // FIX: Capture variables before borrowing tracks_mut()
         let sr = engine.sample_rate;
         let ch = engine.channels;
 
         if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
-            // NOTE: This call will fail to compile UNTIL you update track.rs in the next step.
-            track.restore_clip(
+            track.restore_deleted_clip( // <--- CHANGED HERE
                 self.clip_index,
                 self.clip_data.path.clone(),
                 self.clip_data.start_time,
                 self.clip_data.offset,
                 self.clip_data.duration,
+                self.clip_data.source_duration, // <--- ADDED
+                self.clip_data.source_sr,       // <--- ADDED
+                self.clip_data.source_ch,       // <--- ADDED
                 sr,
                 ch
             )?;
@@ -271,6 +272,51 @@ impl Command for SplitClip {
         Ok(())
     }
     fn name(&self) -> &str { "Split Clip" }
+}
+
+pub struct MergeClip {
+    pub track_id: TrackId,
+    pub clip_index: usize,
+    pub original_duration: Duration,
+    pub right_clip_data: DeletedClipData,
+}
+
+impl Command for MergeClip {
+    fn execute(&self, engine: &mut Engine) -> Result<()> {
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            track.merge_next(self.clip_index)?;
+        }
+        Ok(())
+    }
+    
+    fn undo(&self, engine: &mut Engine) -> Result<()> {
+        let sr = engine.sample_rate;
+        let ch = engine.channels;
+
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            // 1. Restore left clip's original duration
+            if let Some(left) = track.clips.get_mut(self.clip_index) {
+                left.duration = self.original_duration;
+            }
+            
+            // 2. Restore the deleted right clip
+            track.restore_deleted_clip( // <--- CHANGED HERE
+                self.clip_index + 1,
+                self.right_clip_data.path.clone(),
+                self.right_clip_data.start_time,
+                self.right_clip_data.offset,
+                self.right_clip_data.duration,
+                self.right_clip_data.source_duration, // <--- ADDED
+                self.right_clip_data.source_sr,       // <--- ADDED
+                self.right_clip_data.source_ch,       // <--- ADDED
+                sr,
+                ch
+            )?;
+        }
+        Ok(())
+    }
+    
+    fn name(&self) -> &str { "Merge Clips" }
 }
 
 pub struct UpdateEq {

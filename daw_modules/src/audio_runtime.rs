@@ -72,6 +72,7 @@ pub struct FrontendClipInfo {
     pub start_time: f64,
     pub duration: f64,
     pub offset: f64,
+    pub clip_number: usize,
 }
 
 pub struct FrontendTrackInfo {
@@ -516,10 +517,37 @@ impl AudioRuntime {
     }
 
     pub fn merge_clip_with_next(&self, track_index: usize, clip_index: usize) -> anyhow::Result<()> {
-       if let Ok(mut eng) = self.engine.lock() {
-           eng.merge_clip_with_next(track_index, clip_index)?;
-       }
-       Ok(())
+        let (track_id, original_duration, right_clip_data) = {
+            let eng = self.engine.lock().unwrap();
+            let track = eng.tracks().get(track_index).ok_or(anyhow::anyhow!("Track not found"))?;
+            
+            let left = track.clips.get(clip_index).ok_or(anyhow::anyhow!("Left clip not found"))?;
+            let right = track.clips.get(clip_index + 1).ok_or(anyhow::anyhow!("Right clip not found"))?;
+            
+            let right_data = DeletedClipData {
+                path: right.path.clone(),
+                start_time: right.start_time,
+                offset: right.offset,
+                duration: right.duration,
+                source_duration: right.source_duration,
+                source_sr: right.source_sr,
+                source_ch: right.source_ch,
+            };
+            
+            (track.id, left.duration, right_data)
+        };
+
+        let cmd = Box::new(crate::session::commands::MergeClip {
+            track_id,
+            clip_index,
+            original_duration,
+            right_clip_data,
+        });
+
+        if let Ok(mut session) = self.session.lock() {
+            session.apply(&self.engine, cmd)?;
+        }
+        Ok(())
     }
 
     pub fn delete_clip(&self, track_index: usize, clip_index: usize) -> anyhow::Result<()> {
@@ -710,6 +738,7 @@ impl AudioRuntime {
                     start_time: c.start_time.as_secs_f64(),
                     duration: c.duration.as_secs_f64(),
                     offset: c.offset.as_secs_f64(),
+                    clip_number: c.clip_number, // <--- NEW
                 }).collect();
 
                 FrontendTrackInfo {

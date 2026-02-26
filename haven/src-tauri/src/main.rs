@@ -109,6 +109,7 @@ fn build_ui_state(
                 offset: clip_info.offset,
                 color: color.clone(),
                 waveform: import_result, // <--- Use the cached result
+                clip_number: clip_info.clip_number, // <--- NEW
             });
         }
 
@@ -876,6 +877,7 @@ struct LoadedClip {
     offset: f64,
     waveform: ImportResult,
     color: String,
+    clip_number: usize, // <--- NEW
 }
 
 #[derive(serde::Serialize)]
@@ -1058,11 +1060,12 @@ async fn ask_ai(
         {{ \n\
           \"steps\": [ \n\
             {{ \n\
-              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"unmute\" | \"unsolo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"update_eq\" | \"update_compressor\" | \"none\", \n\
+              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"unmute\" | \"unsolo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"merge_clips\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"update_eq\" | \"update_compressor\" | \"none\", \n\
               \"parameters\": {{ \n\
                 \"track_id\": number (optional, default to 0), \n\
                 \"value\": number (optional), \n\
                 \"time\": number (optional), \n\
+                \"clip_number\": number (optional, the 1-based ID of the clip), \n\
                 \"mute_original\": boolean (optional), \n\
                 \"replace_original\": boolean (optional), \n\
                 \"job_id\": string (optional), \n\
@@ -1110,6 +1113,9 @@ async fn ask_ai(
         8. EQ & COMPRESSION LOGIC:\n\
            - To EQ, use 'update_eq'. Bands: 0=Lows, 1=LowMids, 2=HighMids, 3=Highs. Default Q is 1.0.\n\
            - To Compress, use 'update_compressor'. Standard: threshold -20.0, ratio 4.0, attack 5.0, release 50.0.\n\
+        9. CLIP EDITING:\n\
+           - To split, use 'split_clip' with \"time\".\n\
+           - To merge clips (e.g. \"merge clip 1 and 2\"), use 'merge_clips' and pass the left-most clip as \"clip_number\" (e.g. \"clip_number\": 1).\n\
         \n\
         EXAMPLES OF CORRECT BEHAVIOR:\n\
         User: \"max the volume of track 0\"\n\
@@ -1598,8 +1604,8 @@ fn main() {
             split_clip,
             get_project_state,
             merge_clip_with_next,
-            delete_clip,
             delete_track,
+            delete_clip,
             update_eq,
             get_eq_state,
             update_compressor,
