@@ -52,8 +52,8 @@ pub struct AudioRuntime {
     engine: Arc<Mutex<Engine>>,
     master_gain: Arc<Mutex<f32>>,
     session: Mutex<Session>,
-    _stream: Stream,
-    command_tx: SyncSender<EngineCommand>,
+    stream: Option<Stream>, // Changed to Option to allow hot-swapping
+    command_tx: Mutex<SyncSender<EngineCommand>>, // Wrapped in Mutex to allow channel recreation
     // --- ADDED: A safe map of Track ID -> Lock-Free Atomics ---
     meter_registry: Arc<Mutex<std::collections::HashMap<u32, std::sync::Arc<crate::engine::metering::TrackMeters>>>>,
     master_meter: Arc<crate::engine::metering::TrackMeters>, // <--- CHANGED TYPE
@@ -101,16 +101,8 @@ pub struct TrackAnalysisPayload {
 impl AudioRuntime {
     /// Create engine + output stream. Optionally add one initial track.
     pub fn new(initial_track: Option<String>) -> anyhow::Result<Self> {
-        let output = setup_output_device()?;
-        let sample_rate = output.output_sample_rate;
-        let device_channels = output.output_channels;
-
-        // Debug log to confirm what the device is doing
-         println!("🔊 AudioRuntime: Device running at {} Hz with {} channels", sample_rate, device_channels);
-
         let master_gain = Arc::new(Mutex::new(1.0_f32));
-        // Initialize Engine with default master gain
-        let mut engine = Engine::new(sample_rate, 2);
+        let mut engine = Engine::new(44100, 2); 
 
         if let Some(path) = initial_track {
             let _ = engine.add_track(path)?;
@@ -119,37 +111,74 @@ impl AudioRuntime {
 
         let engine = Arc::new(Mutex::new(engine));
         let session = Mutex::new(Session::new());
-
-        // --- ADDED: Initialize the bounded SPSC queue (1024 commands max) ---
         let (command_tx, command_rx) = mpsc::sync_channel::<EngineCommand>(1024);
+        
+        let recorder = Arc::new(Mutex::new(None::<crate::recorder::Recorder>));
+        let master_meter = engine.lock().unwrap().master_meter.clone(); 
+        let meter_registry = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
-        // Build CPAL stream that pulls from Engine::render
+        let mut runtime = Self {
+            engine,
+            master_gain,
+            session,
+            stream: None,
+            command_tx: Mutex::new(command_tx), 
+            meter_registry,
+            master_meter,
+            recorder,
+        };
+
+        if let Err(e) = runtime.build_and_start_stream(command_rx) {
+            eprintln!("⚠️ Warning: Failed to hook default audio device on startup: {}", e);
+        }
+
+        Ok(runtime)
+    }
+
+    pub fn reload_device(&mut self) -> anyhow::Result<()> {
+        println!("🔄 Reloading Audio Device...");
+        self.stream = None; 
+        let (new_tx, new_rx) = mpsc::sync_channel::<EngineCommand>(1024);
+        
+        if let Ok(mut tx_guard) = self.command_tx.lock() {
+            *tx_guard = new_tx;
+        }
+
+        self.build_and_start_stream(new_rx)?;
+        println!("✅ Audio Device Successfully Reloaded.");
+        Ok(())
+    }
+
+    fn build_and_start_stream(&mut self, command_rx: mpsc::Receiver<EngineCommand>) -> anyhow::Result<()> {
+        let output = setup_output_device()?;
+        let sample_rate = output.output_sample_rate;
+        let device_channels = output.output_channels;
+
+        if let Ok(mut eng) = self.engine.lock() {
+            eng.sample_rate = sample_rate;
+        }
+
+        println!("🔊 AudioRuntime: Device running at {} Hz with {} channels", sample_rate, device_channels);
+
         let device = output.device;
         let config = output.config;
-        let err_fn = |err| eprintln!("AudioRuntime output error: {err}");
-        let engine_cb = engine.clone();
-        let gain_cb = master_gain.clone();
+        let engine_cb = self.engine.clone();
+        let gain_cb = self.master_gain.clone();
 
         let mut scratch_buffer: Vec<f32> = Vec::with_capacity(1024);
         let mut live_scratch: Vec<f32> = Vec::with_capacity(1024);
-        let mut active_monitor: Option<crate::recorder::monitor::Monitor> = None; // <--- Exclusive to audio thread
+        let mut active_monitor: Option<crate::recorder::monitor::Monitor> = None; 
 
-        // We wrap the recorder so the UI and the Audio Thread can both access it
-        let recorder = Arc::new(Mutex::new(None::<crate::recorder::Recorder>));
-
-       // --- NEW: Grab the lock-free reference directly from the Engine ---
-        let master_meter = engine.lock().unwrap().master_meter.clone(); 
+        let err_fn = |err| eprintln!("AudioRuntime stream error: {}", err);
 
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _| {
                 if let Ok(mut eng) = engine_cb.try_lock() {
-
-                    // --- 1. PROCESS AI & UI COMMANDS LOCK-FREE ---
                     while let Ok(cmd) = command_rx.try_recv() {
                         match cmd {
-                            EngineCommand::SetMonitor(m) => active_monitor = Some(m), // <--- Grab ownership
-                            EngineCommand::ClearMonitor => active_monitor = None,     // <--- Drop it
+                            EngineCommand::SetMonitor(m) => active_monitor = Some(m),
+                            EngineCommand::ClearMonitor => active_monitor = None,
                             EngineCommand::Play => eng.play(),
                             EngineCommand::Pause => eng.pause(),
                             EngineCommand::TogglePlay => {
@@ -176,9 +205,7 @@ impl AudioRuntime {
                                 let target_id = eng.tracks().get(idx).map(|t| t.id);
                                 if let Some(tid) = target_id {
                                     for t in eng.tracks_mut() {
-                                        if t.id == tid {
-                                            t.solo = !t.solo;
-                                        }
+                                        if t.id == tid { t.solo = !t.solo; }
                                     }
                                 }
                             }
@@ -188,7 +215,6 @@ impl AudioRuntime {
                         }
                     }
 
-                    // Sync master gain from Runtime -> Engine before render
                     if let Ok(g) = gain_cb.try_lock() {
                         eng.master_gain = *g;
                     }
@@ -196,26 +222,22 @@ impl AudioRuntime {
                     let frames = data.len() / device_channels as usize;
                     if scratch_buffer.len() != frames * 2 {
                         scratch_buffer.resize(frames * 2, 0.0);
-                        live_scratch.resize(frames * 2, 0.0); // <--- NEW
+                        live_scratch.resize(frames * 2, 0.0);
                     }
                     
-                    // --- PROCESS MONITOR LOCK-FREE ---
                     live_scratch.fill(0.0);
                     if let Some(mon) = active_monitor.as_mut() {
                         mon.process_into(&mut live_scratch, 2);
                     }
 
-                    // 5. RENDER STEREO: Engine writes strictly to our 2-channel scratch buffer
                     eng.render(&mut scratch_buffer, &live_scratch);
                 
-                   // 6. MAP CHANNELS: Copy Scratch -> Device Buffer cleanly
                     let mut scratch_idx = 0;
                     for frame in data.chunks_mut(device_channels as usize) {
                         if frame.len() >= 2 {
-                            frame[0] = scratch_buffer[scratch_idx];     // Left
-                            frame[1] = scratch_buffer[scratch_idx + 1]; // Right
+                            frame[0] = scratch_buffer[scratch_idx];    
+                            frame[1] = scratch_buffer[scratch_idx + 1]; 
                         }
-                        // Silence remaining channels
                         for sample in frame.iter_mut().skip(2) {
                             *sample = 0.0;
                         }
@@ -230,20 +252,8 @@ impl AudioRuntime {
         )?;
 
         stream.play()?;
-
-        // --- ADDED: Initialize the meter registry ---
-        let meter_registry = Arc::new(Mutex::new(std::collections::HashMap::new()));
-
-        Ok(Self {
-            engine,
-            master_gain,
-            session,
-            _stream: stream,
-            command_tx, //store the transmitter
-            meter_registry,
-            master_meter,
-            recorder,
-        })
+        self.stream = Some(stream);
+        Ok(())
     }
 
     // --- UNDO / REDO ---
@@ -269,15 +279,15 @@ impl AudioRuntime {
     // --- TRANSPORT ---
 
     pub fn play(&self) {
-        let _ = self.command_tx.try_send(EngineCommand::Play);
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::Play);
     }
 
     pub fn pause(&self) {
-        let _ = self.command_tx.try_send(EngineCommand::Pause);
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::Pause);
     }
 
     pub fn toggle_play(&self) {
-        let _ = self.command_tx.try_send(EngineCommand::TogglePlay);
+       let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::TogglePlay);
     }
 
     pub fn is_playing(&self) -> bool {
@@ -289,7 +299,7 @@ impl AudioRuntime {
     }
 
     pub fn seek(&self, pos: Duration) {
-        let _ = self.command_tx.try_send(EngineCommand::Seek(pos));
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::Seek(pos));
     }
 
     pub fn position(&self) -> Duration {
@@ -421,7 +431,7 @@ impl AudioRuntime {
     }
 
     pub fn set_bpm(&self, bpm: f32) {
-        let _ = self.command_tx.try_send(EngineCommand::SetBpm(bpm));
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetBpm(bpm));
     }
 
     pub fn bpm(&self) -> f32 {
@@ -443,12 +453,12 @@ impl AudioRuntime {
     // --- TRACK CONTROLS ---
 
     pub fn toggle_mute(&self, track_index: usize) {
-        let _ = self.command_tx.try_send(EngineCommand::ToggleMute(track_index));
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::ToggleMute(track_index));
     }
 
     // Non-destructive solo logic
     pub fn toggle_solo(&self, track_index: usize) {
-        let _ = self.command_tx.try_send(EngineCommand::ToggleSolo(track_index));
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::ToggleSolo(track_index));
     }
 
     pub fn solo_track(&self, track_index: usize) {
@@ -456,24 +466,24 @@ impl AudioRuntime {
     }
 
     pub fn clear_solo(&self) {
-        let _ = self.command_tx.try_send(EngineCommand::ClearSolo);
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::ClearSolo);
     }
 
     // Absolute Gain Setter (for Sliders)
     pub fn set_track_gain(&self, track_index: usize, gain: f32) {
-        let _ = self.command_tx.try_send(EngineCommand::SetTrackGain(track_index, gain.clamp(0.0, 2.0)));
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetTrackGain(track_index, gain.clamp(0.0, 2.0)));
     }
 
     // Absolute Pan Setter
     pub fn set_track_pan(&self, track_index: usize, pan: f32) {
-        let _ = self.command_tx.try_send(EngineCommand::SetTrackPan(track_index, pan.clamp(-1.0, 1.0)));
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetTrackPan(track_index, pan.clamp(-1.0, 1.0)));
     }
 
     pub fn set_monitor(&self, monitor: crate::recorder::monitor::Monitor) {
-        let _ = self.command_tx.try_send(EngineCommand::SetMonitor(monitor));
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetMonitor(monitor));
     }
     pub fn clear_monitor(&self) {
-        let _ = self.command_tx.try_send(EngineCommand::ClearMonitor);
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::ClearMonitor);
     }
 
     // Relative Adjusters (Kept for Keyboard Shortcuts in daw_controller)
@@ -583,7 +593,7 @@ impl AudioRuntime {
     }
 
     pub fn update_compressor(&self, track_index: usize, params: CompressorParams) {
-        let _ = self.command_tx.try_send(EngineCommand::UpdateCompressor(track_index, params));
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::UpdateCompressor(track_index, params));
     }
 
     pub fn get_compressor_state(&self, track_index: usize) -> CompressorParams {

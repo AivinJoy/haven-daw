@@ -165,6 +165,13 @@ fn get_output_devices() -> Result<Vec<AudioDeviceInfo>, String> {
 }
 
 #[tauri::command]
+fn reload_audio_device(state: State<AppState>) -> Result<(), String> {
+    let mut audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    audio.reload_device().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn get_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     let host = cpal::default_host();
     
@@ -1597,6 +1604,7 @@ fn main() {
             get_eq_state,
             update_compressor,
             get_compressor_state,
+            reload_audio_device,
             get_output_devices,
             get_input_devices,
             undo,
