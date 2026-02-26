@@ -59,7 +59,9 @@ impl Session {
                 pan: t.pan,
                 muted: t.muted,
                 solo: t.solo,
-                clips, 
+                clips,
+                compressor: Some(t.track_compressor.get_params()), // <--- ADD THIS 
+                eq: Some(t.track_eq.get_state()),
             }    
         }).collect();
 
@@ -98,6 +100,14 @@ impl Session {
                 track.pan = t_state.pan;
                 track.muted = t_state.muted;
                 track.solo = t_state.solo;
+
+                if let Some(comp_params) = t_state.compressor {
+                    track.track_compressor.set_params(comp_params);
+                }
+
+                if let Some(eq_state) = t_state.eq {
+                    track.track_eq.set_state(eq_state);
+                }
                 
                 for clip_state in t_state.clips {
                     let start = std::time::Duration::from_secs_f64(clip_state.start_time);

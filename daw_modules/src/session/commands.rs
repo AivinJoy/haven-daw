@@ -3,6 +3,7 @@
 use crate::engine::{Engine, TrackId};
 use anyhow::Result;
 use crate::effects::equalizer::EqParams;
+use crate::effects::compressor::CompressorParams;
 use std::time::Duration;
 
 /// The Command trait defines an action that can be executed and undone.
@@ -293,4 +294,26 @@ impl Command for UpdateEq {
         Ok(())
     }
     fn name(&self) -> &str { "EQ Change" }
+}
+
+pub struct UpdateCompressor {
+    pub track_id: TrackId,
+    pub old_params: CompressorParams,
+    pub new_params: CompressorParams,
+}
+
+impl Command for UpdateCompressor {
+    fn execute(&self, engine: &mut Engine) -> Result<()> {
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            track.track_compressor.set_params(self.new_params);
+        }
+        Ok(())
+    }
+    fn undo(&self, engine: &mut Engine) -> Result<()> {
+        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
+            track.track_compressor.set_params(self.old_params);
+        }
+        Ok(())
+    }
+    fn name(&self) -> &str { "Compressor Change" }
 }

@@ -10,6 +10,7 @@ pub mod engine;
 pub mod audio_runtime;
 pub mod session;
 pub mod effects;
+pub mod analyzer;
 
 pub mod bpm;
 pub use bpm::{BpmDetector, analyze_bpm_for_file};

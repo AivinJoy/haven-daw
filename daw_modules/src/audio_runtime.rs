@@ -1,6 +1,8 @@
 // src/audio_runtime.rs
 
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::atomic::{Ordering};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
@@ -11,6 +13,39 @@ use crate::engine::Engine;
 use crate::session::{Session, commands::*}; 
 use crate::engine::time::GridLine;
 use crate::effects::equalizer::EqParams; // <--- Import this
+use crate::effects::compressor::CompressorParams;
+use crate::analyzer::AnalysisProfile;
+
+
+// --- ADDED: The Lock-Free AI / UI Command Queue ---
+pub enum EngineCommand {
+    Play,
+    Pause,
+    TogglePlay,
+    Seek(Duration),
+    SetMasterGain(f32),
+    SetBpm(f32),
+    ToggleMute(usize),
+    ToggleSolo(usize),
+    ClearSolo,
+    SetTrackGain(usize, f32),
+    SetTrackPan(usize, f32),
+    UpdateCompressor(usize, CompressorParams),
+    SetMonitor(crate::recorder::monitor::Monitor), // <--- NEW
+    ClearMonitor, // <--- NEW
+}
+
+
+#[derive(serde::Serialize)]
+pub struct MeterSnapshot {
+    pub track_id: u32,
+    pub peak_l: f32,
+    pub peak_r: f32,
+    pub hold_l: f32,
+    pub hold_r: f32,
+    pub rms_l: f32,
+    pub rms_r: f32,
+}
 
 /// Owns Engine + CPAL stream and exposes a simple control API.
 pub struct AudioRuntime {
@@ -18,6 +53,11 @@ pub struct AudioRuntime {
     master_gain: Arc<Mutex<f32>>,
     session: Mutex<Session>,
     _stream: Stream,
+    command_tx: SyncSender<EngineCommand>,
+    // --- ADDED: A safe map of Track ID -> Lock-Free Atomics ---
+    meter_registry: Arc<Mutex<std::collections::HashMap<u32, std::sync::Arc<crate::engine::metering::TrackMeters>>>>,
+    master_meter: Arc<crate::engine::metering::TrackMeters>, // <--- CHANGED TYPE
+    pub recorder: Arc<Mutex<Option<crate::recorder::Recorder>>>, // <--- NEW
 }
 
 pub struct TrackSnapshot {
@@ -43,10 +83,19 @@ pub struct FrontendTrackInfo {
     pub muted: bool,
     pub solo: bool,
     pub clips: Vec<FrontendClipInfo>,
+    pub compressor: Option<CompressorParams>,
+    pub eq: Option<Vec<EqParams>>,
 }
 
 pub struct EngineSnapshot {
     pub tracks: Vec<TrackSnapshot>,
+}
+
+// --- NEW: Struct for AI Context ---
+#[derive(serde::Serialize)]
+pub struct TrackAnalysisPayload {
+    pub track_id: u32,
+    pub analysis: Option<AnalysisProfile>,
 }
 
 impl AudioRuntime {
@@ -71,6 +120,9 @@ impl AudioRuntime {
         let engine = Arc::new(Mutex::new(engine));
         let session = Mutex::new(Session::new());
 
+        // --- ADDED: Initialize the bounded SPSC queue (1024 commands max) ---
+        let (command_tx, command_rx) = mpsc::sync_channel::<EngineCommand>(1024);
+
         // Build CPAL stream that pulls from Engine::render
         let device = output.device;
         let config = output.config;
@@ -79,44 +131,94 @@ impl AudioRuntime {
         let gain_cb = master_gain.clone();
 
         let mut scratch_buffer: Vec<f32> = Vec::with_capacity(1024);
+        let mut live_scratch: Vec<f32> = Vec::with_capacity(1024);
+        let mut active_monitor: Option<crate::recorder::monitor::Monitor> = None; // <--- Exclusive to audio thread
+
+        // We wrap the recorder so the UI and the Audio Thread can both access it
+        let recorder = Arc::new(Mutex::new(None::<crate::recorder::Recorder>));
+
+       // --- NEW: Grab the lock-free reference directly from the Engine ---
+        let master_meter = engine.lock().unwrap().master_meter.clone(); 
 
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _| {
-                if let Ok(mut eng) = engine_cb.lock() {
+                if let Ok(mut eng) = engine_cb.try_lock() {
+
+                    // --- 1. PROCESS AI & UI COMMANDS LOCK-FREE ---
+                    while let Ok(cmd) = command_rx.try_recv() {
+                        match cmd {
+                            EngineCommand::SetMonitor(m) => active_monitor = Some(m), // <--- Grab ownership
+                            EngineCommand::ClearMonitor => active_monitor = None,     // <--- Drop it
+                            EngineCommand::Play => eng.play(),
+                            EngineCommand::Pause => eng.pause(),
+                            EngineCommand::TogglePlay => {
+                                if eng.transport.playing { eng.pause(); } else { eng.play(); }
+                            }
+                            EngineCommand::Seek(pos) => eng.seek(pos),
+                            EngineCommand::SetMasterGain(g) => eng.master_gain = g,
+                            EngineCommand::SetBpm(bpm) => eng.set_bpm(bpm),
+                            EngineCommand::ToggleMute(idx) => {
+                                if let Some(t) = eng.tracks_mut().get_mut(idx) { t.muted = !t.muted; }
+                            }
+                            EngineCommand::SetTrackGain(idx, gain) => {
+                                if let Some(t) = eng.tracks_mut().get_mut(idx) { t.gain = gain; }
+                            }
+                            EngineCommand::SetTrackPan(idx, pan) => {
+                                if let Some(t) = eng.tracks_mut().get_mut(idx) { t.pan = pan; }
+                            }
+                            EngineCommand::UpdateCompressor(idx, params) => {
+                                if let Some(t) = eng.tracks_mut().get_mut(idx) {
+                                    t.track_compressor.set_params(params);
+                                }
+                            }
+                            EngineCommand::ToggleSolo(idx) => {
+                                let target_id = eng.tracks().get(idx).map(|t| t.id);
+                                if let Some(tid) = target_id {
+                                    for t in eng.tracks_mut() {
+                                        if t.id == tid {
+                                            t.solo = !t.solo;
+                                        }
+                                    }
+                                }
+                            }
+                            EngineCommand::ClearSolo => {
+                                for t in eng.tracks_mut() { t.solo = false; }
+                            }
+                        }
+                    }
+
                     // Sync master gain from Runtime -> Engine before render
-                    if let Ok(g) = gain_cb.lock() {
+                    if let Ok(g) = gain_cb.try_lock() {
                         eng.master_gain = *g;
                     }
-                    // 3. CALCULATE FRAMES: How many "moments in time" are in this buffer?
+                    
                     let frames = data.len() / device_channels as usize;
-                    // 4. PREPARE SCRATCH: Resize to hold exactly 2 samples per frame (Stereo)
                     if scratch_buffer.len() != frames * 2 {
                         scratch_buffer.resize(frames * 2, 0.0);
+                        live_scratch.resize(frames * 2, 0.0); // <--- NEW
+                    }
+                    
+                    // --- PROCESS MONITOR LOCK-FREE ---
+                    live_scratch.fill(0.0);
+                    if let Some(mon) = active_monitor.as_mut() {
+                        mon.process_into(&mut live_scratch, 2);
                     }
 
                     // 5. RENDER STEREO: Engine writes strictly to our 2-channel scratch buffer
-                    eng.render(&mut scratch_buffer);
-
-                    // 6. MAP CHANNELS: Copy Scratch -> Device Buffer
+                    eng.render(&mut scratch_buffer, &live_scratch);
+                
+                   // 6. MAP CHANNELS: Copy Scratch -> Device Buffer cleanly
                     let mut scratch_idx = 0;
-                    // Process the device buffer in chunks (one chunk = one time frame across all channels)
                     for frame in data.chunks_mut(device_channels as usize) {
-
-                        // Fast copy of Left and Right
-                        let l = scratch_buffer[scratch_idx];
-                        let r = scratch_buffer[scratch_idx + 1];
-
                         if frame.len() >= 2 {
-                            frame[0] = l; // Channel 1 (Left)
-                            frame[1] = r; // Channel 2 (Right)
+                            frame[0] = scratch_buffer[scratch_idx];     // Left
+                            frame[1] = scratch_buffer[scratch_idx + 1]; // Right
                         }
-
-                        // Silence remaining channels (3, 4, 5, 6, 7, 8...)
+                        // Silence remaining channels
                         for sample in frame.iter_mut().skip(2) {
                             *sample = 0.0;
                         }
-
                         scratch_idx += 2;
                     }
                 } else {
@@ -129,11 +231,18 @@ impl AudioRuntime {
 
         stream.play()?;
 
+        // --- ADDED: Initialize the meter registry ---
+        let meter_registry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
         Ok(Self {
             engine,
             master_gain,
             session,
             _stream: stream,
+            command_tx, //store the transmitter
+            meter_registry,
+            master_meter,
+            recorder,
         })
     }
 
@@ -160,25 +269,15 @@ impl AudioRuntime {
     // --- TRANSPORT ---
 
     pub fn play(&self) {
-        if let Ok(mut eng) = self.engine.lock() {
-            eng.play();
-        }
+        let _ = self.command_tx.try_send(EngineCommand::Play);
     }
 
     pub fn pause(&self) {
-        if let Ok(mut eng) = self.engine.lock() {
-            eng.pause();
-        }
+        let _ = self.command_tx.try_send(EngineCommand::Pause);
     }
 
     pub fn toggle_play(&self) {
-        if let Ok(mut eng) = self.engine.lock() {
-            if eng.transport.playing {
-                eng.pause();
-            } else {
-                eng.play();
-            }
-        }
+        let _ = self.command_tx.try_send(EngineCommand::TogglePlay);
     }
 
     pub fn is_playing(&self) -> bool {
@@ -190,9 +289,7 @@ impl AudioRuntime {
     }
 
     pub fn seek(&self, pos: Duration) {
-        if let Ok(mut eng) = self.engine.lock() {
-            eng.seek(pos);
-        }
+        let _ = self.command_tx.try_send(EngineCommand::Seek(pos));
     }
 
     pub fn position(&self) -> Duration {
@@ -296,6 +393,19 @@ impl AudioRuntime {
 
     // --- GLOBAL SETTINGS ---
 
+    // --- GLOBAL SETTINGS ---
+
+    // --- GLOBAL SETTINGS ---
+
+    pub fn get_master_meter(&self) -> (f32, f32, f32, f32) {
+        // FIX: Pull hold_l/hold_r (decayed) instead of peak_l/peak_r (instant)
+        let p_l = f32::from_bits(self.master_meter.hold_l.load(Ordering::Relaxed));
+        let p_r = f32::from_bits(self.master_meter.hold_r.load(Ordering::Relaxed));
+        let r_l = f32::from_bits(self.master_meter.rms_l.load(Ordering::Relaxed));
+        let r_r = f32::from_bits(self.master_meter.rms_r.load(Ordering::Relaxed));
+        (p_l, p_r, r_l, r_r)
+    }
+
     pub fn set_master_gain(&self, gain: f32) {
         if let Ok(mut g) = self.master_gain.lock() {
             *g = gain.clamp(0.0, 2.0);
@@ -311,9 +421,7 @@ impl AudioRuntime {
     }
 
     pub fn set_bpm(&self, bpm: f32) {
-        if let Ok(mut eng) = self.engine.lock() {
-            eng.set_bpm(bpm);
-        }
+        let _ = self.command_tx.try_send(EngineCommand::SetBpm(bpm));
     }
 
     pub fn bpm(&self) -> f32 {
@@ -335,38 +443,12 @@ impl AudioRuntime {
     // --- TRACK CONTROLS ---
 
     pub fn toggle_mute(&self, track_index: usize) {
-        let (track_id, current_mute) = {
-            let eng = self.engine.lock().unwrap();
-            if let Some(t) = eng.tracks().get(track_index) {
-                (t.id, t.muted)
-            } else { return; }
-        };
-
-        let cmd = Box::new(SetTrackMute {
-            track_id,
-            new_state: !current_mute,
-        });
-
-        if let Ok(mut session) = self.session.lock() {
-            let _ = session.apply(&self.engine, cmd);
-            println!("Track {} mute toggled", track_index);
-        }
+        let _ = self.command_tx.try_send(EngineCommand::ToggleMute(track_index));
     }
 
     // Non-destructive solo logic
     pub fn toggle_solo(&self, track_index: usize) {
-        let track_id = {
-            let eng = self.engine.lock().unwrap();
-            eng.tracks().get(track_index).map(|t| t.id)
-        };
-
-        if let Some(tid) = track_id {
-            let cmd = Box::new(ToggleSolo { track_id: tid });
-            if let Ok(mut session) = self.session.lock() {
-                let _ = session.apply(&self.engine, cmd);
-                println!("Track {} solo toggled", track_index);
-            }
-        }
+        let _ = self.command_tx.try_send(EngineCommand::ToggleSolo(track_index));
     }
 
     pub fn solo_track(&self, track_index: usize) {
@@ -374,53 +456,24 @@ impl AudioRuntime {
     }
 
     pub fn clear_solo(&self) {
-        if let Ok(mut eng) = self.engine.lock() {
-            for track in eng.tracks_mut().iter_mut() {
-                track.solo = false;
-                // Note: We don't clear muted here, only solo
-            }
-            println!("Solo cleared");
-        }
+        let _ = self.command_tx.try_send(EngineCommand::ClearSolo);
     }
 
     // Absolute Gain Setter (for Sliders)
     pub fn set_track_gain(&self, track_index: usize, gain: f32) {
-        let (track_id, old_gain) = {
-            let eng = self.engine.lock().unwrap();
-            if let Some(t) = eng.tracks().get(track_index) {
-                (t.id, t.gain)
-            } else { return; }
-        };
-
-        let cmd = Box::new(SetTrackGain {
-            track_id,
-            old_gain,
-            new_gain: gain.clamp(0.0, 2.0),
-        });
-
-        if let Ok(mut session) = self.session.lock() {
-            let _ = session.apply(&self.engine, cmd);
-        }
+        let _ = self.command_tx.try_send(EngineCommand::SetTrackGain(track_index, gain.clamp(0.0, 2.0)));
     }
 
     // Absolute Pan Setter
     pub fn set_track_pan(&self, track_index: usize, pan: f32) {
-        let (track_id, old_pan) = {
-            let eng = self.engine.lock().unwrap();
-            if let Some(t) = eng.tracks().get(track_index) {
-                (t.id, t.pan)
-            } else { return; }
-        };
+        let _ = self.command_tx.try_send(EngineCommand::SetTrackPan(track_index, pan.clamp(-1.0, 1.0)));
+    }
 
-        let cmd = Box::new(SetTrackPan {
-            track_id,
-            old_pan,
-            new_pan: pan.clamp(-1.0, 1.0),
-        });
-
-        if let Ok(mut session) = self.session.lock() {
-            let _ = session.apply(&self.engine, cmd);
-        }
+    pub fn set_monitor(&self, monitor: crate::recorder::monitor::Monitor) {
+        let _ = self.command_tx.try_send(EngineCommand::SetMonitor(monitor));
+    }
+    pub fn clear_monitor(&self) {
+        let _ = self.command_tx.try_send(EngineCommand::ClearMonitor);
     }
 
     // Relative Adjusters (Kept for Keyboard Shortcuts in daw_controller)
@@ -529,6 +582,27 @@ impl AudioRuntime {
         Vec::new()
     }
 
+    pub fn update_compressor(&self, track_index: usize, params: CompressorParams) {
+        let _ = self.command_tx.try_send(EngineCommand::UpdateCompressor(track_index, params));
+    }
+
+    pub fn get_compressor_state(&self, track_index: usize) -> CompressorParams {
+        if let Ok(eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks().get(track_index) {
+                return track.track_compressor.get_params();
+            }
+        }
+        // Fallback default if track isn't found
+        CompressorParams {
+            is_active: false,
+            threshold_db: -20.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 50.0,
+            makeup_gain_db: 0.0,
+        }
+    }
+
     // FIX: Corrected Reset Methods (No Delta, Just Reset)
     pub fn reset_track_gain(&self, track_index: usize) {
         self.set_track_gain(track_index, 1.0);
@@ -582,6 +656,8 @@ impl AudioRuntime {
                 muted: t.muted,
                 solo: t.solo,
                 clips, // Add the list of clips
+                compressor: Some(t.track_compressor.get_params()),
+                eq: Some(t.track_eq.get_state()),
             }
         }).collect();
 
@@ -608,6 +684,15 @@ impl AudioRuntime {
 
     pub fn get_tracks_list(&self) -> Vec<FrontendTrackInfo> {
         if let Ok(eng) = self.engine.lock() {
+
+            // --- ADDED: Sync the registry quietly whenever the UI asks for track data ---
+            if let Ok(mut reg) = self.meter_registry.lock() {
+                reg.clear();
+                for t in eng.tracks() {
+                    reg.insert(t.id.0, t.meters.clone());
+                }
+            }
+
             eng.tracks().iter().map(|t| {
                 // Map the clips
                 let clips = t.clips.iter().map(|c| FrontendClipInfo {
@@ -626,6 +711,8 @@ impl AudioRuntime {
                     muted: t.muted,
                     solo: t.solo,
                     clips, // <--- Add the clips here
+                    compressor: Some(t.track_compressor.get_params()),
+                    eq: Some(t.track_eq.get_state()),
                 }
             }).collect()
         } else {
@@ -676,5 +763,47 @@ impl AudioRuntime {
             return Err(format!("Track ID {} not found", track_id));
         }
         Err("Failed to lock engine".to_string())
+    }
+
+    // --- ADD NEW METHOD TO AUDIORUNTIME ---
+    pub fn get_meters(&self) -> Vec<MeterSnapshot> {
+        let mut results = Vec::new();
+        // UI thread quickly locks the registry map (NOT the engine)
+        if let Ok(reg) = self.meter_registry.lock() {
+            for (&track_id, meters) in reg.iter() {
+                // Instantly read the lock-free atomics
+                results.push(MeterSnapshot {
+                    track_id,
+                    peak_l: f32::from_bits(meters.peak_l.load(std::sync::atomic::Ordering::Relaxed)),
+                    peak_r: f32::from_bits(meters.peak_r.load(std::sync::atomic::Ordering::Relaxed)),
+                    hold_l: f32::from_bits(meters.hold_l.load(std::sync::atomic::Ordering::Relaxed)),
+                    hold_r: f32::from_bits(meters.hold_r.load(std::sync::atomic::Ordering::Relaxed)),
+                    rms_l: f32::from_bits(meters.rms_l.load(std::sync::atomic::Ordering::Relaxed)),
+                    rms_r: f32::from_bits(meters.rms_r.load(std::sync::atomic::Ordering::Relaxed)),
+                });
+            }
+        }
+        results
+    }
+
+    // --- NEW: Expose offline analysis data for AI ---
+    pub fn get_all_track_analysis(&self) -> Vec<TrackAnalysisPayload> {
+        let mut results = Vec::new();
+        if let Ok(eng) = self.engine.lock() {
+            for t in eng.tracks() {
+                // Safely lock the analysis profile. If it's still computing, it will return None.
+                let profile = if let Ok(guard) = t.analysis.lock() {
+                    guard.clone()
+                } else {
+                    None
+                };
+                
+                results.push(TrackAnalysisPayload {
+                    track_id: t.id.0,
+                    analysis: profile,
+                });
+            }
+        }
+        results
     }
 }

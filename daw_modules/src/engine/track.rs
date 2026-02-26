@@ -18,6 +18,9 @@ use ringbuf::SharedRb;
 use crate::decoder::{spawn_decoder_with_ctrl, DecoderCmd};
 use crate::bpm::adapter;
 use crate::effects::equalizer::TrackEq;
+use crate::effects::compressor::CompressorNode;
+use crate::engine::metering::{MeterState, TrackMeters}; // <--- ADD IMPORT
+use crate::analyzer::AnalysisProfile;
 
 /// Identifier for a track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -312,6 +315,10 @@ pub struct Track {
     state: TrackState,
     pub clips: Vec<Clip>,
     pub track_eq: TrackEq,
+    pub track_compressor: CompressorNode,
+    pub meters: std::sync::Arc<TrackMeters>, // <--- Shared with UI
+    meter_state: MeterState,                 // <--- Owned by Audio Thread
+    pub analysis: Arc<std::sync::Mutex<Option<AnalysisProfile>>>,
     // --- Track Start Time (for Drag & Drop) ---
 }
 
@@ -367,6 +374,10 @@ impl Track {
             state: TrackState::Stopped,
             clips: Vec::new(),
             track_eq: TrackEq::new(sample_rate, channels),
+            track_compressor: CompressorNode::new(sample_rate as f32),
+            meters: TrackMeters::new(),                       // <--- ADDED
+            meter_state: MeterState::new(sample_rate as f32), // <--- ADDED
+            analysis: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -380,6 +391,10 @@ impl Track {
         current_time: Option<Duration> // <--- NEW ARGUMENT
     ) -> anyhow::Result<()> {
         
+
+        // ✅ Clone the path FIRST, before `Clip::new` eats it
+        let file_path = path.clone();
+
         // 1. Create the clip
         // Note: Clip::new defaults to full length. 
         // If you are calling this from a loader, use 'restore_clip' instead!
@@ -396,6 +411,20 @@ impl Track {
         }
 
         self.clips.push(clip);
+        // --- NEW: Trigger Background Analysis ---
+        // --- NEW: Trigger Background Analysis ---
+        let analysis_ref = Arc::clone(&self.analysis);
+        std::thread::spawn(move || {
+            println!("🔍 Starting background analysis for: {}", file_path);
+            if let Ok((samples, source_sr, source_ch)) = crate::bpm::adapter::decode_to_vec(&file_path) {
+                let profile = crate::analyzer::analyze_audio_buffer(&samples, source_ch, source_sr);
+                if let Ok(mut guard) = analysis_ref.lock() {
+                    *guard = Some(profile);
+                }
+                println!("✅ Analysis complete for: {}", file_path);
+            }
+        });
+
         Ok(())
     }
     
@@ -639,6 +668,8 @@ impl Track {
         // We do this BEFORE gain/pan so the EQ is "Pre-Fader" (standard mixing practice)
         if active_clips > 0 {
            self.track_eq.process_buffer(dst, channels);
+
+           self.track_compressor.process(dst);
         }
 
         // Apply Gain/Pan only if we actually mixed something
@@ -666,6 +697,9 @@ impl Track {
             }
         }
 
+        // --- ADDED: Calculate meters exactly as they sound post-fader ---
+        self.meter_state.process_block(dst, channels, &self.meters);
+
         dst.len() / channels
     }
     // --- ADD THIS NEW METHOD ---
@@ -679,6 +713,10 @@ impl Track {
         out_sr: u32,
         out_ch: usize
     ) -> anyhow::Result<()> {
+
+        // ✅ Clone the path FIRST
+        let file_path = path.clone();
+
         // Use the new recover method
         let clip = Clip::recover(
             path, start, offset, dur, out_sr, out_ch
@@ -689,6 +727,18 @@ impl Track {
         } else {
             self.clips.push(clip);
         }
+
+        // --- NEW: Trigger Background Analysis on Load ---
+        let analysis_ref = Arc::clone(&self.analysis);
+        std::thread::spawn(move || {
+            if let Ok((samples, source_sr, source_ch)) = crate::bpm::adapter::decode_to_vec(&file_path) {
+                let profile = crate::analyzer::analyze_audio_buffer(&samples, source_ch, source_sr);
+                if let Ok(mut guard) = analysis_ref.lock() {
+                    *guard = Some(profile);
+                }
+            }
+        });
+
         println!("♻️ Restored clip at index {}", index);
         Ok(())
     }

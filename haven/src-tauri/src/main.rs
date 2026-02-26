@@ -444,9 +444,14 @@ struct RecordingState {
 #[tauri::command]
 fn start_recording(path: String, state: State<AppState>) -> Result<(), String> {
     let mut rec_guard = state.recorder.lock().map_err(|_| "Failed to lock recorder")?;
+    let mut new_recorder = Recorder::start(PathBuf::from(path)).map_err(|e| e.to_string())?;
     
-    // Use the path provided by the frontend
-    let new_recorder = Recorder::start(PathBuf::from(path)).map_err(|e| e.to_string())?;
+    // Detach the monitor and send it to the Audio Thread natively!
+    if let Some(monitor) = new_recorder.monitor.take() {
+        if let Ok(audio) = state.audio.lock() {
+            audio.set_monitor(monitor);
+        }
+    }
     
     *rec_guard = Some(new_recorder);
     Ok(())
@@ -494,6 +499,10 @@ fn stop_recording(state: State<AppState>) -> Result<(), String> {
     if let Some(rec) = rec_guard.take() {
         rec.stop();
     }
+    // Tell the audio thread to drop the monitor connection
+    if let Ok(audio) = state.audio.lock() {
+        audio.clear_monitor();
+    }
     Ok(())
 }
 
@@ -519,10 +528,46 @@ fn set_track_gain(track_id: u32, gain: f32, state: State<AppState>) -> Result<()
 }
 
 #[tauri::command]
+fn get_master_gain(state: tauri::State<AppState>) -> Result<f32, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    Ok(audio.master_gain())
+}
+
+#[tauri::command]
 fn set_master_gain(gain: f32, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
     audio.set_master_gain(gain);
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct MasterMeterState {
+    peak_l: f32,
+    peak_r: f32,
+    rms_l: f32,
+    rms_r: f32,
+}
+
+#[tauri::command]
+fn get_master_meter(state: tauri::State<AppState>) -> Result<MasterMeterState, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    
+    // NOTE: Update your AudioRuntime::get_master_meter() to return a 4-tuple: 
+    // (peak_l, peak_r, rms_l, rms_r) decoded from the atomic bits
+    let (peak_l, peak_r, rms_l, rms_r) = audio.get_master_meter();
+    
+    Ok(MasterMeterState {
+        peak_l,
+        peak_r,
+        rms_l,
+        rms_r,
+    })
+}
+
+#[tauri::command]
+fn get_track_meters(state: tauri::State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    Ok(audio.get_meters())
 }
 
 #[tauri::command]
@@ -626,6 +671,19 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
         muted: false,
         solo: false
     })
+}
+
+#[tauri::command]
+fn get_all_meters(state: State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    Ok(audio.get_meters())
+}
+
+// --- NEW: Tauri command for AI analysis ---
+#[tauri::command]
+fn get_track_analysis(state: State<AppState>) -> Result<Vec<daw_modules::audio_runtime::TrackAnalysisPayload>, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    Ok(audio.get_all_track_analysis())
 }
 
 #[tauri::command]
@@ -748,6 +806,35 @@ fn get_eq_state(track_id: u32, state: State<AppState>) -> Result<Vec<daw_modules
     let index = resolve_track_index(&list, track_id)?;
 
     Ok(audio.get_eq_state(index))
+}
+
+#[tauri::command]
+fn update_compressor(
+    track_id: u32, 
+    params: daw_modules::effects::compressor::CompressorParams, 
+    state: State<AppState>
+) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+    
+    // Note: You will need to add this wrapper method to audio_runtime.rs / engine.rs 
+    // exactly like you did for 'audio.update_eq(...)'!
+    audio.update_compressor(index, params);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_compressor_state(
+    track_id: u32, 
+    state: State<AppState>
+) -> Result<daw_modules::effects::compressor::CompressorParams, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock engine")?;
+    let list = audio.get_tracks_list();
+    let index = resolve_track_index(&list, track_id)?;
+
+    // Note: You will need to add this wrapper method to audio_runtime.rs / engine.rs
+    Ok(audio.get_compressor_state(index))
 }
 
 #[tauri::command]
@@ -964,44 +1051,66 @@ async fn ask_ai(
         {{ \n\
           \"steps\": [ \n\
             {{ \n\
-              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"none\", \n\
+              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"unmute\" | \"unsolo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"update_eq\" | \"update_compressor\" | \"none\", \n\
               \"parameters\": {{ \n\
-                \"track_id\": number (optional), \n\
+                \"track_id\": number (optional, default to 0), \n\
                 \"value\": number (optional), \n\
                 \"time\": number (optional), \n\
                 \"mute_original\": boolean (optional), \n\
                 \"replace_original\": boolean (optional), \n\
-                \"job_id\": string (optional) \n\
+                \"job_id\": string (optional), \n\
+                \"band_index\": number (optional, 0-3), \n\
+                \"filter_type\": \"LowPass\" | \"HighPass\" | \"Peaking\" | \"LowShelf\" | \"HighShelf\" | \"Notch\" | \"BandPass\" (optional), \n\
+                \"freq\": number (optional), \n\
+                \"q\": number (optional), \n\
+                \"gain\": number (optional, -24.0 to 24.0), \n\
+                \"threshold_db\": number (optional, -60.0 to 0.0), \n\
+                \"ratio\": number (optional, 1.0 to 20.0), \n\
+                \"attack_ms\": number (optional), \n\
+                \"release_ms\": number (optional), \n\
+                \"makeup_gain_db\": number (optional) \n\
               }} \n\
             }} \n\
           ], \n\
-          \"message\": \"Short confirmation text\" \n\
+          \"message\": \"Short confirmation text or detailed conversational answer\" \n\
         }}\n\
         \n\
         RULES:\n\
-        1. OUTPUT RAW JSON ONLY. Do not use markdown formatting (no ```json). Do not include any text outside the braces.\n\
-        2. GAIN/VOLUME SCALE:\n\
-            - Range is 0.0 (Silence) to 2.0 (Max Volume).\n\
-            - 1.0 is Unity/Default gain.\n\
-            - If user says 'Max', use 2.0.\n\
-            - If user says 'Half', use 1.0.\n\
-        3. RESET LOGIC: When asked to 'Reset' a track or 'Reset Everything', you must neutralize all active states:\n\
-           - GAIN: Always set to 1.0.\n\
-           - PAN: Always set to 0.0.\n\
-           - MUTE: If context shows 'muted: true', generate 'toggle_mute'.\n\
-           - SOLO: If context shows 'solo: true', generate 'toggle_solo'.\n\
-           - MONITOR: If context shows 'monitoring: true' (or 'is_monitoring: true'), generate 'toggle_monitor'.\n\
-        4. SPECIFIC RESETS: If user says 'Reset monitoring', ONLY toggle monitoring if it is currently true.\n\
-        5. Track IDs: Use the numeric IDs provided in the context.\n\
-        6. SEPARATION CLARIFICATION:\n\
-           - If the user asks to 'separate', 'split', or 'extract' stems AND has NOT specified what to do with the original track:\n\
-             Output \"action\": \"none\" and \"message\": \"Should I mute the original track or replace it?\"\n\
-           - If the user says 'Mute' or 'Mute it':\n\
-             Output \"action\": \"separate_stems\", \"parameters\": {{ \"track_id\": <CONTEXT_ID>, \"mute_original\": true }}\n\
-           - If the user says 'Replace' or 'Replace it' (meaning delete original):\n\
-             Output \"action\": \"separate_stems\", \"parameters\": {{ \"track_id\": <CONTEXT_ID>, \"replace_original\": true }}\n\
+        1. CRITICAL: YOU MUST OUTPUT A VALID JSON OBJECT. NO PLAIN TEXT.\n\
+        2. STRICT DATA TYPES (PREVENT API CRASH): \n\
+           - For 'value', 'track_id', and all numerical fields, YOU MUST USE REAL NUMBERS (e.g., 1.0, -1.0, 0). \n\
+           - NEVER use strings like \"full\", \"max\", \"left\", or \"right\" for numbers. \n\
+           - If the user does not specify a track number, you MUST assume \"track_id\": 0.\n\
+           - NEVER output a parameter with a 'null' value. If a parameter is not needed, omit the key completely.\n\
+        3. CONVERSATION VS COMMANDS:\n\
+           - If user ASKS A QUESTION: Use action \"none\" and put the answer in \"message\".\n\
+           - If user ISSUES A COMMAND: Use the correct action ('set_gain', 'set_pan', etc.). NEVER use \"none\" for a command.\n\
+        4. GAIN/VOLUME SCALE:\n\
+            - Range is 0.0 (Silence) to 2.0 (Max Volume). 1.0 is Unity.\n\
+            - If user says 'max volume', use 'set_gain' with \"value\": 2.0.\n\
+            - If user says 'half volume', use 'set_gain' with \"value\": 0.5.\n\
+        5. PAN SCALE:\n\
+            - Range is -1.0 (Full Left) to 1.0 (Full Right). 0.0 is Center.\n\
+            - If user says 'pan right' or 'right pan full', use 'set_pan' with \"value\": 1.0.\n\
+            - If user says 'pan left' or 'left pan full', use 'set_pan' with \"value\": -1.0.\n\
+        6. MUTE & SOLO LOGIC:\n\
+            - Use 'toggle_mute', 'unmute', 'toggle_solo', or 'unsolo' as actions where appropriate.\n\
+        7. RESET LOGIC (CRITICAL FOR MUTE/SOLO): When asked to 'Reset' a track or 'Reset Everything', you must neutralize active states by outputting multiple steps:\n\
+           - ALWAYS include 'set_gain' with \"value\": 1.0.\n\
+           - ALWAYS include 'set_pan' with \"value\": 0.0.\n\
+           - DO NOT include 'unmute' UNLESS the context explicitly says 'muted: true'.\n\
+           - DO NOT include 'unsolo' UNLESS the context explicitly says 'solo: true'.\n\
+        8. EQ & COMPRESSION LOGIC:\n\
+           - To EQ, use 'update_eq'. Bands: 0=Lows, 1=LowMids, 2=HighMids, 3=Highs. Default Q is 1.0.\n\
+           - To Compress, use 'update_compressor'. Standard: threshold -20.0, ratio 4.0, attack 5.0, release 50.0.\n\
+        \n\
+        EXAMPLES OF CORRECT BEHAVIOR:\n\
+        User: \"max the volume of track 0\"\n\
+        Assistant: {{\"steps\": [{{\"action\": \"set_gain\", \"parameters\": {{\"track_id\": 0, \"value\": 2.0}}}}], \"message\": \"Track 0 volume set to maximum.\"}}\n\
+        \n\
+        User: \"reset track 0\" (Assume context says muted: false, solo: false)\n\
+        Assistant: {{\"steps\": [{{\"action\": \"set_gain\", \"parameters\": {{\"track_id\": 0, \"value\": 1.0}}}}, {{\"action\": \"set_pan\", \"parameters\": {{\"track_id\": 0, \"value\": 0.0}}}}], \"message\": \"Track 0 reset.\"}}\n\
         ",
-        
         track_context, user_input
     );
 
@@ -1032,7 +1141,7 @@ async fn ask_ai(
 
     // 4. Construct Request Payload
     let payload = serde_json::json!({
-        "model":   "qwen/qwen3-32b", //"qwen-2.5-72b-instruct",  //"llama3-70b-8192", // Fast & Good at JSON
+        "model":   "llama-3.3-70b-versatile",  //"qwen/qwen3-32b", //"qwen-2.5-72b-instruct",  //"llama3-70b-8192", // Fast & Good at JSON
         "messages": messages_payload,
         "response_format": { "type": "json_object" },
 
@@ -1469,11 +1578,16 @@ fn main() {
             toggle_mute,
             toggle_solo,
             set_master_gain,
+            get_master_gain,
+            get_master_meter,
+            get_track_meters,
             save_project,
             load_project,
             export_project,
             get_temp_path,
             add_clip,
+            get_all_meters,
+            get_track_analysis,
             split_clip,
             get_project_state,
             merge_clip_with_next,
@@ -1481,6 +1595,8 @@ fn main() {
             delete_track,
             update_eq,
             get_eq_state,
+            update_compressor,
+            get_compressor_state,
             get_output_devices,
             get_input_devices,
             undo,

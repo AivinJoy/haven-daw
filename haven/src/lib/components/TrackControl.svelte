@@ -1,3 +1,5 @@
+<!-- haven\src\lib\components\TrackControl.svelte -->
+
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { Mic, Headphones, MoreVertical, Volume2, Ear } from 'lucide-svelte';
@@ -97,82 +99,81 @@
     <div class={`absolute left-0 top-0 bottom-0 w-1 ${color} opacity-80 shadow-[0_0_15px_${color.replace('bg-', '')}]`}></div>
 
     <div class="flex items-center w-full gap-3 pl-2">
-      <span class="text-white/30 font-mono text-[10px] select-none shrink-0">{id.toString().padStart(2, '0')}</span>
+        <span class="text-white/30 font-mono text-[10px] select-none shrink-0">{id.toString().padStart(2, '0')}</span>
+        
+        <div class="opacity-80 shrink-0">
+            {@render MusicIconType({ src: source })}
+        </div>
+      
+        <input 
+            type="text" 
+            bind:value={name} 
+            class="bg-transparent border-none text-white/90 text-sm font-bold flex-1 min-w-0 focus:ring-0 p-0 placeholder-white/20 focus:outline-none"
+        />
 
-      <div class="opacity-80 shrink-0">
-          {@render MusicIconType({ src: source })}
-      </div>
-
-      <input 
-          type="text" 
-          bind:value={name} 
-          class="bg-transparent border-none text-white/90 text-sm font-bold flex-1 min-w-0 focus:ring-0 p-0 placeholder-white/20 focus:outline-none"
-      />
-
-      <div class="flex items-center gap-1 shrink-0 ml-auto">
-          {#if source === 'mic'}
+        <div class="flex items-center gap-1 shrink-0 ml-auto">
+              {#if source === 'mic'}
+                  <button 
+                      onclick={() => onmonitor()} 
+                      class={`w-6 h-6 rounded flex items-center justify-center border transition-all ${monitor ? 'bg-emerald-500/20 border-emerald-500 text-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'border-white/10 text-white/40 hover:border-white/30 hover:text-white/70'}`}
+                      title="Input Monitor (Hear yourself)"
+                  >
+                      <Ear size={14} />
+                  </button>
+              {/if}
               <button 
-                  onclick={() => onmonitor()} 
-                  class={`w-6 h-6 rounded flex items-center justify-center border transition-all ${monitor ? 'bg-emerald-500/20 border-emerald-500 text-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'border-white/10 text-white/40 hover:border-white/30 hover:text-white/70'}`}
-                  title="Input Monitor (Hear yourself)"
+                  onclick={toggleMute}
+                  class={`w-6 h-6 rounded text-[9px] font-bold border transition-all ${muted ? 'bg-red-500/20 border-red-500 text-red-500 shadow-[0_0_8px_rgba(220,38,38,0.4)]' : 'border-white/10 text-white/40 hover:border-white/30 hover:text-white/70'}`}
+              >M</button>
+
+              <button 
+                  onclick={toggleSolo}
+                  class={`w-6 h-6 rounded text-[9px] font-bold border transition-all ${solo ? 'bg-yellow-500/20 border-yellow-500 text-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.4)]' : 'border-white/10 text-white/40 hover:border-white/30 hover:text-white/70'}`}
+              >S</button>
+
+              <button 
+                  onclick={(e) => onmenu(e)} 
+                  class="w-6 h-6 flex items-center justify-center text-white/20 hover:text-white transition-colors" 
+                  aria-label="Track Settings"
               >
-                  <Ear size={14} />
+                  <MoreVertical size={14} />
               </button>
-          {/if}
-          <button 
-              onclick={toggleMute}
-              class={`w-6 h-6 rounded text-[9px] font-bold border transition-all ${muted ? 'bg-red-500/20 border-red-500 text-red-500 shadow-[0_0_8px_rgba(220,38,38,0.4)]' : 'border-white/10 text-white/40 hover:border-white/30 hover:text-white/70'}`}
-          >M</button>
-            
-          <button 
-              onclick={toggleSolo}
-              class={`w-6 h-6 rounded text-[9px] font-bold border transition-all ${solo ? 'bg-yellow-500/20 border-yellow-500 text-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.4)]' : 'border-white/10 text-white/40 hover:border-white/30 hover:text-white/70'}`}
-          >S</button>
-            
-          <button 
-              onclick={(e) => onmenu(e)} 
-              class="w-6 h-6 flex items-center justify-center text-white/20 hover:text-white transition-colors" 
-              aria-label="Track Settings"
-          >
-              <MoreVertical size={14} />
-          </button>
-      </div>
+        </div>
     </div>
 
     <div class="flex items-center w-full pl-2 gap-[38px]">
 
-      <div class="flex items-center gap-3">
-          <Volume2 size={14} class="text-white/30 shrink-0" />
+        <div class="flex items-center gap-3">
+            <Volume2 size={14} class="text-white/30 shrink-0" />
 
-          <input 
-              type="range" min="0" max="100" 
-              value={volumeSlider}
-              oninput={updateVolume}
-              ondblclick={resetVolume}
-              style="background: linear-gradient(to right, {trackColorHex} 0%, {trackColorHex} {volumeSlider}%, rgba(255,255,255,0.1) {volumeSlider}%, rgba(255,255,255,0.1) 100%);"
-              class="w-28 h-1 rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white/80 [&::-webkit-slider-thumb]:shadow-[0_0_5px_white] hover:[&::-webkit-slider-thumb]:bg-white"
-          />
-      </div>
+            <input 
+                type="range" min="0" max="100" 
+                value={volumeSlider}
+                oninput={updateVolume}
+                ondblclick={resetVolume}
+                style="background: linear-gradient(to right, {trackColorHex} 0%, {trackColorHex} {volumeSlider}%, rgba(255,255,255,0.1) {volumeSlider}%, rgba(255,255,255,0.1) 100%);"
+                class="w-28 h-1 rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white/80 [&::-webkit-slider-thumb]:shadow-[0_0_5px_white] hover:[&::-webkit-slider-thumb]:bg-white"
+            />
+        </div>
 
-      <div class="flex flex-col items-center justify-center gap-0.5 w-10 shrink-0 scale-75 origin-right mr-1">
-         <Knob 
-            value={pan} 
-            min={-1.0} 
-            max={1.0} 
-            step={0.05} 
-            size="sm"
-            bipolar={true}
-            defaultValue={0.0}
-            color={trackColorHex}
-            onChange={updatePan}
-         />
-        
-         <div class="flex justify-between w-full text-[8px] font-bold font-sans text-white/30 select-none px-1">
-            <span class={pan < -0.1 ? 'text-white' : ''}>L</span>
-            <span class={pan > 0.1 ? 'text-white' : ''}>R</span>
-         </div>
-      </div>   
+        <div class="flex flex-col items-center justify-center gap-0.5 w-10 shrink-0 scale-75 origin-right mr-1">
+            <Knob 
+               value={pan} 
+               min={-1.0} 
+               max={1.0} 
+               step={0.05} 
+               size="sm"
+               bipolar={true}
+               defaultValue={0.0}
+               color={trackColorHex}
+               onChange={updatePan}
+            />
 
+            <div class="flex justify-between w-full text-[8px] font-bold font-sans text-white/30 select-none px-1">
+               <span class={pan < -0.1 ? 'text-white' : ''}>L</span>
+               <span class={pan > 0.1 ? 'text-white' : ''}>R</span>
+            </div>
+        </div>   
     </div>
 
 </div>
