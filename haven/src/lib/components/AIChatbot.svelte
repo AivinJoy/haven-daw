@@ -48,12 +48,12 @@
         const unlistenComplete = listen('ai-job-complete', (event: any) => {
             isReasoning = false;
             awaitingConfirmation = true;
+         
             currentJobId = event.payload;
 
-            // CHANGE: Add standard chat message
             messages = [...messages, { 
                 role: 'assistant', 
-                content: "Separation complete. Type 'Yes' to import stems or 'No' to discard them.", 
+                content: "Separation complete. Type 'Replace', 'Mute', or 'Keep' to import, or 'No' to discard.", 
                 timestamp: Date.now() 
             }];
         });
@@ -74,18 +74,23 @@
         }
     }
 
-    async function handleConfirm(confirm: boolean) {
+    async function handleConfirm(action: string) {
         if (!currentJobId) return;
 
-        if (confirm) {
-            await invoke('commit_pending_stems', { jobId: currentJobId });
-            messages = [...messages, { role: 'assistant', content: "✅ Imported stems.", timestamp: Date.now() }];
+        // Optimistic UI Update: Instant feedback
+        awaitingConfirmation = false;
+
+        if (action !== 'discard') {
+            isReasoning = true;
+            reasoningMessage = "importing Stems..."
+            await invoke('commit_pending_stems', { jobId: currentJobId, importAction: action });
+            messages = [...messages, { role: 'assistant', content: `Imported stems (${action} original).`, timestamp: Date.now() }];
         } else {
             await invoke('discard_pending_stems', { jobId: currentJobId });
-            messages = [...messages, { role: 'assistant', content: "🗑️ Discarded.", timestamp: Date.now() }];
+            messages = [...messages, { role: 'assistant', content: "Discarded.", timestamp: Date.now() }];
         }
 
-        awaitingConfirmation = false;
+        isReasoning = false;
         currentJobId = null;
         window.dispatchEvent(new CustomEvent('refresh-project'));
     }
@@ -101,13 +106,17 @@
 
             messages = [...messages, { role: 'user', content: originalInput, timestamp: Date.now()} ];
 
-            if (['yes', 'y', 'sure', 'ok', 'import', 'confirm'].includes(text)) {
-                await handleConfirm(true);
+            if (['replace', 'r'].includes(text)) {
+                await handleConfirm('replace');
+            } else if (['mute', 'm'].includes(text)) {
+                await handleConfirm('mute');
+            } else if (['keep', 'k'].includes(text)) {
+                await handleConfirm('keep');
             } else if (['no', 'n', 'cancel', 'discard', 'stop'].includes(text)) {
-                await handleConfirm(false);
+                await handleConfirm('discard');
             } else {
                 // If they type gibberish, ask again
-                messages = [...messages, { role: 'assistant', content: "Please type 'Yes' to import or 'No' to discard.", timestamp: Date.now() }];
+                messages = [...messages, { role: 'assistant', content: "Please type 'Replace', 'Mute', 'Keep', or 'No'.", timestamp: Date.now() }];
             }
             return;
         }
@@ -212,7 +221,7 @@
             type="text" 
             bind:value={input}
             onkeydown={handleKeydown}
-            placeholder={isReasoning ? "Working..." : awaitingConfirmation ? "Type 'Yes' or 'No'... " : "Ask Haven to split, mute, or pan..."}
+            placeholder={isReasoning ? "Working..." : awaitingConfirmation ? "Type 'Replace', 'Mute', 'Keep' or 'No'... " : "Ask Haven to split, mute, or pan..."}
             class="flex-1 bg-transparent border-none outline-none h-full px-4 text-sm text-white placeholder-white/30 disabled:opacity-50 disabled:cursor-wait"
             disabled={isLoading || isReasoning} 
         />

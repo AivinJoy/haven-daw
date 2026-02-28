@@ -24,8 +24,6 @@ use daw_modules::engine::time::GridLine; // Import GridLine
 struct PendingStemGroup {
     stems: HashMap<String, String>, // key: Stem Name (e.g., "vocals"), value: File Path
     original_track_id: u32,
-    replace_original: bool,
-    mute_original: bool,
 }
 
 // --- 1. Global State ---
@@ -689,7 +687,7 @@ fn get_all_meters(state: State<AppState>) -> Result<Vec<daw_modules::audio_runti
 
 // --- NEW: Tauri command for AI analysis ---
 #[tauri::command]
-fn get_track_analysis(state: State<AppState>) -> Result<Vec<daw_modules::audio_runtime::TrackAnalysisPayload>, String> {
+async fn get_track_analysis(state: State<'_, AppState>) -> Result<Vec<daw_modules::audio_runtime::TrackAnalysisPayload>, String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
     Ok(audio.get_all_track_analysis())
 }
@@ -1066,8 +1064,6 @@ async fn ask_ai(
                 \"value\": number (optional), \n\
                 \"time\": number (optional), \n\
                 \"clip_number\": number (optional, the 1-based ID of the clip), \n\
-                \"mute_original\": boolean (optional), \n\
-                \"replace_original\": boolean (optional), \n\
                 \"job_id\": string (optional), \n\
                 \"band_index\": number (optional, 0-3), \n\
                 \"filter_type\": \"LowPass\" | \"HighPass\" | \"Peaking\" | \"LowShelf\" | \"HighShelf\" | \"Notch\" | \"BandPass\" (optional), \n\
@@ -1251,8 +1247,6 @@ fn get_ai_base_url() -> String {
 async fn separate_stems(
     app: tauri::AppHandle,
     track_id: u32,
-    mute_original: bool,
-    replace_original: bool,
     state: State<'_, AppState>
 ) -> Result<(), String> {
     
@@ -1402,8 +1396,6 @@ async fn separate_stems(
                     let group = PendingStemGroup {
                         stems: stems.clone(),
                         original_track_id: track_id,
-                        replace_original,
-                        mute_original
                     };
                 
                     // 2. Store it in AppState (Do NOT touch the audio engine yet)
@@ -1451,98 +1443,93 @@ async fn cancel_ai_job(job_id: String) -> Result<(), String> {
 }
 
 
+// IMPORTANT: Make sure this import is at the top of your main.rs file
+// use tauri::Manager; 
+
 #[tauri::command]
 async fn commit_pending_stems(
     app: tauri::AppHandle,
     job_id: String,
+    import_action: String,
     state: State<'_, AppState>
 ) -> Result<(), String> {
     
+    // Notify UI immediately (No sleep required, optimistic updates handle the rest)
+    let _ = app.emit("ai-progress", ProgressPayload { 
+        message: "Importing stems...".into(), progress: 0.0, visible: true 
+    });
+
     // 1. Retrieve the pending data
     let group = {
         let mut pending = state.pending_stems.lock().map_err(|_| "Failed to lock pending")?;
         pending.remove(&job_id).ok_or("Job ID not found or already processed")?
     };
 
-    // Store tasks for analysis so we can do it WITHOUT holding the audio lock
-    let mut analysis_tasks: Vec<(String, String)> = Vec::new();
+    let app_clone = app.clone();
+    
+    // 2. Offload BOTH Engine Modification and Analysis to a blocking thread
+    let computed_results = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<(String, ImportResult)>, String> {
+        
+        // Extract AppState securely inside the spawned thread
+        let state_handle = app_clone.state::<AppState>();
+        let mut analysis_tasks: Vec<(String, String)> = Vec::new();
 
-    // 2. AUDIO LOCK SCOPE (Short duration to prevent stuttering)
-    {
-        let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+        // AUDIO LOCK SCOPE
+        {
+            let audio = state_handle.audio.lock().map_err(|_| "Failed to lock audio")?;
 
-        // A. Handle Original Track
-        let list = audio.get_tracks_list();
-        if let Ok(index) = resolve_track_index(&list, group.original_track_id) { 
-            if group.replace_original {
-                audio.delete_track(index).map_err(|e| e.to_string())?;
-            } else if group.mute_original {
-                audio.toggle_mute(index); 
+            // A. Handle Original Track
+            let list = audio.get_tracks_list();
+            if let Ok(index) = resolve_track_index(&list, group.original_track_id) { 
+                match import_action.as_str() {
+                    "replace" => { let _ = audio.delete_track(index); },
+                    "mute" => {
+                        let track_info = &list[index];
+                        if !track_info.muted { audio.toggle_mute(index); }
+                    },
+                    _ => {} // "keep" does nothing
+                }
             }
-        }
 
-        // B. Add New Stems to Engine
-        for (stem_name, path) in &group.stems {
-            if !std::path::Path::new(path).exists() { continue; }
-            
-            match audio.add_track(path.clone()) {
-                Ok(_) => {
+            // B. Add New Stems to Engine (Disk I/O)
+            for (stem_name, path) in &group.stems {
+                if !std::path::Path::new(path).exists() { continue; }
+                
+                if audio.add_track(path.clone()).is_ok() {
                     let list = audio.get_tracks_list();
                     let idx = list.len() - 1; 
                     audio.set_track_name(idx, stem_name.clone());
-                    
-                    // Capture path and assigned color for analysis
                     analysis_tasks.push((path.clone(), list[idx].color.clone()));
-                },
-                Err(e) => println!("Failed to commit stem {}: {}", path, e)
+                }
             }
-        }
-    } // <--- Audio Lock Drops Here (Playback continues smoothly)
+        } // <--- Audio Lock Drops Here (Playback continues smoothly)
 
-    // Notify UI: Start
-    let _ = app.emit("ai-progress", ProgressPayload { 
-        message: "Importing stems...".into(), progress: 0.0, visible: true 
-    });
-
-    let total = analysis_tasks.len();
-
-    // Move heavy work to a blocking thread to keep UI responsive
-    // Clone cache (expensive but safe) or just pass State if possible. 
-    // Actually, we can't easily pass State into spawn_blocking without Arc. 
-    // Easier approach: Calculate results in blocking, return them, then lock cache in async.
-
-    let computed_results = tauri::async_runtime::spawn_blocking(move || {
+        // Waveform Analysis (Heavy CPU)
         let mut results = Vec::new();
         for (path, color) in analysis_tasks {
-            // Internal Helper (Heavy CPU)
             match analyze_audio_internal(&path, color) {
                 Ok(res) => results.push((path, res)),
                 Err(e) => println!("Failed to analyze stem {}: {}", path, e),
             }
         }
-        results
-    }).await.map_err(|e| e.to_string())?;
+        Ok(results)
+    }).await.map_err(|e| e.to_string())??;
+
+    let total = computed_results.len();
 
     // 4. Update Cache & UI Loop
     for (i, (path, result)) in computed_results.into_iter().enumerate() {
-        
-        // Update UI Bubble
         let _ = app.emit("ai-progress", ProgressPayload { 
             message: format!("Analyzing stem {}/{}...", i + 1, total), 
             progress: ((i as f64) / (total as f64)) * 100.0, 
             visible: true 
         });
         
-        // Small delay to let user see the bubble (optional, feels more 'reasoning-like')
-        tokio::time::sleep(Duration::from_millis(120)).await;
-
-        // Save to cache
         if let Ok(mut cache) = state.cache.lock() {
             cache.insert(path, result);
         }
     }
 
-    // Notify UI: Done
     let _ = app.emit("ai-progress", ProgressPayload { 
         message: "Done.".into(), progress: 100.0, visible: false 
     });
@@ -1553,8 +1540,43 @@ async fn commit_pending_stems(
 #[tauri::command]
 fn discard_pending_stems(job_id: String, state: State<AppState>) -> Result<(), String> {
     let mut pending = state.pending_stems.lock().map_err(|_| "Failed to lock pending")?;
-    pending.remove(&job_id); // Just remove from memory
+    
+    if let Some(group) = pending.remove(&job_id) {
+        // Garbage collect orphaned audio files to prevent storage leaks
+        for (_, path) in group.stems {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    
     Ok(())
+}
+
+// --- COMMAND VALIDATION MIDDLEWARE ---
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct AiStep {
+    pub action: String,
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[tauri::command]
+fn sanitize_ai_batch(mut steps: Vec<AiStep>) -> Result<Vec<AiStep>, String> {
+    // RULE 1: Engine handles solo isolation. 
+    // Reject any AI-hallucinated mute commands if a solo command exists in the same batch.
+    let has_solo = steps.iter().any(|s| s.action == "toggle_solo" || s.action == "unsolo");
+    
+    if has_solo {
+        let original_len = steps.len();
+        steps.retain(|s| s.action != "toggle_mute" && s.action != "unmute");
+        
+        if steps.len() < original_len {
+            println!("🛡️ Engine Guard: Stripped illegal mute commands during a Solo operation.");
+        }
+    }
+
+    // [Future Rules can go here]
+    // e.g., prevent duplicate toggles, prevent destructive commands while recording, etc.
+
+    Ok(steps)
 }
 
 fn main() {
@@ -1619,7 +1641,8 @@ fn main() {
             separate_stems,
             cancel_ai_job,
             commit_pending_stems,
-            discard_pending_stems
+            discard_pending_stems,
+            sanitize_ai_batch
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
