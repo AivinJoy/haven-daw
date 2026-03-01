@@ -4,9 +4,11 @@
     windows_subsystem = "windows"
 )]
 
+mod stem_separation;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration};
 use std::collections::HashMap;
 use tauri::{State, Emitter, Manager};
 use cpal::traits::{HostTrait, DeviceTrait};
@@ -22,16 +24,16 @@ use daw_modules::engine::time::GridLine; // Import GridLine
 
 // [NEW STRUCT] Holds separation results waiting for user confirmation
 struct PendingStemGroup {
-    stems: HashMap<String, String>, // key: Stem Name (e.g., "vocals"), value: File Path
-    original_track_id: u32,
+    pub stems: HashMap<String, String>, // key: Stem Name (e.g., "vocals"), value: File Path
+    pub original_track_id: u32,
 }
 
 // --- 1. Global State ---
 struct AppState {
-    audio: Mutex<AudioRuntime>,
-    recorder: Mutex<Option<Recorder>>,
-    cache: Mutex<HashMap<String, ImportResult>>,
-    pending_stems: Mutex<HashMap<String, PendingStemGroup>>,
+    pub audio: Mutex<AudioRuntime>,
+    pub recorder: Mutex<Option<Recorder>>,
+    pub cache: Mutex<HashMap<String, ImportResult>>,
+    pub pending_stems: Mutex<HashMap<String, PendingStemGroup>>,
 }
 
 // --- 2. Define Return Struct ---
@@ -194,7 +196,7 @@ fn get_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
 
 // Helper: Resolve Stable ID -> Mutable Index
 // Returns the current index of the track with the given ID.
-fn resolve_track_index(
+pub fn resolve_track_index(
     tracks: &[daw_modules::audio_runtime::FrontendTrackInfo], 
     target_id: u32
 ) -> Result<usize, String> {
@@ -225,9 +227,9 @@ fn get_position(state: State<AppState>) -> Result<f64, String> {
 
 #[derive(Clone, serde::Serialize)]
 struct ProgressPayload {
-    message: String,
-    progress: f64,
-    visible: bool,
+    pub message: String,
+    pub progress: f64,
+    pub visible: bool,
 }
 
 #[tauri::command]
@@ -1224,225 +1226,6 @@ fn analyze_audio_internal(path: &str, color: String) -> Result<ImportResult, Str
     })
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct SidecarJobResponse {
-    pub job_id: String,
-    pub status: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct SidecarStatusResponse {
-    pub status: String,
-    pub result: Option<HashMap<String, String>>, // Maps "vocals" -> "path/to/vocals.mp3"
-    pub error: Option<String>,
-}
-
-// --- AI SIDECAR ---
-// In production, use std::env::var or a config file
-fn get_ai_base_url() -> String {
-    std::env::var("AI_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
-}
-
-#[tauri::command]
-async fn separate_stems(
-    app: tauri::AppHandle,
-    track_id: u32,
-    state: State<'_, AppState>
-) -> Result<(), String> {
-    
-    let base_url = get_ai_base_url(); // <--- FIX 1: Capture string once
-
-    // 1. PREPARATION (Brief Lock)
-    let (file_path, duration_secs) = {
-        let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-        let list = audio.get_tracks_list();
-        let index = resolve_track_index(&list, track_id)?;
-        
-        if index >= list.len() {
-            return Err("Track index out of bounds".into());
-        }
-        
-        let clip = list[index].clips.first()
-            .ok_or("Track has no audio clips to separate")?;
-            
-        (clip.path.clone(), clip.duration)
-    };
-
-    // Timeout: 4x realtime or min 60s
-    let timeout_seconds = (duration_secs * 4.0).max(60.0) as usize;
-
-    println!("✂️ Separating: {} (Timeout: {}s)", file_path, timeout_seconds);
-
-    let app_handle = app.clone();
-    
-    tauri::async_runtime::spawn(async move {
-
-        let state_handle = app_handle.state::<AppState>();
-        let client = reqwest::Client::new();
-
-        // 2. CONNECT (Fast Fail)
-        let _ = app_handle.emit("ai-progress", ProgressPayload { 
-            message: "Connecting...".into(), progress: 5.0, visible: true 
-        });
-
-        // FIX 2: Use base_url reference or clone to avoid move error
-        let health_check = client.get(format!("{}/health", base_url))
-            .timeout(Duration::from_secs(3)) 
-            .send().await;
-
-        if health_check.is_err() {
-            // [CHANGE] Tell chat it failed
-            let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                message: "Server unreachable.".into(), progress: 0.0, visible: false 
-            });
-            return
-        }
-
-        // 3. START JOB
-        let _ = app_handle.emit("ai-progress", ProgressPayload { 
-            message: "Uploading to GPU...".into(), progress: 10.0, visible: true 
-        });
-
-        // Send full config for Demucs
-        let res = client.post(format!("{}/process/separate", base_url))
-            .timeout(Duration::from_secs(10))
-            .json(&serde_json::json!({ 
-                "file_path": file_path, 
-                "stem_count": 4,
-                "model": "htdemucs",
-                "device": "cuda",
-                "format": "mp3",   
-                "bitrate": 320       
-            }))
-            .send().await;
-        
-        // Handle Start Error
-        let response = match res {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                    message: format!("Failed: {}", e), progress: 0.0, visible: false 
-                });
-                return;
-            }
-        };
-
-        let job_data_res: Result<SidecarJobResponse, _> = response.json().await;
-        if job_data_res.is_err() {
-             let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                message: "Invalid API response".into(), progress: 0.0, visible: false 
-            });
-            return;
-        }
-
-        let job_id = job_data_res.unwrap().job_id;
-        // --- NEW: Tell Frontend the Job ID so it can be cancelled ---
-        let _ = app_handle.emit("ai-job-started", job_id.clone());
-
-        // 4. SMART POLLING LOOP
-        let mut attempts = 0;
-        loop {
-            if attempts > timeout_seconds {
-                // TIMEOUT: Try to cancel on server side
-                let _ = client.post(format!("{}/jobs/{}/cancel", base_url, job_id))
-                    .send().await;
-                let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                    message: "Timed out.".into(), progress: 0.0, visible: false 
-                });
-                return
-            }
-
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-
-            // Poll Status
-            let status_res = client.get(format!("{}/jobs/{}", base_url, job_id))
-                .timeout(Duration::from_secs(5))
-                .send().await;
-
-            // Handle Polling Errors gracefully
-            if status_res.is_err() {
-                attempts += 1;
-                continue; 
-            }    
-
-            // Unwrap safely because we checked is_err
-            let status_data: SidecarStatusResponse = match status_res.unwrap().json().await {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            // PROGRESS LOGIC: "Asymptotic Approach" (Never resets, slows down as it gets higher)
-            // Formula: 20 + (70 * (1 - e^(-0.05 * t))) -> Approaches 90%
-            let raw_progress = 1.0 - (-0.05 * (attempts as f64)).exp(); 
-            let visual_progress = 20.0 + (70.0 * raw_progress);
-
-            let stage_msg = match status_data.status.as_str() {
-                "pending" => "Queued...",
-                "processing" => "Separating Audio...",
-                "completed" => "Finalizing...",
-                "cancelled" => "Cancelled by user.",
-                _ => "Thinking..."
-            };
-
-            let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                message: stage_msg.into(), 
-                progress: visual_progress, 
-                visible: true 
-            });
-
-            if status_data.status == "completed" {
-                if let Some(stems) = status_data.result {
-
-                    // 1. Create the Pending Group
-                    let group = PendingStemGroup {
-                        stems: stems.clone(),
-                        original_track_id: track_id,
-                    };
-                
-                    // 2. Store it in AppState (Do NOT touch the audio engine yet)
-                    if let Ok(mut pending) = state_handle.pending_stems.lock() {
-                        pending.insert(job_id.clone(), group);
-                    }
-                
-                    // 3. Notify Frontend to ask for confirmation
-                    let _ = app_handle.emit("ai-job-complete", job_id); 
-                }
-                break;
-            }
-            else if status_data.status == "failed" {
-                let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                    message: "Failed.".into(), progress: 0.0, visible: false 
-                });
-                return;
-            } 
-            else if status_data.status == "cancelled" {
-                 let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                    message: "Cancelled.".into(), progress: 0.0, visible: false 
-                });
-                return
-            }
-
-            attempts += 1;
-        }
-    });
-    
-    Ok(())
-}
-
-#[tauri::command]
-async fn cancel_ai_job(job_id: String) -> Result<(), String> {
-    let base_url = get_ai_base_url();
-    let client = reqwest::Client::new();
-    
-    println!("🛑 Requesting cancellation for Job ID: {}", job_id);
-
-    let _ = client.post(format!("{}/jobs/{}/cancel", base_url, job_id))
-        .send().await
-        .map_err(|e| format!("Failed to send cancel request: {}", e))?;
-        
-    Ok(())
-}
-
-
 // IMPORTANT: Make sure this import is at the top of your main.rs file
 // use tauri::Manager; 
 
@@ -1638,8 +1421,8 @@ fn main() {
             undo,
             redo,
             ask_ai,
-            separate_stems,
-            cancel_ai_job,
+            stem_separation::separate_stems,
+            stem_separation::cancel_ai_job,
             commit_pending_stems,
             discard_pending_stems,
             sanitize_ai_batch
