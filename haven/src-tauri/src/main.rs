@@ -1038,7 +1038,10 @@ async fn ask_ai(
 
     // 2. Get API Key from Environment
     // NOTE: In production, you might want to load this from a user config file
-    let api_key = std::env::var("GROQ_API_KEY").unwrap_or_else(|_| "".to_string());
+    // This checks for the key at BUILD time, and falls back to runtime if needed.
+    let api_key = option_env!("GROQ_API_KEY")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("GROQ_API_KEY").unwrap_or_default());
     
     if api_key.is_empty() {
          return Ok(serde_json::to_string(&AiErrorResponse {
