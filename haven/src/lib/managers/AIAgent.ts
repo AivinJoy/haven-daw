@@ -19,10 +19,8 @@ interface AIResponse {
             mode?: string;
             direction?: string;
             count?: number;
-            // --- ADD THESE LINES ---
-            mute_original?: boolean;
-            replace_original?: boolean;
             job_id?: string;
+            clip_number?: number; // <--- NEW: Allow AI to target clips
         };
     }[];
     
@@ -88,6 +86,11 @@ class AIAgent {
                 muted: t.muted,
                 solo: t.solo,
                 monitoring: isMonitoring,
+                clips: t.clips?.map((c: any) => ({
+                    clip_number: c.clipNumber,
+                    start_time: Number(c.startTime.toFixed(2)),
+                    duration: Number(c.duration.toFixed(2))
+                })), // <--- NEW: AI can now "see" the clips!
                 // AI gets the true statistical average of the track
                 analysis: profile ? {
                     integrated_rms_db: Number(profile.integrated_rms_db.toFixed(1)),
@@ -154,11 +157,25 @@ class AIAgent {
 
             // CASE 1: New Multi-Step Format
             if (data.steps && Array.isArray(data.steps)) {
-                for (const step of data.steps) {
+                
+                // Extract to a local variable to preserve TypeScript's type narrowing
+                let safeSteps = data.steps; 
+                
+                try {
+                    // 🛡️ LAYER 3 ENFORCEMENT: Pass batch to Rust Engine for validation
+                    // The backend enforces the invariant rules and returns a safe, sanitized array.
+                    safeSteps = await invoke('sanitize_ai_batch', { steps: safeSteps });
+                } catch (e) {
+                    console.error("Engine rejected the AI batch:", e);
+                    safeSteps = []; // Abort execution if Rust panics/rejects
+                }
+
+                for (const step of safeSteps) {
                     await this.executeAction(step, tracks);
                     await new Promise(r => setTimeout(r, 100)); // Delay for UI safety
                 }
-            } 
+            }
+            
             // CASE 2: Fallback (Old Single Action Format)
             else if (data.action) {
                  await this.executeAction({ 
@@ -246,18 +263,10 @@ class AIAgent {
 
             case 'separate_stems':
                 console.log("✂️ AI Separating Stems...");
-                
-                // 1. Determine Logic based on AI parameters
-                const replaceOriginal = parameters.replace_original === true;
-                const shouldMute = parameters.mute_original === true;
 
                 // 2. Call Rust Backend
-                // (If replacing, we don't need to mute, because we will delete it anyway)
-
                 await invoke('separate_stems', { 
-                    trackId: parameters.track_id,
-                    muteOriginal: shouldMute, 
-                    replaceOriginal: replaceOriginal
+                    trackId: parameters.track_id
                 });  
                 break;
 
@@ -349,14 +358,50 @@ class AIAgent {
                 }    
                 break;
             case 'split_clip':
-               
-                if (parameters.track_id !== undefined && parameters.time !== undefined) {
+                console.log("🔥 AI Split Clip. Params:", parameters);
+                // Default to track 0 if the AI forgot
+                const splitTrackId = parameters.track_id ?? 0;
+                
+                if (parameters.time !== undefined) {
                     await invoke('split_clip', { 
-                        trackId: parameters.track_id, 
+                        trackId: splitTrackId, 
                         time: parameters.time 
                     });
+                } else {
+                    console.error("⚠️ AI forgot the time parameter for splitting!");
                 }
                 break;
+
+            case 'merge_clips':
+                console.log("🔥 AI Merge Clips. Params:", parameters);
+                // AI often uses 'value' by mistake instead of 'clip_number'
+                let mergeClipNum = parameters.clip_number ?? parameters.value; 
+                
+                if (mergeClipNum === undefined) {
+                    console.warn("⚠️ AI forgot clip number! Defaulting to 1.");
+                    mergeClipNum = 1;
+                }
+                
+                await invoke('merge_clip_with_next', { 
+                    trackId: parameters.track_id ?? 0, 
+                    clipIndex: mergeClipNum - 1 // Convert 1-based UI to 0-based Backend
+                });
+                break;
+            case 'delete_clip':
+                console.log("🔥 AI Delete Clip. Params:", parameters);
+                // Catch the AI's missing parameters
+                let delClipNum = parameters.clip_number ?? parameters.value;
+                
+                if (delClipNum === undefined) {
+                    console.warn("⚠️ AI forgot clip number! Defaulting to 1.");
+                    delClipNum = 1;
+                }
+                
+                await invoke('delete_clip', { 
+                    trackId: parameters.track_id ?? 0, 
+                    clipIndex: delClipNum - 1 
+                });
+                break;       
             case 'delete_track':
                  if (parameters.track_id != undefined ) {
                     await invoke('delete_track', { 

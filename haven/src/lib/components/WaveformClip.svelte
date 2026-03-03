@@ -18,7 +18,8 @@
     duration = 0,
     offset = 0,
     zoom = 1,
-    name = "Audio Clip"
+    name = "Audio Clip",
+    clipNumber = 1 // <--- NEW
   } = $props();
 
   let canvas: HTMLCanvasElement;
@@ -219,6 +220,6 @@
     class="absolute top-1 left-2 text-[10px] font-bold font-sans z-20 truncate max-w-[95%] pointer-events-none"
     style="color: {waveColor}; filter: brightness(0.6) saturate(1.5);"
 >
-   {name}
+   {name} (Clip {clipNumber})
 </span>
 </div>

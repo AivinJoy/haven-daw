@@ -4,9 +4,11 @@
     windows_subsystem = "windows"
 )]
 
+mod stem_separation;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration};
 use std::collections::HashMap;
 use tauri::{State, Emitter, Manager};
 use cpal::traits::{HostTrait, DeviceTrait};
@@ -22,18 +24,16 @@ use daw_modules::engine::time::GridLine; // Import GridLine
 
 // [NEW STRUCT] Holds separation results waiting for user confirmation
 struct PendingStemGroup {
-    stems: HashMap<String, String>, // key: Stem Name (e.g., "vocals"), value: File Path
-    original_track_id: u32,
-    replace_original: bool,
-    mute_original: bool,
+    pub stems: HashMap<String, String>, // key: Stem Name (e.g., "vocals"), value: File Path
+    pub original_track_id: u32,
 }
 
 // --- 1. Global State ---
 struct AppState {
-    audio: Mutex<AudioRuntime>,
-    recorder: Mutex<Option<Recorder>>,
-    cache: Mutex<HashMap<String, ImportResult>>,
-    pending_stems: Mutex<HashMap<String, PendingStemGroup>>,
+    pub audio: Mutex<AudioRuntime>,
+    pub recorder: Mutex<Option<Recorder>>,
+    pub cache: Mutex<HashMap<String, ImportResult>>,
+    pub pending_stems: Mutex<HashMap<String, PendingStemGroup>>,
 }
 
 // --- 2. Define Return Struct ---
@@ -109,6 +109,7 @@ fn build_ui_state(
                 offset: clip_info.offset,
                 color: color.clone(),
                 waveform: import_result, // <--- Use the cached result
+                clip_number: clip_info.clip_number, // <--- NEW
             });
         }
 
@@ -165,6 +166,13 @@ fn get_output_devices() -> Result<Vec<AudioDeviceInfo>, String> {
 }
 
 #[tauri::command]
+fn reload_audio_device(state: State<AppState>) -> Result<(), String> {
+    let mut audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    audio.reload_device().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn get_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     let host = cpal::default_host();
     
@@ -188,7 +196,7 @@ fn get_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
 
 // Helper: Resolve Stable ID -> Mutable Index
 // Returns the current index of the track with the given ID.
-fn resolve_track_index(
+pub fn resolve_track_index(
     tracks: &[daw_modules::audio_runtime::FrontendTrackInfo], 
     target_id: u32
 ) -> Result<usize, String> {
@@ -219,9 +227,9 @@ fn get_position(state: State<AppState>) -> Result<f64, String> {
 
 #[derive(Clone, serde::Serialize)]
 struct ProgressPayload {
-    message: String,
-    progress: f64,
-    visible: bool,
+    pub message: String,
+    pub progress: f64,
+    pub visible: bool,
 }
 
 #[tauri::command]
@@ -681,7 +689,7 @@ fn get_all_meters(state: State<AppState>) -> Result<Vec<daw_modules::audio_runti
 
 // --- NEW: Tauri command for AI analysis ---
 #[tauri::command]
-fn get_track_analysis(state: State<AppState>) -> Result<Vec<daw_modules::audio_runtime::TrackAnalysisPayload>, String> {
+async fn get_track_analysis(state: State<'_, AppState>) -> Result<Vec<daw_modules::audio_runtime::TrackAnalysisPayload>, String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
     Ok(audio.get_all_track_analysis())
 }
@@ -869,6 +877,7 @@ struct LoadedClip {
     offset: f64,
     waveform: ImportResult,
     color: String,
+    clip_number: usize, // <--- NEW
 }
 
 #[derive(serde::Serialize)]
@@ -1029,7 +1038,10 @@ async fn ask_ai(
 
     // 2. Get API Key from Environment
     // NOTE: In production, you might want to load this from a user config file
-    let api_key = std::env::var("GROQ_API_KEY").unwrap_or_else(|_| "".to_string());
+    // This checks for the key at BUILD time, and falls back to runtime if needed.
+    let api_key = option_env!("GROQ_API_KEY")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("GROQ_API_KEY").unwrap_or_default());
     
     if api_key.is_empty() {
          return Ok(serde_json::to_string(&AiErrorResponse {
@@ -1051,13 +1063,12 @@ async fn ask_ai(
         {{ \n\
           \"steps\": [ \n\
             {{ \n\
-              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"unmute\" | \"unsolo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"update_eq\" | \"update_compressor\" | \"none\", \n\
+              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"unmute\" | \"unsolo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"merge_clips\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"update_eq\" | \"update_compressor\" | \"none\", \n\
               \"parameters\": {{ \n\
                 \"track_id\": number (optional, default to 0), \n\
                 \"value\": number (optional), \n\
                 \"time\": number (optional), \n\
-                \"mute_original\": boolean (optional), \n\
-                \"replace_original\": boolean (optional), \n\
+                \"clip_number\": number (optional, the 1-based ID of the clip), \n\
                 \"job_id\": string (optional), \n\
                 \"band_index\": number (optional, 0-3), \n\
                 \"filter_type\": \"LowPass\" | \"HighPass\" | \"Peaking\" | \"LowShelf\" | \"HighShelf\" | \"Notch\" | \"BandPass\" (optional), \n\
@@ -1103,6 +1114,9 @@ async fn ask_ai(
         8. EQ & COMPRESSION LOGIC:\n\
            - To EQ, use 'update_eq'. Bands: 0=Lows, 1=LowMids, 2=HighMids, 3=Highs. Default Q is 1.0.\n\
            - To Compress, use 'update_compressor'. Standard: threshold -20.0, ratio 4.0, attack 5.0, release 50.0.\n\
+        9. CLIP EDITING:\n\
+           - To split, use 'split_clip' with \"time\".\n\
+           - To merge clips (e.g. \"merge clip 1 and 2\"), use 'merge_clips' and pass the left-most clip as \"clip_number\" (e.g. \"clip_number\": 1).\n\
         \n\
         EXAMPLES OF CORRECT BEHAVIOR:\n\
         User: \"max the volume of track 0\"\n\
@@ -1215,321 +1229,93 @@ fn analyze_audio_internal(path: &str, color: String) -> Result<ImportResult, Str
     })
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct SidecarJobResponse {
-    pub job_id: String,
-    pub status: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct SidecarStatusResponse {
-    pub status: String,
-    pub result: Option<HashMap<String, String>>, // Maps "vocals" -> "path/to/vocals.mp3"
-    pub error: Option<String>,
-}
-
-// --- AI SIDECAR ---
-// In production, use std::env::var or a config file
-fn get_ai_base_url() -> String {
-    std::env::var("AI_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
-}
-
-#[tauri::command]
-async fn separate_stems(
-    app: tauri::AppHandle,
-    track_id: u32,
-    mute_original: bool,
-    replace_original: bool,
-    state: State<'_, AppState>
-) -> Result<(), String> {
-    
-    let base_url = get_ai_base_url(); // <--- FIX 1: Capture string once
-
-    // 1. PREPARATION (Brief Lock)
-    let (file_path, duration_secs) = {
-        let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-        let list = audio.get_tracks_list();
-        let index = resolve_track_index(&list, track_id)?;
-        
-        if index >= list.len() {
-            return Err("Track index out of bounds".into());
-        }
-        
-        let clip = list[index].clips.first()
-            .ok_or("Track has no audio clips to separate")?;
-            
-        (clip.path.clone(), clip.duration)
-    };
-
-    // Timeout: 4x realtime or min 60s
-    let timeout_seconds = (duration_secs * 4.0).max(60.0) as usize;
-
-    println!("✂️ Separating: {} (Timeout: {}s)", file_path, timeout_seconds);
-
-    let app_handle = app.clone();
-    
-    tauri::async_runtime::spawn(async move {
-
-        let state_handle = app_handle.state::<AppState>();
-        let client = reqwest::Client::new();
-
-        // 2. CONNECT (Fast Fail)
-        let _ = app_handle.emit("ai-progress", ProgressPayload { 
-            message: "Connecting...".into(), progress: 5.0, visible: true 
-        });
-
-        // FIX 2: Use base_url reference or clone to avoid move error
-        let health_check = client.get(format!("{}/health", base_url))
-            .timeout(Duration::from_secs(3)) 
-            .send().await;
-
-        if health_check.is_err() {
-            // [CHANGE] Tell chat it failed
-            let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                message: "Server unreachable.".into(), progress: 0.0, visible: false 
-            });
-            return
-        }
-
-        // 3. START JOB
-        let _ = app_handle.emit("ai-progress", ProgressPayload { 
-            message: "Uploading to GPU...".into(), progress: 10.0, visible: true 
-        });
-
-        // Send full config for Demucs
-        let res = client.post(format!("{}/process/separate", base_url))
-            .timeout(Duration::from_secs(10))
-            .json(&serde_json::json!({ 
-                "file_path": file_path, 
-                "stem_count": 4,
-                "model": "htdemucs",
-                "device": "cuda",
-                "format": "mp3",   
-                "bitrate": 320       
-            }))
-            .send().await;
-        
-        // Handle Start Error
-        let response = match res {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                    message: format!("Failed: {}", e), progress: 0.0, visible: false 
-                });
-                return;
-            }
-        };
-
-        let job_data_res: Result<SidecarJobResponse, _> = response.json().await;
-        if job_data_res.is_err() {
-             let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                message: "Invalid API response".into(), progress: 0.0, visible: false 
-            });
-            return;
-        }
-
-        let job_id = job_data_res.unwrap().job_id;
-        // --- NEW: Tell Frontend the Job ID so it can be cancelled ---
-        let _ = app_handle.emit("ai-job-started", job_id.clone());
-
-        // 4. SMART POLLING LOOP
-        let mut attempts = 0;
-        loop {
-            if attempts > timeout_seconds {
-                // TIMEOUT: Try to cancel on server side
-                let _ = client.post(format!("{}/jobs/{}/cancel", base_url, job_id))
-                    .send().await;
-                let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                    message: "Timed out.".into(), progress: 0.0, visible: false 
-                });
-                return
-            }
-
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-
-            // Poll Status
-            let status_res = client.get(format!("{}/jobs/{}", base_url, job_id))
-                .timeout(Duration::from_secs(5))
-                .send().await;
-
-            // Handle Polling Errors gracefully
-            if status_res.is_err() {
-                attempts += 1;
-                continue; 
-            }    
-
-            // Unwrap safely because we checked is_err
-            let status_data: SidecarStatusResponse = match status_res.unwrap().json().await {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            // PROGRESS LOGIC: "Asymptotic Approach" (Never resets, slows down as it gets higher)
-            // Formula: 20 + (70 * (1 - e^(-0.05 * t))) -> Approaches 90%
-            let raw_progress = 1.0 - (-0.05 * (attempts as f64)).exp(); 
-            let visual_progress = 20.0 + (70.0 * raw_progress);
-
-            let stage_msg = match status_data.status.as_str() {
-                "pending" => "Queued...",
-                "processing" => "Separating Audio...",
-                "completed" => "Finalizing...",
-                "cancelled" => "Cancelled by user.",
-                _ => "Thinking..."
-            };
-
-            let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                message: stage_msg.into(), 
-                progress: visual_progress, 
-                visible: true 
-            });
-
-            if status_data.status == "completed" {
-                if let Some(stems) = status_data.result {
-
-                    // 1. Create the Pending Group
-                    let group = PendingStemGroup {
-                        stems: stems.clone(),
-                        original_track_id: track_id,
-                        replace_original,
-                        mute_original
-                    };
-                
-                    // 2. Store it in AppState (Do NOT touch the audio engine yet)
-                    if let Ok(mut pending) = state_handle.pending_stems.lock() {
-                        pending.insert(job_id.clone(), group);
-                    }
-                
-                    // 3. Notify Frontend to ask for confirmation
-                    let _ = app_handle.emit("ai-job-complete", job_id); 
-                }
-                break;
-            }
-            else if status_data.status == "failed" {
-                let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                    message: "Failed.".into(), progress: 0.0, visible: false 
-                });
-                return;
-            } 
-            else if status_data.status == "cancelled" {
-                 let _ = app_handle.emit("ai-progress", ProgressPayload { 
-                    message: "Cancelled.".into(), progress: 0.0, visible: false 
-                });
-                return
-            }
-
-            attempts += 1;
-        }
-    });
-    
-    Ok(())
-}
-
-#[tauri::command]
-async fn cancel_ai_job(job_id: String) -> Result<(), String> {
-    let base_url = get_ai_base_url();
-    let client = reqwest::Client::new();
-    
-    println!("🛑 Requesting cancellation for Job ID: {}", job_id);
-
-    let _ = client.post(format!("{}/jobs/{}/cancel", base_url, job_id))
-        .send().await
-        .map_err(|e| format!("Failed to send cancel request: {}", e))?;
-        
-    Ok(())
-}
-
+// IMPORTANT: Make sure this import is at the top of your main.rs file
+// use tauri::Manager; 
 
 #[tauri::command]
 async fn commit_pending_stems(
     app: tauri::AppHandle,
     job_id: String,
+    import_action: String,
     state: State<'_, AppState>
 ) -> Result<(), String> {
     
+    // Notify UI immediately (No sleep required, optimistic updates handle the rest)
+    let _ = app.emit("ai-progress", ProgressPayload { 
+        message: "Importing stems...".into(), progress: 0.0, visible: true 
+    });
+
     // 1. Retrieve the pending data
     let group = {
         let mut pending = state.pending_stems.lock().map_err(|_| "Failed to lock pending")?;
         pending.remove(&job_id).ok_or("Job ID not found or already processed")?
     };
 
-    // Store tasks for analysis so we can do it WITHOUT holding the audio lock
-    let mut analysis_tasks: Vec<(String, String)> = Vec::new();
+    let app_clone = app.clone();
+    
+    // 2. Offload BOTH Engine Modification and Analysis to a blocking thread
+    let computed_results = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<(String, ImportResult)>, String> {
+        
+        // Extract AppState securely inside the spawned thread
+        let state_handle = app_clone.state::<AppState>();
+        let mut analysis_tasks: Vec<(String, String)> = Vec::new();
 
-    // 2. AUDIO LOCK SCOPE (Short duration to prevent stuttering)
-    {
-        let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+        // AUDIO LOCK SCOPE
+        {
+            let audio = state_handle.audio.lock().map_err(|_| "Failed to lock audio")?;
 
-        // A. Handle Original Track
-        let list = audio.get_tracks_list();
-        if let Ok(index) = resolve_track_index(&list, group.original_track_id) { 
-            if group.replace_original {
-                audio.delete_track(index).map_err(|e| e.to_string())?;
-            } else if group.mute_original {
-                audio.toggle_mute(index); 
+            // A. Handle Original Track
+            let list = audio.get_tracks_list();
+            if let Ok(index) = resolve_track_index(&list, group.original_track_id) { 
+                match import_action.as_str() {
+                    "replace" => { let _ = audio.delete_track(index); },
+                    "mute" => {
+                        let track_info = &list[index];
+                        if !track_info.muted { audio.toggle_mute(index); }
+                    },
+                    _ => {} // "keep" does nothing
+                }
             }
-        }
 
-        // B. Add New Stems to Engine
-        for (stem_name, path) in &group.stems {
-            if !std::path::Path::new(path).exists() { continue; }
-            
-            match audio.add_track(path.clone()) {
-                Ok(_) => {
+            // B. Add New Stems to Engine (Disk I/O)
+            for (stem_name, path) in &group.stems {
+                if !std::path::Path::new(path).exists() { continue; }
+                
+                if audio.add_track(path.clone()).is_ok() {
                     let list = audio.get_tracks_list();
                     let idx = list.len() - 1; 
                     audio.set_track_name(idx, stem_name.clone());
-                    
-                    // Capture path and assigned color for analysis
                     analysis_tasks.push((path.clone(), list[idx].color.clone()));
-                },
-                Err(e) => println!("Failed to commit stem {}: {}", path, e)
+                }
             }
-        }
-    } // <--- Audio Lock Drops Here (Playback continues smoothly)
+        } // <--- Audio Lock Drops Here (Playback continues smoothly)
 
-    // Notify UI: Start
-    let _ = app.emit("ai-progress", ProgressPayload { 
-        message: "Importing stems...".into(), progress: 0.0, visible: true 
-    });
-
-    let total = analysis_tasks.len();
-
-    // Move heavy work to a blocking thread to keep UI responsive
-    // Clone cache (expensive but safe) or just pass State if possible. 
-    // Actually, we can't easily pass State into spawn_blocking without Arc. 
-    // Easier approach: Calculate results in blocking, return them, then lock cache in async.
-
-    let computed_results = tauri::async_runtime::spawn_blocking(move || {
+        // Waveform Analysis (Heavy CPU)
         let mut results = Vec::new();
         for (path, color) in analysis_tasks {
-            // Internal Helper (Heavy CPU)
             match analyze_audio_internal(&path, color) {
                 Ok(res) => results.push((path, res)),
                 Err(e) => println!("Failed to analyze stem {}: {}", path, e),
             }
         }
-        results
-    }).await.map_err(|e| e.to_string())?;
+        Ok(results)
+    }).await.map_err(|e| e.to_string())??;
+
+    let total = computed_results.len();
 
     // 4. Update Cache & UI Loop
     for (i, (path, result)) in computed_results.into_iter().enumerate() {
-        
-        // Update UI Bubble
         let _ = app.emit("ai-progress", ProgressPayload { 
             message: format!("Analyzing stem {}/{}...", i + 1, total), 
             progress: ((i as f64) / (total as f64)) * 100.0, 
             visible: true 
         });
         
-        // Small delay to let user see the bubble (optional, feels more 'reasoning-like')
-        tokio::time::sleep(Duration::from_millis(120)).await;
-
-        // Save to cache
         if let Ok(mut cache) = state.cache.lock() {
             cache.insert(path, result);
         }
     }
 
-    // Notify UI: Done
     let _ = app.emit("ai-progress", ProgressPayload { 
         message: "Done.".into(), progress: 100.0, visible: false 
     });
@@ -1540,8 +1326,43 @@ async fn commit_pending_stems(
 #[tauri::command]
 fn discard_pending_stems(job_id: String, state: State<AppState>) -> Result<(), String> {
     let mut pending = state.pending_stems.lock().map_err(|_| "Failed to lock pending")?;
-    pending.remove(&job_id); // Just remove from memory
+    
+    if let Some(group) = pending.remove(&job_id) {
+        // Garbage collect orphaned audio files to prevent storage leaks
+        for (_, path) in group.stems {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    
     Ok(())
+}
+
+// --- COMMAND VALIDATION MIDDLEWARE ---
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct AiStep {
+    pub action: String,
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[tauri::command]
+fn sanitize_ai_batch(mut steps: Vec<AiStep>) -> Result<Vec<AiStep>, String> {
+    // RULE 1: Engine handles solo isolation. 
+    // Reject any AI-hallucinated mute commands if a solo command exists in the same batch.
+    let has_solo = steps.iter().any(|s| s.action == "toggle_solo" || s.action == "unsolo");
+    
+    if has_solo {
+        let original_len = steps.len();
+        steps.retain(|s| s.action != "toggle_mute" && s.action != "unmute");
+        
+        if steps.len() < original_len {
+            println!("🛡️ Engine Guard: Stripped illegal mute commands during a Solo operation.");
+        }
+    }
+
+    // [Future Rules can go here]
+    // e.g., prevent duplicate toggles, prevent destructive commands while recording, etc.
+
+    Ok(steps)
 }
 
 fn main() {
@@ -1591,21 +1412,23 @@ fn main() {
             split_clip,
             get_project_state,
             merge_clip_with_next,
-            delete_clip,
             delete_track,
+            delete_clip,
             update_eq,
             get_eq_state,
             update_compressor,
             get_compressor_state,
+            reload_audio_device,
             get_output_devices,
             get_input_devices,
             undo,
             redo,
             ask_ai,
-            separate_stems,
-            cancel_ai_job,
+            stem_separation::separate_stems,
+            stem_separation::cancel_ai_job,
             commit_pending_stems,
-            discard_pending_stems
+            discard_pending_stems,
+            sanitize_ai_batch
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

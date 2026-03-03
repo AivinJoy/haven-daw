@@ -130,9 +130,10 @@ pub struct Clip {
     pub start_time: Duration, // Position on timeline
     pub offset: Duration,     // Start offset in the file (trimming)
     pub duration: Duration,
-     pub source_duration: Duration, // full file length (never changes)
+    pub source_duration: Duration, // full file length (never changes)
     pub source_sr: u32,
     pub source_ch: usize,   // Duration on timeline
+    pub clip_number: usize, // <--- NEW: Backend controlled ID
     decoder: DecoderHandle,
 }
 
@@ -178,6 +179,7 @@ impl Clip {
             source_duration: duration,
             source_sr: source_sr,
             source_ch: source_ch,
+            clip_number: 0,
             decoder,
         })
     }
@@ -212,6 +214,7 @@ impl Clip {
             source_duration,
             source_sr,
             source_ch,
+            clip_number: 0,
             decoder,
         };
         
@@ -292,6 +295,7 @@ impl Clip {
             source_duration, // <--- USE PROBED SOURCE LENGTH
             source_sr,
             source_ch,
+            clip_number: 0,
             decoder,
         };
 
@@ -411,6 +415,7 @@ impl Track {
         }
 
         self.clips.push(clip);
+        self.renumber_clips();
         // --- NEW: Trigger Background Analysis ---
         // --- NEW: Trigger Background Analysis ---
         let analysis_ref = Arc::clone(&self.analysis);
@@ -456,6 +461,13 @@ impl Track {
         matches!(self.state, TrackState::Playing)
     }
 
+    // --- NEW: Automatically numbers clips sequentially from left to right ---
+    pub fn renumber_clips(&mut self) {
+        for (i, clip) in self.clips.iter_mut().enumerate() {
+            clip.clip_number = i + 1;
+        }
+    }
+
     pub fn merge_next(&mut self, clip_index: usize) -> anyhow::Result<()> {
        if clip_index + 1 >= self.clips.len() {
            return Err(anyhow::anyhow!("No next clip to merge"));
@@ -492,6 +504,7 @@ impl Track {
        let right_duration = self.clips[clip_index + 1].duration;
        self.clips[clip_index].duration += right_duration;
        self.clips.remove(clip_index + 1);
+       self.renumber_clips();
     
        Ok(())
     }
@@ -539,6 +552,7 @@ impl Track {
                 // IMPORTANT: preserve full file duration + metadata
                 // If your new_known doesn't set these yet, update it to do so.
                 self.clips.insert(i + 1, new_clip);
+                self.renumber_clips();
 
                 println!("✂️ Split successful @ {:.2}s", split_secs);
                 break;
@@ -561,6 +575,7 @@ impl Track {
     pub fn delete_clip(&mut self, clip_index: usize) -> anyhow::Result<()> {
         if clip_index < self.clips.len() {
             self.clips.remove(clip_index);
+            self.renumber_clips();
             println!("🗑️ Deleted clip at index {}", clip_index);
             Ok(())
         } else {
@@ -728,6 +743,8 @@ impl Track {
             self.clips.push(clip);
         }
 
+        self.renumber_clips();
+
         // --- NEW: Trigger Background Analysis on Load ---
         let analysis_ref = Arc::clone(&self.analysis);
         std::thread::spawn(move || {
@@ -742,4 +759,39 @@ impl Track {
         println!("♻️ Restored clip at index {}", index);
         Ok(())
     }
+
+    // --- NEW: Fast-path restore for Undo operations (Avoids heavy decoding) ---
+    pub fn restore_deleted_clip(
+        &mut self,
+        index: usize,
+        path: String,
+        start: Duration,
+        offset: Duration,
+        dur: Duration,
+        source_duration: Duration,
+        source_sr: u32,
+        source_ch: usize,
+        out_sr: u32,
+        out_ch: usize
+    ) -> anyhow::Result<()> {
+        
+        // Use new_known instead of recover! It's instant!
+        let clip = Clip::new_known(
+            path, start, offset, dur, source_duration, source_sr, source_ch, out_sr, out_ch
+        )?;
+        
+        if index <= self.clips.len() {
+            self.clips.insert(index, clip);
+        } else {
+            self.clips.push(clip);
+        }
+
+        self.renumber_clips();
+        
+        // Note: No background analysis thread spawned here because undoing 
+        // a clip doesn't change the source file's overall track analysis.
+
+        Ok(())
+    }
+
 }
