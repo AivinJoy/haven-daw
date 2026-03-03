@@ -5,6 +5,7 @@
 )]
 
 mod stem_separation;
+mod ai_transaction;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -23,13 +24,13 @@ use daw_modules::engine::time::GridLine; // Import GridLine
 
 
 // [NEW STRUCT] Holds separation results waiting for user confirmation
-struct PendingStemGroup {
+pub struct PendingStemGroup {
     pub stems: HashMap<String, String>, // key: Stem Name (e.g., "vocals"), value: File Path
     pub original_track_id: u32,
 }
 
 // --- 1. Global State ---
-struct AppState {
+pub struct AppState {
     pub audio: Mutex<AudioRuntime>,
     pub recorder: Mutex<Option<Recorder>>,
     pub cache: Mutex<HashMap<String, ImportResult>>,
@@ -39,13 +40,13 @@ struct AppState {
 // --- 2. Define Return Struct ---
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct ImportResult {
-    mins: Vec<f32>,
-    maxs: Vec<f32>,
-    duration: f64,
-    bins_per_second: f64,
-    bpm: Option<f32>, // New field for BPM
-    color: String,
+pub struct ImportResult {
+    pub mins: Vec<f32>,
+    pub maxs: Vec<f32>,
+    pub duration: f64,
+    pub bins_per_second: f64,
+    pub bpm: Option<f32>, // New field for BPM
+    pub color: String,
 }
 
 // Helper function to build the UI state from the raw track list
@@ -558,24 +559,35 @@ struct MasterMeterState {
 
 #[tauri::command]
 fn get_master_meter(state: tauri::State<AppState>) -> Result<MasterMeterState, String> {
-    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    
-    // NOTE: Update your AudioRuntime::get_master_meter() to return a 4-tuple: 
-    // (peak_l, peak_r, rms_l, rms_r) decoded from the atomic bits
-    let (peak_l, peak_r, rms_l, rms_r) = audio.get_master_meter();
-    
-    Ok(MasterMeterState {
-        peak_l,
-        peak_r,
-        rms_l,
-        rms_r,
-    })
+    // FIX: Use try_lock to prevent freezing the UI when the AI is editing the engine.
+    if let Ok(audio) = state.audio.try_lock() {
+        let (peak_l, peak_r, rms_l, rms_r) = audio.get_master_meter();
+        
+        Ok(MasterMeterState {
+            peak_l,
+            peak_r,
+            rms_l,
+            rms_r,
+        })
+    } else {
+        // Fallback: If busy, just return 0s for this single frame to keep the UI smooth
+        Ok(MasterMeterState {
+            peak_l: 0.0,
+            peak_r: 0.0,
+            rms_l: 0.0,
+            rms_r: 0.0,
+        })
+    }
 }
 
 #[tauri::command]
 fn get_track_meters(state: tauri::State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
-    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    Ok(audio.get_meters())
+    // Use try_lock to prevent UI stuttering!
+    if let Ok(audio) = state.audio.try_lock() {
+        Ok(audio.get_meters())
+    } else {
+        Ok(Vec::new()) // Return empty if busy, avoiding the freeze
+    }
 }
 
 #[tauri::command]
@@ -683,8 +695,13 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
 
 #[tauri::command]
 fn get_all_meters(state: State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
-    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    Ok(audio.get_meters())
+    // FIX: try_lock prevents UI stuttering. If the engine is busy, we just return empty 
+    // for this single frame instead of freezing Svelte's requestAnimationFrame loop.
+    if let Ok(audio) = state.audio.try_lock() {
+        Ok(audio.get_meters())
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 // --- NEW: Tauri command for AI analysis ---
@@ -867,38 +884,38 @@ async fn get_project_state(
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LoadedClip {
-    id: String,
-    track_id: u32,
-    name: String,
-    path: String,
-    start_time: f64,
-    duration: f64,
-    offset: f64,
-    waveform: ImportResult,
-    color: String,
-    clip_number: usize, // <--- NEW
+pub struct LoadedClip {
+    pub id: String,
+    pub track_id: u32,
+    pub name: String,
+    pub path: String,
+    pub start_time: f64,
+    pub duration: f64,
+    pub offset: f64,
+    pub waveform: ImportResult,
+    pub color: String,
+    pub clip_number: usize, // <--- NEW
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LoadedTrack {
-    id: u32,
-    name: String,
-    color: String,
-    clips: Vec<LoadedClip>,
-    gain: f32,
-    pan: f32,
-    muted: bool,
-    solo: bool,
+pub struct LoadedTrack {
+    pub id: u32,
+    pub name: String,
+    pub color: String,
+    pub clips: Vec<LoadedClip>,
+    pub gain: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub solo: bool,
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProjectState {
-    tracks: Vec<LoadedTrack>,
-    bpm: f32,
-    master_gain: f32,
+pub struct ProjectState {
+    pub tracks: Vec<LoadedTrack>,
+    pub bpm: f32,
+    pub master_gain: f32,
 }
 
 
@@ -1053,77 +1070,37 @@ async fn ask_ai(
     // 3. Construct System Prompt (Strict JSON Schema)
     // 3. System Prompt (Strict JSON-Only API)
     // 3. System Prompt (Refined for Reset Logic & JSON Stability)
+    // 3. System Prompt (Strict JSON-Only API Aligned with Layer 1 Contract)
+    // 3. System Prompt (Strict JSON-Only API Aligned with Layer 1 Contract)
     let system_prompt = format!(
-        "You are a strict JSON API for a DAW. You speak ONLY JSON.\n\
+        "You are an elite Audio DSP Engineer and a strict JSON API for a DAW. You speak ONLY JSON.\n\
         \n\
         CONTEXT:\nTracks: [{}]\n\
         USER REQUEST: '{}'\n\
         \n\
-        SCHEMA:\n\
-        {{ \n\
-          \"steps\": [ \n\
-            {{ \n\
-              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"unmute\" | \"unsolo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"merge_clips\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"update_eq\" | \"update_compressor\" | \"none\", \n\
-              \"parameters\": {{ \n\
-                \"track_id\": number (optional, default to 0), \n\
-                \"value\": number (optional), \n\
-                \"time\": number (optional), \n\
-                \"clip_number\": number (optional, the 1-based ID of the clip), \n\
-                \"job_id\": string (optional), \n\
-                \"band_index\": number (optional, 0-3), \n\
-                \"filter_type\": \"LowPass\" | \"HighPass\" | \"Peaking\" | \"LowShelf\" | \"HighShelf\" | \"Notch\" | \"BandPass\" (optional), \n\
-                \"freq\": number (optional), \n\
-                \"q\": number (optional), \n\
-                \"gain\": number (optional, -24.0 to 24.0), \n\
-                \"threshold_db\": number (optional, -60.0 to 0.0), \n\
-                \"ratio\": number (optional, 1.0 to 20.0), \n\
-                \"attack_ms\": number (optional), \n\
-                \"release_ms\": number (optional), \n\
-                \"makeup_gain_db\": number (optional) \n\
-              }} \n\
-            }} \n\
-          ], \n\
-          \"message\": \"Short confirmation text or detailed conversational answer\" \n\
-        }}\n\
+        CRITICAL RULES:\n\
+        1. YOU MUST OUTPUT A VALID JSON OBJECT WITH 'version': '1.0' and a 'commands' array. NO PLAIN TEXT.\n\
+        2. FLATTEN PARAMETERS. Put 'track_id', 'value', 'time', 'clip_number' DIRECTLY inside the command object.\n\
+        3. ACTION NAMES MUST MATCH EXACTLY: play, pause, record, seek, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor, none.\n\
+        4. DSP MATH: \n\
+           - Gain is 0.0 (silent) to 2.0 (+6dB). Default/Unity volume is 1.0.\n\
+           - Pan is -1.0 (Left) to 1.0 (Right). Default pan is 0.0.\n\
+        5. DO NOT INVENT FIELDS. \n\
+           - For 'merge_clips': ONLY use 'track_id' and 'clip_number' (the left-most clip).\n\
+           - For 'reset volume': ONLY output 'set_gain' with 'value': 1.0. Do NOT output mute or solo commands.\n\
+           - For 'reset track': Output 'set_gain' to 1.0, 'set_pan' to 0.0, 'unmute', and 'unsolo'.\n\
+        6. OMIT UNUSED KEYS. If a command doesn't need a parameter, do not include it. Do NOT output null values.\n\
+        7. DEFAULT TRACK: If the user doesn't specify a track, assume \"track_id\": 0. EXCEPT for global commands (play, pause, record, create_track, undo, redo, toggle_monitor). NEVER output 'track_id' for global commands.\n\
         \n\
-        RULES:\n\
-        1. CRITICAL: YOU MUST OUTPUT A VALID JSON OBJECT. NO PLAIN TEXT.\n\
-        2. STRICT DATA TYPES (PREVENT API CRASH): \n\
-           - For 'value', 'track_id', and all numerical fields, YOU MUST USE REAL NUMBERS (e.g., 1.0, -1.0, 0). \n\
-           - NEVER use strings like \"full\", \"max\", \"left\", or \"right\" for numbers. \n\
-           - If the user does not specify a track number, you MUST assume \"track_id\": 0.\n\
-           - NEVER output a parameter with a 'null' value. If a parameter is not needed, omit the key completely.\n\
-        3. CONVERSATION VS COMMANDS:\n\
-           - If user ASKS A QUESTION: Use action \"none\" and put the answer in \"message\".\n\
-           - If user ISSUES A COMMAND: Use the correct action ('set_gain', 'set_pan', etc.). NEVER use \"none\" for a command.\n\
-        4. GAIN/VOLUME SCALE:\n\
-            - Range is 0.0 (Silence) to 2.0 (Max Volume). 1.0 is Unity.\n\
-            - If user says 'max volume', use 'set_gain' with \"value\": 2.0.\n\
-            - If user says 'half volume', use 'set_gain' with \"value\": 0.5.\n\
-        5. PAN SCALE:\n\
-            - Range is -1.0 (Full Left) to 1.0 (Full Right). 0.0 is Center.\n\
-            - If user says 'pan right' or 'right pan full', use 'set_pan' with \"value\": 1.0.\n\
-            - If user says 'pan left' or 'left pan full', use 'set_pan' with \"value\": -1.0.\n\
-        6. MUTE & SOLO LOGIC:\n\
-            - Use 'toggle_mute', 'unmute', 'toggle_solo', or 'unsolo' as actions where appropriate.\n\
-        7. RESET LOGIC (CRITICAL FOR MUTE/SOLO): When asked to 'Reset' a track or 'Reset Everything', you must neutralize active states by outputting multiple steps:\n\
-           - ALWAYS include 'set_gain' with \"value\": 1.0.\n\
-           - ALWAYS include 'set_pan' with \"value\": 0.0.\n\
-           - DO NOT include 'unmute' UNLESS the context explicitly says 'muted: true'.\n\
-           - DO NOT include 'unsolo' UNLESS the context explicitly says 'solo: true'.\n\
-        8. EQ & COMPRESSION LOGIC:\n\
-           - To EQ, use 'update_eq'. Bands: 0=Lows, 1=LowMids, 2=HighMids, 3=Highs. Default Q is 1.0.\n\
-           - To Compress, use 'update_compressor'. Standard: threshold -20.0, ratio 4.0, attack 5.0, release 50.0.\n\
-        9. CLIP EDITING:\n\
-           - To split, use 'split_clip' with \"time\".\n\
-           - To merge clips (e.g. \"merge clip 1 and 2\"), use 'merge_clips' and pass the left-most clip as \"clip_number\" (e.g. \"clip_number\": 1).\n\
+        SCHEMA EXAMPLES:\n\
+        User: \"reset the volume of track 0\"\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"set_gain\", \"track_id\": 0, \"value\": 1.0}}], \"message\": \"Track 0 volume reset to default (1.0).\", \"confidence\": 1.0}}\n\
         \n\
-        EXAMPLES OF CORRECT BEHAVIOR:\n\
-        User: \"max the volume of track 0\"\n\
-        Assistant: {{\"steps\": [{{\"action\": \"set_gain\", \"parameters\": {{\"track_id\": 0, \"value\": 2.0}}}}], \"message\": \"Track 0 volume set to maximum.\"}}\n\
+        User: \"merge clip 1 and 2 on track 0\"\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"merge_clips\", \"track_id\": 0, \"clip_number\": 1}}], \"message\": \"Merging clip 1 with the next clip.\", \"confidence\": 1.0}}\n\
         \n\
-        User: \"reset track 0\" (Assume context says muted: false, solo: false)\n\
-        Assistant: {{\"steps\": [{{\"action\": \"set_gain\", \"parameters\": {{\"track_id\": 0, \"value\": 1.0}}}}, {{\"action\": \"set_pan\", \"parameters\": {{\"track_id\": 0, \"value\": 0.0}}}}], \"message\": \"Track 0 reset.\"}}\n\
+        User: \"undo that\"\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"undo\"}}], \"message\": \"Undoing last action.\", \"confidence\": 1.0}}\n\
         ",
         track_context, user_input
     );
@@ -1424,6 +1401,7 @@ fn main() {
             undo,
             redo,
             ask_ai,
+            ai_transaction::execute_ai_transaction,
             stem_separation::separate_stems,
             stem_separation::cancel_ai_job,
             commit_pending_stems,

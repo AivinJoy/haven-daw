@@ -12,6 +12,7 @@ use crate::audio::setup_output_device;
 use crate::engine::Engine;
 use crate::session::{Session, commands::*}; 
 use crate::engine::time::GridLine;
+use crate::ai::ai_schema::{AiAction, EqFilterType as SchemaEqFilterType};
 use crate::effects::equalizer::EqParams; // <--- Import this
 use crate::effects::compressor::CompressorParams;
 use crate::analyzer::AnalysisProfile;
@@ -807,10 +808,9 @@ impl AudioRuntime {
     // --- ADD NEW METHOD TO AUDIORUNTIME ---
     pub fn get_meters(&self) -> Vec<MeterSnapshot> {
         let mut results = Vec::new();
-        // UI thread quickly locks the registry map (NOT the engine)
+        // UI thread quickly locks the registry map
         if let Ok(reg) = self.meter_registry.lock() {
             for (&track_id, meters) in reg.iter() {
-                // Instantly read the lock-free atomics
                 results.push(MeterSnapshot {
                     track_id,
                     peak_l: f32::from_bits(meters.peak_l.load(std::sync::atomic::Ordering::Relaxed)),
@@ -822,6 +822,11 @@ impl AudioRuntime {
                 });
             }
         }
+        
+        // 🐛 BUG FIX: HashMaps are unordered! We MUST sort them by track_id 
+        // so the UI doesn't assign meters to random tracks every frame.
+        results.sort_by_key(|m| m.track_id);
+        
         results
     }
 
@@ -845,4 +850,131 @@ impl AudioRuntime {
         }
         results
     }
+
+    // --- AI TRANSACTION BATCH EXECUTION ---
+    pub fn apply_ai_batch(&self, commands: Vec<AiAction>) -> anyhow::Result<()> {
+        for action in commands {
+            match action {
+                AiAction::SetGain { track_id, value } => {
+                    let safe_gain = value.clamp(0.0, 2.0);
+                    let (tid, old_gain) = {
+                        let eng = self.engine.lock().unwrap();
+                        let t = eng.tracks().get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found"))?;
+                        (t.id, t.gain)
+                    };
+                    let cmd = Box::new(crate::session::commands::SetTrackGain {
+                        track_id: tid,
+                        old_gain,
+                        new_gain: safe_gain,
+                    });
+                    self.session.lock().unwrap().apply(&self.engine, cmd)?;
+                },
+                AiAction::SetMasterGain { value } => self.set_master_gain(value.clamp(0.0, 1.5)),
+                AiAction::SetPan { track_id, value } => {
+                    let safe_pan = value.clamp(-1.0, 1.0);
+                    let (tid, old_pan) = {
+                        let eng = self.engine.lock().unwrap();
+                        let t = eng.tracks().get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found"))?;
+                        (t.id, t.pan)
+                    };
+                    let cmd = Box::new(crate::session::commands::SetTrackPan {
+                        track_id: tid,
+                        old_pan,
+                        new_pan: safe_pan,
+                    });
+                    self.session.lock().unwrap().apply(&self.engine, cmd)?;
+                },
+                AiAction::ToggleMute { track_id } => {
+                    let (tid, old_state) = {
+                        let eng = self.engine.lock().unwrap();
+                        let t = eng.tracks().get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found"))?;
+                        (t.id, t.muted)
+                    };
+                    let cmd = Box::new(crate::session::commands::SetTrackMute {
+                        track_id: tid,
+                        new_state: !old_state, // Actually toggles now
+                    });
+                    self.session.lock().unwrap().apply(&self.engine, cmd)?;
+                },
+                AiAction::Unmute { track_id } => {
+                    let tid = {
+                        let eng = self.engine.lock().unwrap();
+                        let t = eng.tracks().get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found"))?;
+                        t.id
+                    };
+                    let cmd = Box::new(crate::session::commands::SetTrackMute {
+                        track_id: tid,
+                        new_state: false,
+                    });
+                    self.session.lock().unwrap().apply(&self.engine, cmd)?;
+                },
+                AiAction::ToggleSolo { track_id } => self.toggle_solo(track_id),
+                AiAction::Unsolo { track_id: _ } => self.clear_solo(),
+                AiAction::SplitClip { track_id, time } => { self.split_clip(track_id, time)?; },
+                AiAction::MergeClips { track_id, clip_number } => {
+                    let clip_idx = clip_number.saturating_sub(1); // AI uses 1-based index
+                    self.merge_clip_with_next(track_id, clip_idx)?;
+                },
+                AiAction::DeleteClip { track_id, clip_number } => {
+                    let clip_idx = clip_number.saturating_sub(1);
+                    self.delete_clip(track_id, clip_idx)?;
+                },
+                AiAction::DeleteTrack { track_id } => { self.delete_track(track_id)?; },
+                AiAction::CreateTrack { count: _, track_id: _ } => { self.create_empty_track()?; },
+                AiAction::UpdateEq { track_id, band_index, filter_type, freq, q, gain } => {
+                    let safe_freq = freq.clamp(20.0, 20_000.0);
+                    let safe_q = q.clamp(0.1, 10.0);
+                    let safe_gain = gain.clamp(-18.0, 18.0);
+
+                    let mapped_filter = match filter_type {
+                        SchemaEqFilterType::Peaking => crate::effects::equalizer::EqFilterType::Peaking,
+                        SchemaEqFilterType::LowShelf => crate::effects::equalizer::EqFilterType::LowShelf,
+                        SchemaEqFilterType::HighShelf => crate::effects::equalizer::EqFilterType::HighShelf,
+                        SchemaEqFilterType::LowPass => crate::effects::equalizer::EqFilterType::LowPass,
+                        SchemaEqFilterType::HighPass => crate::effects::equalizer::EqFilterType::HighPass,
+                    };
+
+                    let params = crate::effects::equalizer::EqParams {
+                        filter_type: mapped_filter,
+                        freq: safe_freq,
+                        q: safe_q,
+                        gain: safe_gain,
+                        active: true,
+                    };
+                    self.update_eq(track_id, band_index, params);
+                },
+                AiAction::UpdateCompressor { track_id, threshold_db, ratio, attack_ms, release_ms, makeup_gain_db } => {
+                    let params = crate::effects::compressor::CompressorParams {
+                        is_active: true,
+                        threshold_db: threshold_db.clamp(-60.0, 0.0),
+                        ratio: ratio.clamp(1.0, 20.0),
+                        attack_ms: attack_ms.clamp(0.1, 200.0),
+                        release_ms: release_ms.clamp(10.0, 1000.0),
+                        makeup_gain_db: makeup_gain_db.clamp(0.0, 24.0),
+                    };
+                    self.update_compressor(track_id, params);
+                },
+                AiAction::Undo => self.undo(),
+                AiAction::Redo => self.redo(),
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        if let Ok(eng) = self.engine.lock() {
+            let peak_l = f32::from_bits(eng.master_meter.peak_l.load(std::sync::atomic::Ordering::Relaxed));
+            let peak_r = f32::from_bits(eng.master_meter.peak_r.load(std::sync::atomic::Ordering::Relaxed));
+            let max_peak = peak_l.max(peak_r);
+            
+            if max_peak > 1.0 {
+                println!("⚠️ AI caused Master clipping! Governance auto-compensating...");
+                if let Ok(mut g) = self.master_gain.lock() {
+                    let attenuation = 0.95 / max_peak;
+                    *g = (*g * attenuation).clamp(0.0, 2.0);
+                }
+            }
+        }
+        Ok(())
+    }
+
 }
