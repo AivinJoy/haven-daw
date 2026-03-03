@@ -1,5 +1,4 @@
 // src/waveform/mod.rs
-pub mod terminal;
 use anyhow::{anyhow, Result};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;

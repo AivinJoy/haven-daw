@@ -5,7 +5,6 @@ pub mod decoder;
 mod player;
 pub mod waveform;
 pub mod recorder;
-pub mod daw_controller;
 pub mod engine;
 pub mod audio_runtime;
 pub mod session;
