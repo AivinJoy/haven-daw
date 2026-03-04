@@ -125,7 +125,9 @@
 
             meterScale = Math.max(0, Math.min(1.0, dbToPercent(pDb) / 100));
             rmsScale = Math.max(0, Math.min(1.0, dbToPercent(toDB(maxRms)) / 100));
-        } catch(e) {}
+        } catch(e) {
+            if (e !== "busy") console.error("Meter fetch failed:", e);
+        }
         reqId = requestAnimationFrame(pollMasterMeter);
     };
 

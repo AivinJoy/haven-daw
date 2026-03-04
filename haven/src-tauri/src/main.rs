@@ -8,7 +8,7 @@ mod stem_separation;
 mod ai_transaction;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration};
 use std::collections::HashMap;
 use tauri::{State, Emitter, Manager};
@@ -35,6 +35,8 @@ pub struct AppState {
     pub recorder: Mutex<Option<Recorder>>,
     pub cache: Mutex<HashMap<String, ImportResult>>,
     pub pending_stems: Mutex<HashMap<String, PendingStemGroup>>,
+    pub master_meter: Arc<daw_modules::engine::metering::TrackMeters>,
+    pub meter_registry: Arc<Mutex<HashMap<u32, Arc<daw_modules::engine::metering::TrackMeters>>>>,
 }
 
 // --- 2. Define Return Struct ---
@@ -114,6 +116,13 @@ fn build_ui_state(
             });
         }
 
+        // NEW: If a track has no clips, assume it's an empty track for recording
+        let source_type = if info.clips.is_empty() {
+            "mic".to_string()
+        } else {
+            "media".to_string()
+        };
+
         results.push(LoadedTrack {
             id: track_id,
             name: info.name.clone(),
@@ -122,7 +131,8 @@ fn build_ui_state(
             gain: info.gain,
             pan: info.pan,
             muted: info.muted,
-            solo: info.solo
+            solo: info.solo,
+            source: source_type,
         });
     }
     
@@ -559,35 +569,44 @@ struct MasterMeterState {
 
 #[tauri::command]
 fn get_master_meter(state: tauri::State<AppState>) -> Result<MasterMeterState, String> {
-    // FIX: Use try_lock to prevent freezing the UI when the AI is editing the engine.
-    if let Ok(audio) = state.audio.try_lock() {
-        let (peak_l, peak_r, rms_l, rms_r) = audio.get_master_meter();
-        
-        Ok(MasterMeterState {
-            peak_l,
-            peak_r,
-            rms_l,
-            rms_r,
-        })
-    } else {
-        // Fallback: If busy, just return 0s for this single frame to keep the UI smooth
-        Ok(MasterMeterState {
-            peak_l: 0.0,
-            peak_r: 0.0,
-            rms_l: 0.0,
-            rms_r: 0.0,
-        })
+    // 100% Lock Free - Reads directly from atomics!
+    let p_l = f32::from_bits(state.master_meter.hold_l.load(std::sync::atomic::Ordering::Relaxed));
+    let p_r = f32::from_bits(state.master_meter.hold_r.load(std::sync::atomic::Ordering::Relaxed));
+    let r_l = f32::from_bits(state.master_meter.rms_l.load(std::sync::atomic::Ordering::Relaxed));
+    let r_r = f32::from_bits(state.master_meter.rms_r.load(std::sync::atomic::Ordering::Relaxed));
+    
+    Ok(MasterMeterState {
+        peak_l: p_l,
+        peak_r: p_r,
+        rms_l: r_l,
+        rms_r: r_r,
+    })
+}
+
+#[tauri::command]
+fn get_all_meters(state: State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
+    let mut results = Vec::new();
+    // This lock only blocks other UI fetches, never the DSP engine!
+    if let Ok(reg) = state.meter_registry.lock() {
+        for (&track_id, meters) in reg.iter() {
+            results.push(daw_modules::audio_runtime::MeterSnapshot {
+                track_id,
+                peak_l: f32::from_bits(meters.peak_l.load(std::sync::atomic::Ordering::Relaxed)),
+                peak_r: f32::from_bits(meters.peak_r.load(std::sync::atomic::Ordering::Relaxed)),
+                hold_l: f32::from_bits(meters.hold_l.load(std::sync::atomic::Ordering::Relaxed)),
+                hold_r: f32::from_bits(meters.hold_r.load(std::sync::atomic::Ordering::Relaxed)),
+                rms_l: f32::from_bits(meters.rms_l.load(std::sync::atomic::Ordering::Relaxed)),
+                rms_r: f32::from_bits(meters.rms_r.load(std::sync::atomic::Ordering::Relaxed)),
+            });
+        }
     }
+    results.sort_by_key(|m| m.track_id);
+    Ok(results)
 }
 
 #[tauri::command]
 fn get_track_meters(state: tauri::State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
-    // Use try_lock to prevent UI stuttering!
-    if let Ok(audio) = state.audio.try_lock() {
-        Ok(audio.get_meters())
-    } else {
-        Ok(Vec::new()) // Return empty if busy, avoiding the freeze
-    }
+    get_all_meters(state) // Reuse logic
 }
 
 #[tauri::command]
@@ -689,20 +708,11 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
         gain: 1.0,
         pan: 0.0,
         muted: false,
-        solo: false
+        solo: false,
+        source: "mic".to_string()
     })
 }
 
-#[tauri::command]
-fn get_all_meters(state: State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
-    // FIX: try_lock prevents UI stuttering. If the engine is busy, we just return empty 
-    // for this single frame instead of freezing Svelte's requestAnimationFrame loop.
-    if let Ok(audio) = state.audio.try_lock() {
-        Ok(audio.get_meters())
-    } else {
-        Ok(Vec::new())
-    }
-}
 
 // --- NEW: Tauri command for AI analysis ---
 #[tauri::command]
@@ -908,6 +918,7 @@ pub struct LoadedTrack {
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
+    pub source: String,
 }
 
 #[derive(serde::Serialize)]
@@ -1347,6 +1358,9 @@ fn main() {
     dotenv().ok();
     let runtime = AudioRuntime::new(None).expect("Failed to init Audio Engine");
 
+    let master_meter = runtime.master_meter.clone();
+    let meter_registry = runtime.meter_registry.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_log::Builder::default().build())
@@ -1355,6 +1369,8 @@ fn main() {
             recorder: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
             pending_stems: Mutex::new(HashMap::new()),
+            master_meter,
+            meter_registry,
         })
         .invoke_handler(tauri::generate_handler![
             play,

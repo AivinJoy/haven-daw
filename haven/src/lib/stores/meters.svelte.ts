@@ -37,7 +37,7 @@ class MeterStore {
                 this.levels[meter.track_id] = meter;
             }
         } catch (e) {
-            console.error("Meter fetch failed:", e);
+           if (e !== "busy") console.error("Meter fetch failed:", e);
         }
 
         // Recursively call the next frame (locks to monitor refresh rate, e.g., 60fps)

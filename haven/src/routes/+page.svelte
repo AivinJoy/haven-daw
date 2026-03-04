@@ -413,7 +413,7 @@
                     ...newTrack,
                     isRecording: oldTrack ? oldTrack.isRecording : false,
                     monitor: oldTrack ? oldTrack.monitor : false,
-                    source: oldTrack ? oldTrack.source : 'media',
+                    source: oldTrack ? oldTrack.source : newTrack.source,
                     savePath: oldTrack ? oldTrack.savePath : undefined
                 };
             });
@@ -432,66 +432,91 @@
     $effect(() => {
         const handleRefresh = () => refreshProjectState();
 
-        const handleAICommand = async (e: Event) => {
-            const customEvent = e as CustomEvent;
-            const { action, mode, time, direction } = customEvent.detail;
-            console.log("⚡ Page received AI Command:", action, mode);
+        // --- NEW: ASYNC COMMAND QUEUE ---
+        // Prevents Race Conditions when AI sends multiple commands at once
+        let aiCommandQueue: any[] = [];
+        let isProcessingQueue = false;
 
-            switch (action) {
-                case 'play':
-                    if (!isPlaying) togglePlayback();
-                    break;
-                case 'pause':
-                    if (isPlaying) togglePlayback();
-                    break;
-                case 'rewind':
-                    rewind(); // Calls your existing rewind() function (Seek 0)
-                    break;
+        const processQueue = async () => {
+            if (isProcessingQueue) return;
+            isProcessingQueue = true;
 
-                // --- NEW SEEK LOGIC ---
-                case 'seek':
-                    if (time === undefined) return;
-                    
-                    let targetTime = time;
+            while (aiCommandQueue.length > 0) {
+                const detail = aiCommandQueue.shift();
+                const { action, mode, time, direction } = detail;
+                console.log("⚡ Processing AI Command:", action, mode);
 
-                    if (direction === 'forward') {
-                        targetTime = currentTime + time;
-                    } else if (direction === 'backward') {
-                        targetTime = currentTime - time;
-                    }
-                    
-                    // Clamp to 0 (cannot seek before start)
-                    seekTo(Math.max(0, targetTime));
-                    break;
-                // ----------------------
-                    
-                case 'record':
-                    // Toggle recording logic
-                    // FIX: If AI specified a track (e.g., "Record on Track 2"), ARM it first!
-                    if (customEvent.detail.trackId) {
-                        console.log("🤖 AI Arming Track:", customEvent.detail.trackId);
-                        armTrack(customEvent.detail.trackId);
-                    }
+                switch (action) {
+                    case 'play':
+                        if (!isPlaying) togglePlayback();
+                        break;
+                    case 'pause':
+                        if (isPlaying) togglePlayback();
+                        break;
+                    case 'rewind':
+                        rewind(); 
+                        break;
 
-                    // Then proceed with toggle logic
-                    if (isRecordingMode) stopRecordingLogic();
-                    else startRecordingLogic();
-                    break;
-                case 'create_track':
-                    // Handle "Add audio track" vs "Add empty track"
-                    if (mode === 'record') await addNewTrack('record');
-                    else await addNewTrack('default');
-                    break;
+                    case 'seek':
+                        if (time === undefined) break;
+                        let targetTime = time;
+                        if (direction === 'forward') {
+                            targetTime = currentTime + time;
+                        } else if (direction === 'backward') {
+                            targetTime = currentTime - time;
+                        }
+                        seekTo(Math.max(0, targetTime));
+                        break;
 
-                case 'toggle_monitor':
-                    if (customEvent.detail.trackId) {
-                         // Reuse your existing logic!
-                         // We create a fake event structure because your handleToggleMonitor expects CustomEvent<number>
-                         handleToggleMonitor(new CustomEvent('toggle', { detail: customEvent.detail.trackId }));
-                    }
-                    break; 
-                    
+                    case 'record':
+                        if (detail.trackId !== undefined) {
+                            console.log("🤖 AI Arming Track:", detail.trackId);
+                            armTrack(detail.trackId);
+                        } else if (!isRecordingMode && tracks.length > 0 && !tracks.some(t => t.isRecording)) {
+                            console.log("🤖 Auto-Arming newest track");
+                            armTrack(tracks[tracks.length - 1].id);
+                        }
+
+                        if (isRecordingMode) stopRecordingLogic();
+                        else startRecordingLogic(); 
+                        break;
+
+                    case 'create_track':
+                        // AWAIT is crucial here so the queue pauses until Rust finishes making the track
+                        if (mode === 'record') await addNewTrack('record');
+                        else await addNewTrack('default');
+                        
+                        // Give Svelte a tiny moment to update the DOM/tracks array before moving to the next command
+                        await new Promise(resolve => setTimeout(resolve, 50));
+                        break;
+
+                    case 'toggle_monitor':
+                        let targetTrackId = detail.trackId;
+                        
+                        // Fallbacks if AI didn't specify a track ID
+                        if (targetTrackId === undefined) {
+                            const armed = tracks.find(t => t.isRecording);
+                            if (armed) {
+                                targetTrackId = armed.id; // Target armed track
+                            } else if (tracks.length > 0) {
+                                targetTrackId = tracks[tracks.length - 1].id; // Target newest track
+                            }
+                        }
+
+                        if (targetTrackId !== undefined) {
+                            handleToggleMonitor(new CustomEvent('toggle', { detail: targetTrackId }));
+                        }
+                        break;
+                }
             }
+            isProcessingQueue = false;
+        };
+
+        const handleAICommand = (e: Event) => {
+            const customEvent = e as CustomEvent;
+            // Push the command into the queue instead of running it immediately
+            aiCommandQueue.push(customEvent.detail);
+            processQueue(); // Kick off the queue processor
         };
         
         window.addEventListener('refresh-project', handleRefresh);

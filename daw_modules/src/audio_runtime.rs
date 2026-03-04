@@ -27,11 +27,13 @@ pub enum EngineCommand {
     SetMasterGain(f32),
     SetBpm(f32),
     ToggleMute(usize),
+    SetTrackMute(usize, bool), // <--- NEW: Strict Mute/Unmute
     ToggleSolo(usize),
     ClearSolo,
     SetTrackGain(usize, f32),
     SetTrackPan(usize, f32),
     UpdateCompressor(usize, CompressorParams),
+    UpdateEq(usize, usize, EqParams), // <--- NEW: Lock-Free EQ
     SetMonitor(crate::recorder::monitor::Monitor), // <--- NEW
     ClearMonitor, // <--- NEW
 }
@@ -56,8 +58,8 @@ pub struct AudioRuntime {
     stream: Option<Stream>, // Changed to Option to allow hot-swapping
     command_tx: Mutex<SyncSender<EngineCommand>>, // Wrapped in Mutex to allow channel recreation
     // --- ADDED: A safe map of Track ID -> Lock-Free Atomics ---
-    meter_registry: Arc<Mutex<std::collections::HashMap<u32, std::sync::Arc<crate::engine::metering::TrackMeters>>>>,
-    master_meter: Arc<crate::engine::metering::TrackMeters>, // <--- CHANGED TYPE
+    pub meter_registry: Arc<Mutex<std::collections::HashMap<u32, std::sync::Arc<crate::engine::metering::TrackMeters>>>>,
+    pub master_meter: Arc<crate::engine::metering::TrackMeters>, // <--- CHANGED TYPE
     pub recorder: Arc<Mutex<Option<crate::recorder::Recorder>>>, // <--- NEW
 }
 
@@ -176,7 +178,7 @@ impl AudioRuntime {
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _| {
-                if let Ok(mut eng) = engine_cb.try_lock() {
+                if let Ok(mut eng) = engine_cb.lock() {
                     while let Ok(cmd) = command_rx.try_recv() {
                         match cmd {
                             EngineCommand::SetMonitor(m) => active_monitor = Some(m),
@@ -191,6 +193,15 @@ impl AudioRuntime {
                             EngineCommand::SetBpm(bpm) => eng.set_bpm(bpm),
                             EngineCommand::ToggleMute(idx) => {
                                 if let Some(t) = eng.tracks_mut().get_mut(idx) { t.muted = !t.muted; }
+                            }
+                            // --- NEW HANDLERS ---
+                            EngineCommand::SetTrackMute(idx, state) => {
+                                if let Some(t) = eng.tracks_mut().get_mut(idx) { t.muted = state; }
+                            }
+                            EngineCommand::UpdateEq(track_idx, band_idx, params) => {
+                                if let Some(t) = eng.tracks_mut().get_mut(track_idx) {
+                                    t.track_eq.update_band(band_idx, params);
+                                }
                             }
                             EngineCommand::SetTrackGain(idx, gain) => {
                                 if let Some(t) = eng.tracks_mut().get_mut(idx) { t.gain = gain; }
@@ -583,33 +594,15 @@ impl AudioRuntime {
 
     // --- EQ COMMANDS ---
 
+    // KEEP THIS ONE
     pub fn update_eq(&self, track_index: usize, band_index: usize, params: EqParams) {
-        let (track_id, old_params) = {
-            let eng = self.engine.lock().unwrap();
-            if let Some(track) = eng.tracks().get(track_index) {
-                let current_state = track.track_eq.get_state(); 
-                if band_index < current_state.len() {
-                    (Some(track.id), Some(current_state[band_index]))
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            }
-        };
+        // PRO FIX: Send directly to the lock-free queue! Bypasses the Undo Session for AI adjustments.
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::UpdateEq(track_index, band_index, params));
+    }
 
-        if let (Some(tid), Some(old)) = (track_id, old_params) {
-            let cmd = Box::new(UpdateEq {
-                track_id: tid,
-                band_index,
-                old_params: old,
-                new_params: params,
-            });
-            
-            if let Ok(mut session) = self.session.lock() {
-                let _ = session.apply(&self.engine, cmd);
-            }
-        }
+    // NEW Helper
+    pub fn set_track_mute(&self, track_index: usize, state: bool) {
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetTrackMute(track_index, state));
     }
 
     pub fn get_eq_state(&self, track_index: usize) -> Vec<EqParams> {
@@ -855,77 +848,30 @@ impl AudioRuntime {
     pub fn apply_ai_batch(&self, commands: Vec<AiAction>) -> anyhow::Result<()> {
         for action in commands {
             match action {
-                AiAction::SetGain { track_id, value } => {
-                    let safe_gain = value.clamp(0.0, 2.0);
-                    let (tid, old_gain) = {
-                        let eng = self.engine.lock().unwrap();
-                        let t = eng.tracks().get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found"))?;
-                        (t.id, t.gain)
-                    };
-                    let cmd = Box::new(crate::session::commands::SetTrackGain {
-                        track_id: tid,
-                        old_gain,
-                        new_gain: safe_gain,
-                    });
-                    self.session.lock().unwrap().apply(&self.engine, cmd)?;
-                },
-                AiAction::SetMasterGain { value } => self.set_master_gain(value.clamp(0.0, 1.5)),
-                AiAction::SetPan { track_id, value } => {
-                    let safe_pan = value.clamp(-1.0, 1.0);
-                    let (tid, old_pan) = {
-                        let eng = self.engine.lock().unwrap();
-                        let t = eng.tracks().get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found"))?;
-                        (t.id, t.pan)
-                    };
-                    let cmd = Box::new(crate::session::commands::SetTrackPan {
-                        track_id: tid,
-                        old_pan,
-                        new_pan: safe_pan,
-                    });
-                    self.session.lock().unwrap().apply(&self.engine, cmd)?;
-                },
-                AiAction::ToggleMute { track_id } => {
-                    let (tid, old_state) = {
-                        let eng = self.engine.lock().unwrap();
-                        let t = eng.tracks().get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found"))?;
-                        (t.id, t.muted)
-                    };
-                    let cmd = Box::new(crate::session::commands::SetTrackMute {
-                        track_id: tid,
-                        new_state: !old_state, // Actually toggles now
-                    });
-                    self.session.lock().unwrap().apply(&self.engine, cmd)?;
-                },
-                AiAction::Unmute { track_id } => {
-                    let tid = {
-                        let eng = self.engine.lock().unwrap();
-                        let t = eng.tracks().get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found"))?;
-                        t.id
-                    };
-                    let cmd = Box::new(crate::session::commands::SetTrackMute {
-                        track_id: tid,
-                        new_state: false,
-                    });
-                    self.session.lock().unwrap().apply(&self.engine, cmd)?;
-                },
+                // 🚀 ALL MIXING COMMANDS NOW ROUTE THROUGH THE LOCK-FREE QUEUE
+                AiAction::SetGain { track_id, value } => self.set_track_gain(track_id, value),
+                AiAction::SetMasterGain { value } => self.set_master_gain(value),
+                AiAction::SetPan { track_id, value } => self.set_track_pan(track_id, value),
+                AiAction::ToggleMute { track_id } => self.toggle_mute(track_id),
+                AiAction::Unmute { track_id } => self.set_track_mute(track_id, false),
                 AiAction::ToggleSolo { track_id } => self.toggle_solo(track_id),
                 AiAction::Unsolo { track_id: _ } => self.clear_solo(),
-                AiAction::SplitClip { track_id, time } => { self.split_clip(track_id, time)?; },
+                
+                // Note: Structural changes (split, merge, create) still lock momentarily 
+                // because they require memory allocation, but they are rare.
+                AiAction::SplitClip { track_id, time } => { let _ = self.split_clip(track_id, time); },
                 AiAction::MergeClips { track_id, clip_number } => {
-                    let clip_idx = clip_number.saturating_sub(1); // AI uses 1-based index
-                    self.merge_clip_with_next(track_id, clip_idx)?;
+                    let clip_idx = clip_number.saturating_sub(1); 
+                    let _ = self.merge_clip_with_next(track_id, clip_idx);
                 },
                 AiAction::DeleteClip { track_id, clip_number } => {
                     let clip_idx = clip_number.saturating_sub(1);
-                    self.delete_clip(track_id, clip_idx)?;
+                    let _ = self.delete_clip(track_id, clip_idx);
                 },
-                AiAction::DeleteTrack { track_id } => { self.delete_track(track_id)?; },
-                AiAction::CreateTrack { count: _, track_id: _ } => { self.create_empty_track()?; },
+                AiAction::DeleteTrack { track_id } => { let _ = self.delete_track(track_id); },
+                AiAction::CreateTrack { count: _, track_id: _ } => { let _ = self.create_empty_track(); },
+                
                 AiAction::UpdateEq { track_id, band_index, filter_type, freq, q, gain } => {
-                    let safe_freq = freq.clamp(20.0, 20_000.0);
-                    let safe_q = q.clamp(0.1, 10.0);
-                    let safe_gain = gain.clamp(-18.0, 18.0);
-
                     let mapped_filter = match filter_type {
                         SchemaEqFilterType::Peaking => crate::effects::equalizer::EqFilterType::Peaking,
                         SchemaEqFilterType::LowShelf => crate::effects::equalizer::EqFilterType::LowShelf,
@@ -933,12 +879,11 @@ impl AudioRuntime {
                         SchemaEqFilterType::LowPass => crate::effects::equalizer::EqFilterType::LowPass,
                         SchemaEqFilterType::HighPass => crate::effects::equalizer::EqFilterType::HighPass,
                     };
-
                     let params = crate::effects::equalizer::EqParams {
                         filter_type: mapped_filter,
-                        freq: safe_freq,
-                        q: safe_q,
-                        gain: safe_gain,
+                        freq: freq.clamp(20.0, 20_000.0),
+                        q: q.clamp(0.1, 10.0),
+                        gain: gain.clamp(-18.0, 18.0),
                         active: true,
                     };
                     self.update_eq(track_id, band_index, params);
@@ -959,21 +904,8 @@ impl AudioRuntime {
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        if let Ok(eng) = self.engine.lock() {
-            let peak_l = f32::from_bits(eng.master_meter.peak_l.load(std::sync::atomic::Ordering::Relaxed));
-            let peak_r = f32::from_bits(eng.master_meter.peak_r.load(std::sync::atomic::Ordering::Relaxed));
-            let max_peak = peak_l.max(peak_r);
-            
-            if max_peak > 1.0 {
-                println!("⚠️ AI caused Master clipping! Governance auto-compensating...");
-                if let Ok(mut g) = self.master_gain.lock() {
-                    let attenuation = 0.95 / max_peak;
-                    *g = (*g * attenuation).clamp(0.0, 2.0);
-                }
-            }
-        }
+        // NO MORE 50ms THREAD SLEEP.
+        // NO MORE POST-BATCH MASTER MUTEX LOCK.
         Ok(())
     }
 
