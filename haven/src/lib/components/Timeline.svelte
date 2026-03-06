@@ -101,10 +101,12 @@
     }
 
     function handleScroll() {
-        if (rulerContainer && trackContainer) {
-            rulerContainer.scrollLeft = trackContainer.scrollLeft;
-            updateGrid(); 
-        }
+        if (!trackContainer || !rulerContainer) return;
+        
+        // The ruler strictly mirrors the master track container
+        rulerContainer.scrollLeft = trackContainer.scrollLeft;
+        // (Grid generation will be moved to a local Svelte $derived state in Step 3)
+        updateGrid();
 
         // 🛡️ ROBUST SYNC CHECK
         // Allow a 2px tolerance for browser sub-pixel scrolling differences
@@ -417,10 +419,11 @@
         bind:this={rulerContainer} 
         class="flex-1 flex items-end overflow-hidden relative pb-1 cursor-pointer"
         onmousedown={handleRulerClick}
+        onwheel={(e) => e.preventDefault()}
         role="button"
         tabindex="0"
     >
-        <div class="h-full relative pointer-events-none" style="width: {maxDurationSeconds * PIXELS_PER_SECOND * zoomMultiplier}px;">
+        <div class="h-full relative pointer-events-none shrink-0" style="width: {maxDurationSeconds * PIXELS_PER_SECOND * zoomMultiplier}px; min-width: max-content;">
             
             {#each gridLines as line}
                 <div 
