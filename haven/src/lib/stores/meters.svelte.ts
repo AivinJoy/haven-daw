@@ -14,7 +14,10 @@ export type MeterSnapshot = {
 class MeterStore {
     // Svelte 5 reactive state holding the latest meters by Track ID
     levels = $state<Record<number, MeterSnapshot>>({});
+
     private running = false;
+    private polling = false;
+    private intervalMs = 33; // ~30 FPS (stable for visual meters)
 
     start() {
         if (this.running) return;
@@ -29,20 +32,34 @@ class MeterStore {
     private loop = async () => {
         if (!this.running) return;
 
-        try {
-            // 1 Call per frame, fetches ALL tracks instantly lock-free
-            const data: MeterSnapshot[] = await invoke('get_all_meters');
-            
-            for (const meter of data) {
-                this.levels[meter.track_id] = meter;
+        // Prevent overlapping IPC calls
+        if (!this.polling) {
+            this.polling = true;
+
+            try {
+                const data: MeterSnapshot[] = await invoke('get_all_meters');
+
+                // Batch update (single reactive assignment)
+                const updated: Record<number, MeterSnapshot> = {};
+
+                for (const meter of data) {
+                    updated[meter.track_id] = meter;
+                }
+
+                this.levels = updated;
+
+            } catch (e) {
+                if (e !== "busy") {
+                    console.error("Meter fetch failed:", e);
+                }
             }
-        } catch (e) {
-           if (e !== "busy") console.error("Meter fetch failed:", e);
+
+            this.polling = false;
         }
 
-        // Recursively call the next frame (locks to monitor refresh rate, e.g., 60fps)
-        requestAnimationFrame(this.loop);
-    }
+        // Stable throttled polling (not tied to display refresh rate)
+        setTimeout(this.loop, this.intervalMs);
+    };
 }
 
 export const meterStore = new MeterStore();

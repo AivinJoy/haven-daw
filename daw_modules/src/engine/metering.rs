@@ -95,6 +95,12 @@ impl MeterState {
         self.stored_rms_l = (self.stored_rms_l * block_decay) + (rms_l * (1.0 - block_decay));
         self.stored_rms_r = (self.stored_rms_r * block_decay) + (rms_r * (1.0 - block_decay));
 
+        // Denormal protection for RMS to prevent CPU spikes on silence
+        self.stored_rms_l += 1e-20; 
+        self.stored_rms_l -= 1e-20;
+        self.stored_rms_r += 1e-20;
+        self.stored_rms_r -= 1e-20;
+
         // 3. Process Left Channel (Instant Attack, Peak Hold, Scaled Decay)
         if max_l > self.stored_peak_l {
             self.stored_peak_l = max_l;

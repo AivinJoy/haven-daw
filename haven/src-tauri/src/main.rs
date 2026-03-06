@@ -584,23 +584,32 @@ fn get_master_meter(state: tauri::State<AppState>) -> Result<MasterMeterState, S
 }
 
 #[tauri::command]
-fn get_all_meters(state: State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
-    let mut results = Vec::new();
-    // This lock only blocks other UI fetches, never the DSP engine!
-    if let Ok(reg) = state.meter_registry.lock() {
-        for (&track_id, meters) in reg.iter() {
-            results.push(daw_modules::audio_runtime::MeterSnapshot {
-                track_id,
-                peak_l: f32::from_bits(meters.peak_l.load(std::sync::atomic::Ordering::Relaxed)),
-                peak_r: f32::from_bits(meters.peak_r.load(std::sync::atomic::Ordering::Relaxed)),
-                hold_l: f32::from_bits(meters.hold_l.load(std::sync::atomic::Ordering::Relaxed)),
-                hold_r: f32::from_bits(meters.hold_r.load(std::sync::atomic::Ordering::Relaxed)),
-                rms_l: f32::from_bits(meters.rms_l.load(std::sync::atomic::Ordering::Relaxed)),
-                rms_r: f32::from_bits(meters.rms_r.load(std::sync::atomic::Ordering::Relaxed)),
-            });
-        }
+fn get_all_meters(
+    state: State<AppState>,
+) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
+
+    let reg = state
+        .meter_registry
+        .lock()
+        .map_err(|_| "meter registry poisoned")?;
+
+    let mut results = Vec::with_capacity(reg.len());
+
+    for (&track_id, meters) in reg.iter() {
+        results.push(daw_modules::audio_runtime::MeterSnapshot {
+            track_id,
+            peak_l: f32::from_bits(meters.peak_l.load(std::sync::atomic::Ordering::Relaxed)),
+            peak_r: f32::from_bits(meters.peak_r.load(std::sync::atomic::Ordering::Relaxed)),
+            hold_l: f32::from_bits(meters.hold_l.load(std::sync::atomic::Ordering::Relaxed)),
+            hold_r: f32::from_bits(meters.hold_r.load(std::sync::atomic::Ordering::Relaxed)),
+            rms_l: f32::from_bits(meters.rms_l.load(std::sync::atomic::Ordering::Relaxed)),
+            rms_r: f32::from_bits(meters.rms_r.load(std::sync::atomic::Ordering::Relaxed)),
+        });
     }
-    results.sort_by_key(|m| m.track_id);
+
+    // ❌ Remove sorting (registry should not change order during playback)
+    // results.sort_by_key(|m| m.track_id);
+
     Ok(results)
 }
 
