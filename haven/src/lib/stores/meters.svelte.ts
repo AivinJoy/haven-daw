@@ -39,14 +39,21 @@ class MeterStore {
             try {
                 const data: MeterSnapshot[] = await invoke('get_all_meters');
 
-                // Batch update (single reactive assignment)
-                const updated: Record<number, MeterSnapshot> = {};
+                /// Mutate existing state to prevent Svelte 5 reactive graph thrashing
+                const activeIds = new Set<number>();
 
                 for (const meter of data) {
-                    updated[meter.track_id] = meter;
+                    this.levels[meter.track_id] = meter;
+                    activeIds.add(meter.track_id);
                 }
 
-                this.levels = updated;
+                // Clean up deleted tracks to prevent memory leaks
+                for (const id of Object.keys(this.levels)) {
+                    const numId = Number(id);
+                    if (!activeIds.has(numId)) {
+                        delete this.levels[numId];
+                    }
+                }
 
             } catch (e) {
                 if (e !== "busy") {

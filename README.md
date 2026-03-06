@@ -3,7 +3,7 @@
 A high-performance Digital Audio Workstation built with **Rust**, **Tauri**, and **SvelteKit**. 
 Features a custom high-performance audio engine, non-destructive arrangement, an integrated AI Music Director, and a real-time lock-free mixer.
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue) ![Rust](https://img.shields.io/badge/built_with-Rust-orange) ![Svelte](https://img.shields.io/badge/frontend-Svelte 5-red)
+![Version](https://img.shields.io/badge/version-0.1.0-blue) ![Rust](https://img.shields.io/badge/built_with-Rust-orange) ![Svelte](https://img.shields.io/badge/frontend-Svelte_5-red)
 
 ## 🚀 Key Features
 

@@ -46,7 +46,7 @@ impl MeterState {
         let decay_coeff = (-1.0 / (release_time_sec * sample_rate)).exp();
         
         // 500ms Peak Hold 
-        let hold_duration_frames = 0;
+        let hold_duration_frames = (0.5 * sample_rate) as usize;
 
         Self {
             decay_coeff,
@@ -96,10 +96,8 @@ impl MeterState {
         self.stored_rms_r = (self.stored_rms_r * block_decay) + (rms_r * (1.0 - block_decay));
 
         // Denormal protection for RMS to prevent CPU spikes on silence
-        self.stored_rms_l += 1e-20; 
-        self.stored_rms_l -= 1e-20;
-        self.stored_rms_r += 1e-20;
-        self.stored_rms_r -= 1e-20;
+        if self.stored_rms_l < 1e-12 { self.stored_rms_l = 0.0; }
+        if self.stored_rms_r < 1e-12 { self.stored_rms_r = 0.0; }
 
         // 3. Process Left Channel (Instant Attack, Peak Hold, Scaled Decay)
         if max_l > self.stored_peak_l {
@@ -110,8 +108,7 @@ impl MeterState {
                 self.hold_frames_l = self.hold_frames_l.saturating_sub(block_size);
             } else {
                 self.stored_peak_l *= block_decay;
-                self.stored_peak_l += 1e-20; // Denormal protection
-                self.stored_peak_l -= 1e-20;
+                if self.stored_peak_l < 1e-12 { self.stored_peak_l = 0.0; }
             }
         }
 
@@ -124,8 +121,7 @@ impl MeterState {
                 self.hold_frames_r = self.hold_frames_r.saturating_sub(block_size);
             } else {
                 self.stored_peak_r *= block_decay;
-                self.stored_peak_r += 1e-20;
-                self.stored_peak_r -= 1e-20;
+                if self.stored_peak_r < 1e-12 { self.stored_peak_r = 0.0; }
             }
         }
 

@@ -563,6 +563,8 @@ fn set_master_gain(gain: f32, state: State<AppState>) -> Result<(), String> {
 struct MasterMeterState {
     peak_l: f32,
     peak_r: f32,
+    hold_l: f32,
+    hold_r : f32,
     rms_l: f32,
     rms_r: f32,
 }
@@ -570,16 +572,22 @@ struct MasterMeterState {
 #[tauri::command]
 fn get_master_meter(state: tauri::State<AppState>) -> Result<MasterMeterState, String> {
     // 100% Lock Free - Reads directly from atomics!
-    let p_l = f32::from_bits(state.master_meter.hold_l.load(std::sync::atomic::Ordering::Relaxed));
-    let p_r = f32::from_bits(state.master_meter.hold_r.load(std::sync::atomic::Ordering::Relaxed));
-    let r_l = f32::from_bits(state.master_meter.rms_l.load(std::sync::atomic::Ordering::Relaxed));
-    let r_r = f32::from_bits(state.master_meter.rms_r.load(std::sync::atomic::Ordering::Relaxed));
+    let peak_l = f32::from_bits(state.master_meter.peak_l.load(std::sync::atomic::Ordering::Relaxed));
+    let peak_r = f32::from_bits(state.master_meter.peak_r.load(std::sync::atomic::Ordering::Relaxed));
+
+    let hold_l = f32::from_bits(state.master_meter.hold_l.load(std::sync::atomic::Ordering::Relaxed));
+    let hold_r = f32::from_bits(state.master_meter.hold_r.load(std::sync::atomic::Ordering::Relaxed));
+
+    let rms_l = f32::from_bits(state.master_meter.rms_l.load(std::sync::atomic::Ordering::Relaxed));
+    let rms_r = f32::from_bits(state.master_meter.rms_r.load(std::sync::atomic::Ordering::Relaxed));
     
     Ok(MasterMeterState {
-        peak_l: p_l,
-        peak_r: p_r,
-        rms_l: r_l,
-        rms_r: r_r,
+        peak_l,
+        peak_r,
+        hold_l,
+        hold_r,
+        rms_l,
+        rms_r,
     })
 }
 
