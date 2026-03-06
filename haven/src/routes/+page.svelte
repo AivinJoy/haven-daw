@@ -28,7 +28,20 @@
     
     // --- GLOBAL BPM STATE ---
     let bpm = $state(120); 
+    let timeSignatureNumerator = $state(4);
     let masterGain = $state(1.0); // Add this near 'bpm'
+
+    // Sync BPM & Time Signature with Backend whenever they change
+    $effect(() => {
+        if (bpm > 0) {
+            invoke('set_bpm', { bpm: bpm }).catch(e => console.error("Failed to set BPM:", e));
+        }
+        if (timeSignatureNumerator > 0) {
+            invoke('set_time_signature', { numerator: timeSignatureNumerator })
+                .catch(e => console.error("Failed to set Time Sig:", e));
+        }
+    });
+
     let projectName = $state("untitled Project");
 
     let isRecordingMode = $state(false);
@@ -66,7 +79,11 @@
 
     // --- TRACKS STATE ---
     let tracks = $state<Track[]>([]);
-    let animationFrameId: number;
+    // --- PLAYHEAD TIMING ARCHITECTURE ---
+    let animationFrameId: number | null = null;
+    let syncIntervalId: ReturnType<typeof setInterval> | null = null;
+    let lastSyncTime = 0;
+    let lastEnginePosition = 0;
 
     // Sync BPM with Backend whenever it changes
     $effect(() => {
@@ -86,10 +103,14 @@
                 const projectState = await invoke<{
                   tracks: Track[],
                   bpm: number,
+                  timeSignatureNumerator?: number, // Made optional to not break old save files
                   masterGain: number
-                }>('load_project', { path });
+                }>('load_project', { path }); // (Do the exact same update in 'get_project_state')
 
                 bpm = projectState.bpm;
+                if (projectState.timeSignatureNumerator) {
+                    timeSignatureNumerator = projectState.timeSignatureNumerator;
+                }
                 
 
                 const fileName = path.split(/[\\/]/).pop();
@@ -317,7 +338,10 @@
             if (!isPlaying) {
                await invoke('play');
                isPlaying = true;
-               pollPosition();
+               // Fetch initial hardware position to anchor the interpolation perfectly
+               lastEnginePosition = await invoke<number>('get_position');
+               currentTime = lastEnginePosition;
+               startPlaybackLoop();
             }
 
             // 5. Start Manager (FIXED ARGUMENTS)
@@ -379,7 +403,7 @@
     async function stopRecordingLogic() {
         await invoke('pause');
         isPlaying = false;
-        cancelAnimationFrame(animationFrameId);
+        stopPlaybackLoop(); // Safely clears rAF and interval
 
         isRecordingMode = false;
         const result = await recordingManager.stop();
@@ -543,7 +567,7 @@
         if (isPlaying) {
             await invoke('pause');
             isPlaying = false;
-            cancelAnimationFrame(animationFrameId);
+            stopPlaybackLoop(); // Safely clears rAF and interval
         } else {
             // AUTO-REWIND FIX
             // If we are within 0.1s of the end (or past it), restart from 0
@@ -553,23 +577,70 @@
 
             await invoke('play');
             isPlaying = true;
-            pollPosition();
+            
+            // Fetch initial hardware position to anchor the interpolation perfectly
+            lastEnginePosition = await invoke<number>('get_position');
+            currentTime = lastEnginePosition;
+            startPlaybackLoop();
         }
     }
 
-    function pollPosition() {
-        invoke<number>('get_position')
-            .then((pos) => {
+    // 1. Low-Frequency Hardware Sync (Corrects JS drift against Rust clock)
+    async function syncEngineClock() {
+        if (!isPlaying) return;
+        try {
+            const pos = await invoke<number>('get_position');
+            lastEnginePosition = pos;
+            lastSyncTime = performance.now();
+            
+            // Hard snap if background tab throttling caused severe drift (> 50ms)
+            if (Math.abs(currentTime - pos) > 0.05) {
                 currentTime = pos;
-                if (isPlaying) {
-                    animationFrameId = requestAnimationFrame(pollPosition);
-                }
-            })
-            .catch(console.error);
+            }
+        } catch (e) {
+            console.error("Hardware sync failed:", e);
+        }
+    }
+
+    // 2. High-Frequency UI Interpolation (Runs at Monitor Refresh Rate)
+    function startPlaybackLoop() {
+        // GUARD: Prevent multiple ghost loops
+        if (!isPlaying || animationFrameId) return;
+        
+        lastSyncTime = performance.now();
+        
+        const renderLoop = (now: number) => {
+            if (!isPlaying) return;
+            
+            const deltaSec = (now - lastSyncTime) / 1000.0;
+            currentTime = lastEnginePosition + deltaSec; // Optimistic smooth advance
+            
+            animationFrameId = requestAnimationFrame(renderLoop);
+        };
+        
+        animationFrameId = requestAnimationFrame(renderLoop);
+        syncIntervalId = setInterval(syncEngineClock, 100);
+    }
+
+    // 3. Centralized Cleanup Helper
+    function stopPlaybackLoop() {
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+        }
+        if (syncIntervalId) {
+            clearInterval(syncIntervalId);
+            syncIntervalId = null;
+        }
     }
 
     async function seekTo(time: number) {
-        currentTime = time; 
+        currentTime = time;
+        
+        // Update anchor points so the interpolator doesn't fight the seek
+        lastEnginePosition = time; 
+        lastSyncTime = performance.now(); 
+        
         try {
             await invoke('seek', { pos: time });
         } catch (e) {
@@ -582,7 +653,7 @@
         if (isPlaying) {
             await invoke('pause');
             isPlaying = false;
-            cancelAnimationFrame(animationFrameId);
+            stopPlaybackLoop(); // Safely clears both rAF and the interval
         }
     }
 
@@ -628,7 +699,7 @@
     }
 
     onDestroy(() => {
-      cancelAnimationFrame(animationFrameId);
+      stopPlaybackLoop(); // Safely clears rAF and interval
     });
 </script>
 
@@ -684,7 +755,8 @@
             <Timeline 
                 bind:tracks={tracks} 
                 currentTime={currentTime} 
-                bpm={bpm} 
+                bpm={bpm}
+                timeSignatureNumerator={timeSignatureNumerator} 
                 on:seek={(e) => seekTo(e.detail)}
                 on:select={handleTrackSelect}
                 on:refresh={refreshProjectState}
