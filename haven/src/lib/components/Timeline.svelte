@@ -8,7 +8,11 @@
 
     const dispatch = createEventDispatcher();
 
-    let { tracks = $bindable([]), currentTime = 0, bpm = 120, timeSignatureNumerator = 4 } = $props();
+    let { tracks = $bindable([]), 
+        currentTime = 0, bpm = 120, 
+        timeSignatureNumerator = 4,
+        timeSignatureDenominator = 4
+    } = $props();
 
     const PIXELS_PER_SECOND = 50; 
 
@@ -92,17 +96,19 @@
             return cachedGrid;
         }
 
-        // 2. Setup Deterministic Math Variables
-        const beatsPerBar = timeSignatureNumerator;
-        const secondsPerBeat = 60 / bpm;
-        const secondsPerBar = secondsPerBeat * beatsPerBar;
-
-        // 3. Dynamic Resolution based on zoom level
+        // 2. Setup Deterministic Math Variables (1:1 with Rust backend)
+        const secondsPerQuarterNote = 60 / bpm;
+        const quartersPerBar = timeSignatureNumerator * (4 / timeSignatureDenominator);
+  
+        // 3. Dynamic Resolution based on standard musical divisions
         let resolution = 1; // Default to Bars
-        if (zoomMultiplier > 2.0) resolution = beatsPerBar * 4; // 16th notes
-        else if (zoomMultiplier >= 0.67) resolution = beatsPerBar; // Beats
+        if (zoomMultiplier > 2.0) resolution = 16; // 16th notes
+        else if (zoomMultiplier >= 0.67) resolution = timeSignatureDenominator; // e.g. 8th notes in 6/8
 
-        const timeStep = secondsPerBar / resolution;
+        // Calculate step timing in quarters
+        const quartersPerStep = (resolution === 1) ? quartersPerBar : (4 / resolution);
+        const timeStep = quartersPerStep * secondsPerQuarterNote;
+        const stepsPerBar = Math.round(quartersPerBar / quartersPerStep);
 
         // 4. Render Buffer (1 full screen before and after viewport)
         const bufferPixels = containerWidth;
@@ -127,8 +133,9 @@
         for (let i = startStep; i <= endStep; i++) {
             lines.push({
                 time: i * timeStep,
-                is_bar_start: i % resolution === 0,
-                bar_number: Math.floor(i / resolution) + 1
+                // Safely handle divisions to prevent modulo-by-zero or NaN
+                is_bar_start: stepsPerBar === 0 ? true : i % stepsPerBar === 0,
+                bar_number: stepsPerBar === 0 ? i + 1 : Math.floor(i / stepsPerBar) + 1
             });
         }
 

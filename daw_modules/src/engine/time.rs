@@ -51,25 +51,30 @@ impl TempoMap {
         }
     }
 
-    /// Seconds per beat (e.g., 120 BPM -> 0.5s)
-    pub fn seconds_per_beat(&self) -> f64 {
-        let quarter_note_spb = 60.0 / self.bpm;
-        quarter_note_spb * (4.0 / self.signature.denominator as f64)
+    /// 1. MECHANICAL CLOCK: The universal clock unit. 
+    /// In a professional DAW, BPM ALWAYS defines the length of a Quarter Note.
+    pub fn seconds_per_quarter_note(&self) -> f64 {
+        60.0 / self.bpm
     }
 
+    /// 2. MUSICAL BEAT CLOCK: The duration of a single musical beat, defined by the denominator.
+    /// In 4/4, this is a quarter note. In 6/8, this is an eighth note.
+    pub fn seconds_per_musical_beat(&self) -> f64 {
+        self.seconds_per_quarter_note() * (4.0 / self.signature.denominator as f64)
+    }
 
-    /// Seconds per bar (e.g., 4/4 @ 120 BPM -> 2.0s)
+    /// Seconds per bar is the number of musical beats (numerator) times the length of each beat.
     pub fn seconds_per_bar(&self) -> f64 {
-        self.seconds_per_beat() * self.signature.numerator as f64
+        self.seconds_per_musical_beat() * self.signature.numerator as f64
     }
 
-    /// Convert exact Duration to a Bar/Beat representation.
+    /// Convert exact Duration to a Bar/Beat representation for the UI Transport.
     /// Returns (bar, beat, percentage_of_beat)
     pub fn timestamp_to_musical(&self, position: Duration) -> (u32, u32, f64) {
         let total_seconds = position.as_secs_f64();
-        let spb = self.seconds_per_beat();
+        let seconds_per_beat = self.seconds_per_musical_beat();
         
-        let total_beats = total_seconds / spb;
+        let total_beats = total_seconds / seconds_per_beat;
         let beats_per_bar = self.signature.numerator as f64;
 
         let bar_index = (total_beats / beats_per_bar).floor();
@@ -86,22 +91,19 @@ impl TempoMap {
 
     /// Generates grid lines (in Seconds) for a specific time range.
     /// This is what the Frontend will ask for to draw the grid.
-    /// `resolution`: 4 = quarter notes, 8 = eighth notes, 16 = sixteenths
-    /// UPDATED: Generates grid line data for a specific time range.
+    /// `resolution`: 1 = bars, 4 = quarter notes, 8 = eighth notes, 16 = sixteenths
     pub fn get_grid_lines(&self, start: Duration, end: Duration, resolution: u32) -> Vec<GridLine> {
-        let spb = self.seconds_per_beat();
-        let beats_per_bar = self.signature.numerator as f64;
+        let spq = self.seconds_per_quarter_note();
+        let quarters_per_bar = self.signature.numerator as f64 * (4.0 / self.signature.denominator as f64);
         
-        // How many beats are in one grid step?
-        // resolution 1 = 1 line per bar
-        // resolution 4 = 1 line per quarter note (1 beat)
-        let beats_per_step = if resolution == 1 {
-            beats_per_bar
+        // Grid Resolution strictly follows standard note divisions (1=bar, 4=quarter, 8=eighth)
+        let quarters_per_step = if resolution == 1 {
+            quarters_per_bar
         } else {
             4.0 / resolution as f64
         };
 
-        let seconds_per_step = spb * beats_per_step;
+        let seconds_per_step = quarters_per_step * spq;
         
         let start_sec = start.as_secs_f64();
         let end_sec = end.as_secs_f64();
@@ -109,8 +111,10 @@ impl TempoMap {
         // 1. Calculate the starting STEP INDEX (Integer)
         // This aligns us perfectly to the grid, regardless of scroll position
         let mut step_index = (start_sec / seconds_per_step).ceil() as u64;
-        
         let mut lines = Vec::new();
+
+        // Calculate once outside the loop
+        let steps_per_bar = (quarters_per_bar / quarters_per_step).round() as u64;
 
         // 2. Loop by Integer Steps (No float accumulation drift)
         loop {
@@ -119,14 +123,7 @@ impl TempoMap {
                 break;
             }
 
-            // 3. Calculate Bar/Beat Logic using Integers (if possible) or precise Math
-            // How many steps fit in one bar?
-            // e.g. 4/4 time, Res 4 (quarter notes) -> 4 steps per bar
-            let steps_per_bar = (beats_per_bar / beats_per_step).round() as u64;
-
-            // Is this step the start of a bar?
-            // If resolution is 1 (bars), every step is a bar start.
-            // If resolution is 4, every 4th step is a bar start.
+            // 3. Calculate Bar/Beat Logic
             let is_bar_start = if steps_per_bar == 0 {
                 true 
             } else {
@@ -134,7 +131,11 @@ impl TempoMap {
             };
 
             // Calculate Bar Number (1-indexed)
-            let bar_number = (step_index / steps_per_bar) as u32 + 1;
+            let bar_number = if steps_per_bar == 0 {
+                step_index as u32 + 1
+            } else {
+                (step_index / steps_per_bar) as u32 + 1
+            };
 
             lines.push(GridLine {
                 time,
