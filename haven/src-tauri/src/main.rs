@@ -53,7 +53,6 @@ pub struct ImportResult {
 
 // Helper function to build the UI state from the raw track list
 fn build_ui_state(
-    _app: &tauri::AppHandle, 
     tracks_info: Vec<daw_modules::audio_runtime::FrontendTrackInfo>,
     bpm: f32,
     master_gain: f32,
@@ -285,18 +284,12 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
             track_list[id].color.clone() 
         };
 
-        // Force UI Update
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
         // --- STEP 2: DECODING (Heavy) ---
         let _ = app.emit("progress-update", ProgressPayload { 
             message: format!("Decoding Audio Data {}...", file_num),
             progress: base_progress + (step_size * 0.15), 
             visible: true 
         });
-        
-        // Force UI Update
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // We clone path so we can move it into the thread
         let path_clone = path.clone();
@@ -313,9 +306,6 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
             visible: true 
         });
 
-        // Force UI Update
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
         let samples_clone = samples.clone();
         
         // RUN HEAVY TASK ON SEPARATE THREAD
@@ -330,8 +320,6 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
             visible: true 
         });
 
-        // Force UI Update
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // --- ADD THIS DEBUG BLOCK ---
         println!("--------------------------------------------------");
@@ -396,36 +384,36 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
 }
 
 #[tauri::command]
-fn analyze_file(path: String, state: State<AppState>) -> Result<ImportResult, String> {
-    // 1. Decode (Analysis)
-    let (samples, sr, channels) = bpm::adapter::decode_to_vec(&path)
-        .map_err(|e| format!("Failed to decode: {}", e))?;
+async fn analyze_file(path: String, state: State<'_, AppState>) -> Result<ImportResult, String> {
+    // Offload the heavy DSP work to a background thread
+    let path_clone = path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let (samples, sr, channels) = bpm::adapter::decode_to_vec(&path_clone)
+            .map_err(|e| format!("Failed to decode: {}", e))?;
+        
+        let wf = Waveform::build_from_samples(&samples, sr, channels, 512);
+        
+        let mut det = bpm::BpmDetector::new(2048);
+        let opts = bpm::BpmOptions { compute_beats: true, ..Default::default() };
+        let detected_bpm = det.detect(&samples, channels, sr, opts).map(|res| res.bpm);
 
-    // 2. Build Waveform (Visual)
-    let wf = Waveform::build_from_samples(&samples, sr, channels, 512);
+        let pixels_per_second = 100.0;
+        let spp = (sr as f64) / pixels_per_second;
+        let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
 
-    // 3. Detect BPM
-    let mut det = bpm::BpmDetector::new(2048);
-    let opts = bpm::BpmOptions { compute_beats: true, ..Default::default() };
-    let detected_bpm = det.detect(&samples, channels, sr, opts).map(|res| res.bpm);
+        Ok::<ImportResult, String>(ImportResult {
+            mins: mins.to_vec(),
+            maxs: maxs.to_vec(),
+            duration: wf.duration_secs,
+            bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
+            bpm: detected_bpm,
+            color: "".to_string(), 
+        })
+    }).await.map_err(|e| e.to_string())??; // Double unwrap for thread panic & our error
 
-    // 4. Calculate Bins for UI
-    let pixels_per_second = 100.0;
-    let spp = (sr as f64) / pixels_per_second;
-    let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
-
-    let result = ImportResult {
-        mins: mins.to_vec(),
-        maxs: maxs.to_vec(),
-        duration: wf.duration_secs,
-        bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
-        bpm: detected_bpm,
-        color: "".to_string(), // Frontend assigns color for clips, or we ignore
-    };
-
-    // CRITICAL FIX: Save to cache so Undo can find it
+    // Lock state quickly just to update cache
     if let Ok(mut cache) = state.cache.lock() {
-        cache.insert(path.clone(), result.clone());
+        cache.insert(path, result.clone());
     }
 
     Ok(result)
@@ -619,11 +607,6 @@ fn get_all_meters(
     // results.sort_by_key(|m| m.track_id);
 
     Ok(results)
-}
-
-#[tauri::command]
-fn get_track_meters(state: tauri::State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
-    get_all_meters(state) // Reuse logic
 }
 
 #[tauri::command]
@@ -905,7 +888,7 @@ async fn get_project_state(
 
     // 2. Build UI State (Reuse Helper)
     // Pass cache AND color store
-    let state = build_ui_state(&app, tracks_info, bpm, master_gain, true, &state.cache)?;
+    let state = build_ui_state(tracks_info, bpm, master_gain, true, &state.cache)?;
     Ok(state)
 }
 
@@ -954,28 +937,28 @@ fn save_project(path: String, state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn export_project(app: tauri::AppHandle,path: String, state: State<AppState>) -> Result<(), String> {
-    // 1. Show Loader
+async fn export_project(app: tauri::AppHandle, path: String) -> Result<(), String> {
     let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Rendering Project...".into(), 
-        progress: 0.0, // Indeterminate start
-        visible: true 
+        message: "Rendering Project...".into(), progress: 0.0, visible: true 
     });
     
-    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    // 1. Clone the app handle so we can move it into the background thread safely
+    let app_clone = app.clone();
+    
+    // 2. Offload rendering to prevent UI freeze
+    tauri::async_runtime::spawn_blocking(move || {
+        // Extract the state and lock the mutex INSIDE the thread
+        let state = app_clone.state::<AppState>();
+        let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+        
+        audio.export_project(path)
+    }).await.map_err(|e| e.to_string())??; // Double unwrap: one for thread panic, one for our Result
 
-    // NOTE: If audio.export_project takes a long time, it will block this thread.
-    // Ideally, export_project inside AudioRuntime should accept a callback closure 
-    // to report progress. For now, this ensures the loader at least appears.
-    let result = audio.export_project(path);
-
-    // 2. Hide Loader
     let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Export Complete".into(), 
-        progress: 100.0, 
-        visible: false 
+        message: "Export Complete".into(), progress: 100.0, visible: false 
     });
-    result
+    
+    Ok(())
 }
 
 #[tauri::command]
@@ -1028,7 +1011,7 @@ async fn load_project(
 
     // 3. Build UI State (Reuse Helper)
     // Pass cache AND color store
-    let state = build_ui_state(&app, tracks_info, bpm, master_gain, false, &state.cache)?;
+    let state = build_ui_state(tracks_info, bpm, master_gain, false, &state.cache)?;
 
     let _ = app.emit("load-percent", 100.0);
     let _ = app.emit("load-progress", "Ready");
@@ -1411,7 +1394,6 @@ fn main() {
             set_master_gain,
             get_master_gain,
             get_master_meter,
-            get_track_meters,
             save_project,
             load_project,
             export_project,
