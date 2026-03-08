@@ -868,6 +868,13 @@ impl AudioRuntime {
                     let clip_idx = clip_number.saturating_sub(1);
                     let _ = self.delete_clip(track_id, clip_idx);
                 },
+                AiAction::MoveClip { track_id, clip_number, new_time } => {
+                    let clip_idx = clip_number.saturating_sub(1);
+                    let _ = self.move_clip(track_id as usize, clip_idx, new_time);
+                },
+                AiAction::SetBpm { bpm } => {
+                    self.set_bpm(bpm);
+                },
                 AiAction::DeleteTrack { track_id } => { let _ = self.delete_track(track_id); },
                 AiAction::CreateTrack { count: _, track_id: _ } => { let _ = self.create_empty_track(); },
                 

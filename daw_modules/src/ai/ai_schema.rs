@@ -61,6 +61,14 @@ pub enum AiAction {
     DeleteTrack {
         track_id: usize,
     },
+    MoveClip {
+        track_id: usize,
+        clip_number: usize,
+        new_time: f64, 
+    },
+    SetBpm {
+        bpm: f32,
+    },
     CreateTrack {
         // Only logically optional fields get Option<>
         count: Option<usize>, 

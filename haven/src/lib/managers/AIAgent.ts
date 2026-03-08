@@ -14,7 +14,9 @@ export interface AICommand {
     track_id?: number;
     value?: number;
     time?: number;
+    new_time?: number;
     clip_number?: number;
+    bpm?: number;
     // EQ params
     band_index?: number;
     filter_type?: string;
@@ -44,7 +46,13 @@ interface RecordingState {
 }
 
 class AIAgent {
-    async sendMessage(userInput: string, tracks: any[], previousMessages: AIMessage[] = []): Promise<AIMessage> {
+    // 1. UPDATED SIGNATURE: Accept globalState
+    async sendMessage(
+        userInput: string, 
+        tracks: any[], 
+        globalState: { bpm: number, timeSignature: string, playheadTime: number },
+        previousMessages: AIMessage[] = []
+    ): Promise<AIMessage> {
         
         const chatHistory = previousMessages.map(m => ({
             role: m.role,
@@ -62,51 +70,54 @@ class AIAgent {
         let trackAnalysis: any[] = [];
         try { trackAnalysis = await invoke('get_track_analysis'); } catch (e) {}
         
-        // 1. Provide Context (No Math, Just Facts)
-        let context = JSON.stringify(tracks.map(t => {
-            const data = trackAnalysis.find(a => a.track_id === t.id);
-            const profile = data?.analysis; 
-            
-            return { 
-                id: t.id, 
-                name: t.name.toLowerCase(),
-                gain_db: t.gain, // Note: Let Rust handle if this is linear or dB
-                pan: t.pan,
-                muted: t.muted,
-                solo: t.solo,
-                clips: t.clips?.map((c: any) => ({
-                    clip_number: c.clipNumber,
-                    start_time: Number(c.startTime.toFixed(2)),
-                    duration: Number(c.duration.toFixed(2))
-                })),
-                analysis: profile ? {
-                    integrated_rms_db: Number(profile.integrated_rms_db.toFixed(1)),
-                    max_sample_peak_db: Number(profile.max_sample_peak_db.toFixed(1)),
-                    crest_factor_db: Number(profile.crest_factor_db.toFixed(1)),
-                    spectral_centroid_hz: Math.round(profile.spectral_centroid_hz)
-                } : "computing..."
-            };
-        }));
+        // 1. Provide Context (Now includes Project timing, Playhead, FX, and Colors)
+        let context = JSON.stringify({
+            project: {
+                bpm: globalState.bpm,
+                time_signature: globalState.timeSignature,
+                playhead_position_seconds: globalState.playheadTime,
+                monitoring_enabled: isMonitoring
+            },
+            tracks: tracks.map(t => {
+                const data = trackAnalysis.find(a => a.track_id === t.id);
+                const profile = data?.analysis; 
+                
+                return { 
+                    id: t.id, 
+                    name: t.name.toLowerCase(),
+                    color: t.color, // <--- NOW THE AI KNOWS THE COLORS!
+                    gain_db: t.gain, // Note: Let Rust handle if this is linear or dB
+                    pan: t.pan,
+                    muted: t.muted,
+                    solo: t.solo,
+                    compressor: t.compressor, // <--- ADDED FX STATE
+                    eq: t.eq,                 // <--- ADDED FX STATE
+                    clips: t.clips?.map((c: any) => ({
+                        clip_number: c.clipNumber || c.clip_number,
+                        start_time: Number((c.startTime || c.start_time).toFixed(2)),
+                        duration: Number(c.duration.toFixed(2))
+                    })),
+                    analysis: profile ? {
+                        integrated_rms_db: Number(profile.integrated_rms_db.toFixed(1)),
+                        max_sample_peak_db: Number(profile.max_sample_peak_db.toFixed(1)),
+                        crest_factor_db: Number(profile.crest_factor_db.toFixed(1)),
+                        spectral_centroid_hz: Math.round(profile.spectral_centroid_hz)
+                    } : "computing..."
+                };
+            })
+        });
 
-        // 2. 🆕 STRICT JSON SCHEMA DEFINITION
+        // 2. STRICT JSON SCHEMA DEFINITION
+        // (Shortened to avoid conflicting with the massive Rust prompt)
         context += `\n\nCRITICAL INSTRUCTIONS:
         You are an elite Audio DSP Engineer. 
         You MUST respond with a STRICT JSON payload matching the "1.0" API contract.
         Do NOT wrap the JSON in markdown blocks.
         
-        {
-          "version": "1.0",
-          "commands": [
-            { "action": "set_gain", "track_id": 0, "value": -3.0 }
-          ],
-          "message": "I reduced the gain to prevent clipping.",
-          "confidence": 0.95
-        }
-        
         RULES:
         1. 'value' for gain/pan/etc MUST be in standard audio units (dB for gain, -1.0 to 1.0 for pan).
         2. Never send percentages.
-        3. Only use allowed actions: play, pause, record, set_gain, set_pan, toggle_mute, toggle_solo, split_clip, merge_clips, delete_clip, update_eq, update_compressor.`;
+        3. Only use allowed actions: play, pause, record, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor.`;
 
         try {
             // 3. Let Backend AI Logic Handle LLM execution
@@ -120,8 +131,7 @@ class AIAgent {
             const data: AIBatchRequest = JSON.parse(rawResponse);
             console.log("🧠 AI Intent:", data);
 
-            // 5. 🆕 DELEGATE ENTIRE BATCH TO RUST (Atomic Transaction)
-            // No more frontend looping. No more math. No more default injections.
+            // 5. DELEGATE ENTIRE BATCH TO RUST (Atomic Transaction)
             if (data.version === "1.0" && data.commands && data.commands.length > 0) {
                 
                 // We separate UI Transport commands from DSP commands
