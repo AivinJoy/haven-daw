@@ -26,6 +26,7 @@ pub enum EngineCommand {
     Seek(Duration),
     SetMasterGain(f32),
     SetBpm(f32),
+    SetTimeSignature(u32, u32),
     ToggleMute(usize),
     SetTrackMute(usize, bool), // <--- NEW: Strict Mute/Unmute
     ToggleSolo(usize),
@@ -191,6 +192,10 @@ impl AudioRuntime {
                             EngineCommand::Seek(pos) => eng.seek(pos),
                             EngineCommand::SetMasterGain(g) => eng.master_gain = g,
                             EngineCommand::SetBpm(bpm) => eng.set_bpm(bpm),
+                            EngineCommand::SetTimeSignature(num, den) => {
+                                eng.transport.tempo.signature.numerator = num;
+                                eng.transport.tempo.signature.denominator = den;
+                            }
                             EngineCommand::ToggleMute(idx) => {
                                 if let Some(t) = eng.tracks_mut().get_mut(idx) { t.muted = !t.muted; }
                             }
@@ -445,6 +450,11 @@ impl AudioRuntime {
 
     pub fn set_bpm(&self, bpm: f32) {
         let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetBpm(bpm));
+    }
+
+    // 3. ADD THIS PUBLIC METHOD
+    pub fn set_time_signature(&self, numerator: u32, denominator: u32) {
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetTimeSignature(numerator, denominator));
     }
 
     pub fn bpm(&self) -> f32 {
@@ -845,74 +855,104 @@ impl AudioRuntime {
     }
 
     // --- AI TRANSACTION BATCH EXECUTION ---
+    // --- AI TRANSACTION BATCH EXECUTION ---
     pub fn apply_ai_batch(&self, commands: Vec<AiAction>) -> anyhow::Result<()> {
+        
+        // 🛠️ FIX: Helper to map stable track_id to the current array track_index
+        let resolve = |tid: usize| -> Option<usize> {
+            self.get_tracks_list().into_iter().position(|t| t.id == tid as u32)
+        };
+
         for action in commands {
             match action {
                 // 🚀 ALL MIXING COMMANDS NOW ROUTE THROUGH THE LOCK-FREE QUEUE
-                AiAction::SetGain { track_id, value } => self.set_track_gain(track_id, value),
+                AiAction::SetGain { track_id, value } => {
+                    if let Some(idx) = resolve(track_id) { self.set_track_gain(idx, value); }
+                },
                 AiAction::SetMasterGain { value } => self.set_master_gain(value),
-                AiAction::SetPan { track_id, value } => self.set_track_pan(track_id, value),
-                AiAction::ToggleMute { track_id } => self.toggle_mute(track_id),
-                AiAction::Unmute { track_id } => self.set_track_mute(track_id, false),
-                AiAction::ToggleSolo { track_id } => self.toggle_solo(track_id),
+                AiAction::SetPan { track_id, value } => {
+                    if let Some(idx) = resolve(track_id) { self.set_track_pan(idx, value); }
+                },
+                AiAction::ToggleMute { track_id } => {
+                    if let Some(idx) = resolve(track_id) { self.toggle_mute(idx); }
+                },
+                AiAction::Unmute { track_id } => {
+                    if let Some(idx) = resolve(track_id) { self.set_track_mute(idx, false); }
+                },
+                AiAction::ToggleSolo { track_id } => {
+                    if let Some(idx) = resolve(track_id) { self.toggle_solo(idx); }
+                },
                 AiAction::Unsolo { track_id: _ } => self.clear_solo(),
                 
-                // Note: Structural changes (split, merge, create) still lock momentarily 
-                // because they require memory allocation, but they are rare.
-                AiAction::SplitClip { track_id, time } => { let _ = self.split_clip(track_id, time); },
+                AiAction::SplitClip { track_id, time, clip_number: _ } => { 
+                    if let Some(idx) = resolve(track_id) { let _ = self.split_clip(idx, time); }
+                },
                 AiAction::MergeClips { track_id, clip_number } => {
-                    let clip_idx = clip_number.saturating_sub(1); 
-                    let _ = self.merge_clip_with_next(track_id, clip_idx);
+                    if let Some(idx) = resolve(track_id) {
+                        let clip_idx = clip_number.saturating_sub(1); 
+                        let _ = self.merge_clip_with_next(idx, clip_idx);
+                    }
                 },
                 AiAction::DeleteClip { track_id, clip_number } => {
-                    let clip_idx = clip_number.saturating_sub(1);
-                    let _ = self.delete_clip(track_id, clip_idx);
+                    if let Some(idx) = resolve(track_id) {
+                        let clip_idx = clip_number.saturating_sub(1);
+                        let _ = self.delete_clip(idx, clip_idx);
+                    }
                 },
                 AiAction::MoveClip { track_id, clip_number, new_time } => {
-                    let clip_idx = clip_number.saturating_sub(1);
-                    let _ = self.move_clip(track_id as usize, clip_idx, new_time);
+                    if let Some(idx) = resolve(track_id) {
+                        let clip_idx = clip_number.saturating_sub(1);
+                        let _ = self.move_clip(idx, clip_idx, new_time);
+                    }
                 },
                 AiAction::SetBpm { bpm } => {
                     self.set_bpm(bpm);
                 },
-                AiAction::DeleteTrack { track_id } => { let _ = self.delete_track(track_id); },
+                AiAction::DeleteTrack { track_id } => { 
+                    if let Some(idx) = resolve(track_id) { let _ = self.delete_track(idx); }
+                },
                 AiAction::CreateTrack { count: _, track_id: _ } => { let _ = self.create_empty_track(); },
                 
                 AiAction::UpdateEq { track_id, band_index, filter_type, freq, q, gain } => {
-                    let mapped_filter = match filter_type {
-                        SchemaEqFilterType::Peaking => crate::effects::equalizer::EqFilterType::Peaking,
-                        SchemaEqFilterType::LowShelf => crate::effects::equalizer::EqFilterType::LowShelf,
-                        SchemaEqFilterType::HighShelf => crate::effects::equalizer::EqFilterType::HighShelf,
-                        SchemaEqFilterType::LowPass => crate::effects::equalizer::EqFilterType::LowPass,
-                        SchemaEqFilterType::HighPass => crate::effects::equalizer::EqFilterType::HighPass,
-                    };
-                    let params = crate::effects::equalizer::EqParams {
-                        filter_type: mapped_filter,
-                        freq: freq.clamp(20.0, 20_000.0),
-                        q: q.clamp(0.1, 10.0),
-                        gain: gain.clamp(-18.0, 18.0),
-                        active: true,
-                    };
-                    self.update_eq(track_id, band_index, params);
+                    if let Some(idx) = resolve(track_id) {
+                        let mapped_filter = match filter_type {
+                            SchemaEqFilterType::Peaking => crate::effects::equalizer::EqFilterType::Peaking,
+                            SchemaEqFilterType::LowShelf => crate::effects::equalizer::EqFilterType::LowShelf,
+                            SchemaEqFilterType::HighShelf => crate::effects::equalizer::EqFilterType::HighShelf,
+                            SchemaEqFilterType::LowPass => crate::effects::equalizer::EqFilterType::LowPass,
+                            SchemaEqFilterType::HighPass => crate::effects::equalizer::EqFilterType::HighPass,
+                        };
+                        let params = crate::effects::equalizer::EqParams {
+                            filter_type: mapped_filter,
+                            freq: freq.clamp(20.0, 20_000.0),
+                            q: q.clamp(0.1, 10.0),
+                            gain: gain.clamp(-18.0, 18.0),
+                            active: true,
+                        };
+                        self.update_eq(idx, band_index, params);
+                    }
                 },
                 AiAction::UpdateCompressor { track_id, threshold_db, ratio, attack_ms, release_ms, makeup_gain_db } => {
-                    let params = crate::effects::compressor::CompressorParams {
-                        is_active: true,
-                        threshold_db: threshold_db.clamp(-60.0, 0.0),
-                        ratio: ratio.clamp(1.0, 20.0),
-                        attack_ms: attack_ms.clamp(0.1, 200.0),
-                        release_ms: release_ms.clamp(10.0, 1000.0),
-                        makeup_gain_db: makeup_gain_db.clamp(0.0, 24.0),
-                    };
-                    self.update_compressor(track_id, params);
+                    if let Some(idx) = resolve(track_id) {
+                        let params = crate::effects::compressor::CompressorParams {
+                            is_active: true,
+                            threshold_db: threshold_db.clamp(-60.0, 0.0),
+                            ratio: ratio.clamp(1.0, 20.0),
+                            attack_ms: attack_ms.clamp(0.1, 200.0),
+                            release_ms: release_ms.clamp(10.0, 1000.0),
+                            makeup_gain_db: makeup_gain_db.clamp(0.0, 24.0),
+                        };
+                        self.update_compressor(idx, params);
+                    }
+                },
+                AiAction::SeparateStems { .. } => {
+                    // Handled async by UI
                 },
                 AiAction::Undo => self.undo(),
                 AiAction::Redo => self.redo(),
             }
         }
 
-        // NO MORE 50ms THREAD SLEEP.
-        // NO MORE POST-BATCH MASTER MUTEX LOCK.
         Ok(())
     }
 

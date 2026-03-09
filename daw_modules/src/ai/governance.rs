@@ -56,7 +56,7 @@ pub fn translate_action(action: AiAction) -> Result<Box<dyn Command>, Governance
             }))
         }
 
-        AiAction::SplitClip { track_id, time } => {
+        AiAction::SplitClip { track_id, time, clip_number: _ } => {
             if time < 0.0 {
                 return Err(GovernanceError::InvalidParameter("Split time cannot be negative".into()));
             }

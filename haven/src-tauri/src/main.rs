@@ -654,6 +654,14 @@ fn set_bpm(bpm: f32, state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_time_signature(numerator: u32, state: State<AppState>) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    // We pass the numerator from the UI, and default the denominator to 4
+    audio.set_time_signature(numerator, 4); 
+    Ok(())
+}
+
+#[tauri::command]
 fn get_grid_lines(
     start: f64, 
     end: f64, 
@@ -874,7 +882,7 @@ fn get_compressor_state(
 
 #[tauri::command]
 async fn get_project_state(
-    app: tauri::AppHandle, 
+    _app: tauri::AppHandle, 
     state: State<'_, AppState>
 ) -> Result<ProjectState, String> {
     
@@ -1088,7 +1096,7 @@ async fn ask_ai(
         CRITICAL RULES:\n\
         1. YOU MUST OUTPUT A VALID JSON OBJECT WITH 'version': '1.0' and a 'commands' array. NO PLAIN TEXT.\n\
         2. FLATTEN PARAMETERS. Put 'track_id', 'value', 'time', 'new_time', 'bpm', 'clip_number' DIRECTLY inside the command object.\n\
-        3. ACTION NAMES MUST MATCH EXACTLY: play, pause, record, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor, none.\n\
+        3. ACTION NAMES MUST MATCH EXACTLY: play, pause, record, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor,separate_stems, none.\n\
         4. DSP MATH: \n\
            - Gain is 0.0 (silent) to 2.0 (+6dB). Default/Unity volume is 1.0.\n\
            - Pan is -1.0 (Left) to 1.0 (Right). Default pan is 0.0.\n\
@@ -1118,6 +1126,8 @@ async fn ask_ai(
         \n\
         User: \"undo that\"\n\
         Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"undo\"}}], \"message\": \"Undoing last action.\", \"confidence\": 1.0}}\n\
+        User: \"isolate the vocals on track 1\"\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"separate_stems\", \"track_id\": 1}}], \"message\": \"Extracting stems from track 1...\", \"confidence\": 0.99}}\n\
         ",
         track_context, user_input
     );
@@ -1390,6 +1400,7 @@ fn main() {
             stop_recording,
             get_recording_status,
             set_bpm,
+            set_time_signature,
             get_grid_lines,
             move_clip,
             seek,

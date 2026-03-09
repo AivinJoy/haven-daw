@@ -531,6 +531,13 @@
                             handleToggleMonitor(new CustomEvent('toggle', { detail: targetTrackId }));
                         }
                         break;
+                    case 'separate_stems':  // <--- ADD THIS CASE
+                        if (detail.track_id !== undefined) {
+                            console.log("🤖 AI Triggering Stem Separation on Track:", detail.track_id);
+                            invoke('separate_stems', { trackId: detail.track_id })
+                                .catch(e => console.error("Stem separation failed:", e));
+                        }
+                        break;    
                 }
             }
             isProcessingQueue = false;
@@ -764,7 +771,14 @@
 
         </div>
 
-        <AIChatbot {tracks} />
+        <AIChatbot 
+            tracks={tracks} 
+            globalState={{ 
+                bpm: bpm, 
+                timeSignature: `${timeSignatureNumerator}/4`, 
+                playheadTime: currentTime 
+            }} 
+        />
 
     {/if}
     {#if showEqWindow}

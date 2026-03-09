@@ -49,6 +49,7 @@ pub enum AiAction {
     SplitClip {
         track_id: usize,
         time: f64, // Required
+        clip_number: Option<usize>,
     },
     MergeClips {
         track_id: usize,
@@ -59,6 +60,9 @@ pub enum AiAction {
         clip_number: usize,
     },
     DeleteTrack {
+        track_id: usize,
+    },
+    SeparateStems {          // <--- ADD THIS
         track_id: usize,
     },
     MoveClip {

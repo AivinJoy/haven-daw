@@ -93,8 +93,8 @@ class AIAgent {
                     compressor: t.compressor, // <--- ADDED FX STATE
                     eq: t.eq,                 // <--- ADDED FX STATE
                     clips: t.clips?.map((c: any) => ({
-                        clip_number: c.clipNumber || c.clip_number,
-                        start_time: Number((c.startTime || c.start_time).toFixed(2)),
+                        clip_number: c.clipNumber ?? c.clip_number ?? 1,
+                        start_time: Number((c.startTime ?? c.start_time ?? 0).toFixed(2)),
                         duration: Number(c.duration.toFixed(2))
                     })),
                     analysis: profile ? {
@@ -135,7 +135,7 @@ class AIAgent {
             if (data.version === "1.0" && data.commands && data.commands.length > 0) {
                 
                 // We separate UI Transport commands from DSP commands
-                const transportCommands = ['play', 'pause', 'record', 'rewind', 'seek', 'toggle_monitor'];
+                const transportCommands = ['play', 'pause', 'record', 'rewind', 'seek', 'toggle_monitor', 'separate_stems'];
                 const dspCommands = data.commands.filter(c => !transportCommands.includes(c.action));
                 const uiCommands = data.commands.filter(c => transportCommands.includes(c.action));
 
