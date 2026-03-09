@@ -1115,7 +1115,7 @@ async fn ask_ai(
            - For 'reset volume': ONLY output 'set_gain' with 'value': 1.0. Do NOT output mute or solo commands.\n\
            - For 'reset track': Output 'set_gain' to 1.0, 'set_pan' to 0.0, 'unmute', and 'unsolo'.\n\
         8. OMIT UNUSED KEYS. If a command doesn't need a parameter, do not include it. Do NOT output null values.\n\
-        9. DEFAULT TRACK: If the user doesn't specify a track, assume \"track_id\": 0. EXCEPT for global commands (play, pause, record, set_bpm, create_track, undo, redo, toggle_monitor). NEVER output 'track_id' for global commands.\n\
+        9. TRACK IDENTIFICATION: You MUST accurately map the user's requested instrument or track name to the correct 'id' provided in the context tracks array. Do NOT default to \"track_id\": 0 unless the user explicitly asks to modify the 'master', 'original', or 'default' track. If you cannot find a matching track for their request, output the 'none' action with an error message.\n\
         \n\
         SCHEMA EXAMPLES:\n\
         User: \"reset the volume of track 0\"\n\

@@ -59,8 +59,17 @@ pub async fn separate_stems(
         stem_splitter_core::set_split_progress_callback(move |progress| {
             match progress {
                 SplitProgress::Stage(stage) => {
+                    let stage_name = match stage {
+                        "resolve_model" => "Resolving model",
+                        "engine_preload" => "Loading model",
+                        "read_audio" => "Reading audio file",
+                        "infer" => "Processing audio",
+                        "write_stems" => "Writing stems",
+                        "finalize" => "Finalizing",
+                        _ => stage,
+                    };
                     let _ = app_clone_split.emit("ai-progress", ProgressPayload { 
-                        message: format!("AI Engine: {}", stage), progress: 10.0, visible: true 
+                        message: format!("AI Engine: {}", stage_name), progress: 10.0, visible: true 
                     });
                 }
                 SplitProgress::Chunks { percent, .. } => {
