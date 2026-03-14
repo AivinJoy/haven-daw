@@ -5,9 +5,10 @@
 )]
 
 mod stem_separation;
+mod ai_transaction;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration};
 use std::collections::HashMap;
 use tauri::{State, Emitter, Manager};
@@ -23,34 +24,35 @@ use daw_modules::engine::time::GridLine; // Import GridLine
 
 
 // [NEW STRUCT] Holds separation results waiting for user confirmation
-struct PendingStemGroup {
+pub struct PendingStemGroup {
     pub stems: HashMap<String, String>, // key: Stem Name (e.g., "vocals"), value: File Path
     pub original_track_id: u32,
 }
 
 // --- 1. Global State ---
-struct AppState {
+pub struct AppState {
     pub audio: Mutex<AudioRuntime>,
     pub recorder: Mutex<Option<Recorder>>,
     pub cache: Mutex<HashMap<String, ImportResult>>,
     pub pending_stems: Mutex<HashMap<String, PendingStemGroup>>,
+    pub master_meter: Arc<daw_modules::engine::metering::TrackMeters>,
+    pub meter_registry: Arc<Mutex<HashMap<u32, Arc<daw_modules::engine::metering::TrackMeters>>>>,
 }
 
 // --- 2. Define Return Struct ---
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct ImportResult {
-    mins: Vec<f32>,
-    maxs: Vec<f32>,
-    duration: f64,
-    bins_per_second: f64,
-    bpm: Option<f32>, // New field for BPM
-    color: String,
+pub struct ImportResult {
+    pub mins: Vec<f32>,
+    pub maxs: Vec<f32>,
+    pub duration: f64,
+    pub bins_per_second: f64,
+    pub bpm: Option<f32>, // New field for BPM
+    pub color: String,
 }
 
 // Helper function to build the UI state from the raw track list
 fn build_ui_state(
-    _app: &tauri::AppHandle, 
     tracks_info: Vec<daw_modules::audio_runtime::FrontendTrackInfo>,
     bpm: f32,
     master_gain: f32,
@@ -113,6 +115,13 @@ fn build_ui_state(
             });
         }
 
+        // NEW: If a track has no clips, assume it's an empty track for recording
+        let source_type = if info.clips.is_empty() {
+            "mic".to_string()
+        } else {
+            "media".to_string()
+        };
+
         results.push(LoadedTrack {
             id: track_id,
             name: info.name.clone(),
@@ -121,7 +130,8 @@ fn build_ui_state(
             gain: info.gain,
             pan: info.pan,
             muted: info.muted,
-            solo: info.solo
+            solo: info.solo,
+            source: source_type,
         });
     }
     
@@ -274,18 +284,12 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
             track_list[id].color.clone() 
         };
 
-        // Force UI Update
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
         // --- STEP 2: DECODING (Heavy) ---
         let _ = app.emit("progress-update", ProgressPayload { 
             message: format!("Decoding Audio Data {}...", file_num),
             progress: base_progress + (step_size * 0.15), 
             visible: true 
         });
-        
-        // Force UI Update
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // We clone path so we can move it into the thread
         let path_clone = path.clone();
@@ -302,9 +306,6 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
             visible: true 
         });
 
-        // Force UI Update
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
         let samples_clone = samples.clone();
         
         // RUN HEAVY TASK ON SEPARATE THREAD
@@ -319,8 +320,6 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
             visible: true 
         });
 
-        // Force UI Update
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // --- ADD THIS DEBUG BLOCK ---
         println!("--------------------------------------------------");
@@ -385,36 +384,36 @@ async fn import_tracks( // <--- CHANGED to 'async fn' for better UI behavior
 }
 
 #[tauri::command]
-fn analyze_file(path: String, state: State<AppState>) -> Result<ImportResult, String> {
-    // 1. Decode (Analysis)
-    let (samples, sr, channels) = bpm::adapter::decode_to_vec(&path)
-        .map_err(|e| format!("Failed to decode: {}", e))?;
+async fn analyze_file(path: String, state: State<'_, AppState>) -> Result<ImportResult, String> {
+    // Offload the heavy DSP work to a background thread
+    let path_clone = path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let (samples, sr, channels) = bpm::adapter::decode_to_vec(&path_clone)
+            .map_err(|e| format!("Failed to decode: {}", e))?;
+        
+        let wf = Waveform::build_from_samples(&samples, sr, channels, 512);
+        
+        let mut det = bpm::BpmDetector::new(2048);
+        let opts = bpm::BpmOptions { compute_beats: true, ..Default::default() };
+        let detected_bpm = det.detect(&samples, channels, sr, opts).map(|res| res.bpm);
 
-    // 2. Build Waveform (Visual)
-    let wf = Waveform::build_from_samples(&samples, sr, channels, 512);
+        let pixels_per_second = 100.0;
+        let spp = (sr as f64) / pixels_per_second;
+        let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
 
-    // 3. Detect BPM
-    let mut det = bpm::BpmDetector::new(2048);
-    let opts = bpm::BpmOptions { compute_beats: true, ..Default::default() };
-    let detected_bpm = det.detect(&samples, channels, sr, opts).map(|res| res.bpm);
+        Ok::<ImportResult, String>(ImportResult {
+            mins: mins.to_vec(),
+            maxs: maxs.to_vec(),
+            duration: wf.duration_secs,
+            bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
+            bpm: detected_bpm,
+            color: "".to_string(), 
+        })
+    }).await.map_err(|e| e.to_string())??; // Double unwrap for thread panic & our error
 
-    // 4. Calculate Bins for UI
-    let pixels_per_second = 100.0;
-    let spp = (sr as f64) / pixels_per_second;
-    let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
-
-    let result = ImportResult {
-        mins: mins.to_vec(),
-        maxs: maxs.to_vec(),
-        duration: wf.duration_secs,
-        bins_per_second: if wf.duration_secs > 0.0 { (mins.len() as f64) / wf.duration_secs } else { 0.0 },
-        bpm: detected_bpm,
-        color: "".to_string(), // Frontend assigns color for clips, or we ignore
-    };
-
-    // CRITICAL FIX: Save to cache so Undo can find it
+    // Lock state quickly just to update cache
     if let Ok(mut cache) = state.cache.lock() {
-        cache.insert(path.clone(), result.clone());
+        cache.insert(path, result.clone());
     }
 
     Ok(result)
@@ -552,30 +551,62 @@ fn set_master_gain(gain: f32, state: State<AppState>) -> Result<(), String> {
 struct MasterMeterState {
     peak_l: f32,
     peak_r: f32,
+    hold_l: f32,
+    hold_r : f32,
     rms_l: f32,
     rms_r: f32,
 }
 
 #[tauri::command]
 fn get_master_meter(state: tauri::State<AppState>) -> Result<MasterMeterState, String> {
-    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    
-    // NOTE: Update your AudioRuntime::get_master_meter() to return a 4-tuple: 
-    // (peak_l, peak_r, rms_l, rms_r) decoded from the atomic bits
-    let (peak_l, peak_r, rms_l, rms_r) = audio.get_master_meter();
+    // 100% Lock Free - Reads directly from atomics!
+    let peak_l = f32::from_bits(state.master_meter.peak_l.load(std::sync::atomic::Ordering::Relaxed));
+    let peak_r = f32::from_bits(state.master_meter.peak_r.load(std::sync::atomic::Ordering::Relaxed));
+
+    let hold_l = f32::from_bits(state.master_meter.hold_l.load(std::sync::atomic::Ordering::Relaxed));
+    let hold_r = f32::from_bits(state.master_meter.hold_r.load(std::sync::atomic::Ordering::Relaxed));
+
+    let rms_l = f32::from_bits(state.master_meter.rms_l.load(std::sync::atomic::Ordering::Relaxed));
+    let rms_r = f32::from_bits(state.master_meter.rms_r.load(std::sync::atomic::Ordering::Relaxed));
     
     Ok(MasterMeterState {
         peak_l,
         peak_r,
+        hold_l,
+        hold_r,
         rms_l,
         rms_r,
     })
 }
 
 #[tauri::command]
-fn get_track_meters(state: tauri::State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
-    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    Ok(audio.get_meters())
+fn get_all_meters(
+    state: State<AppState>,
+) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
+
+    let reg = state
+        .meter_registry
+        .lock()
+        .map_err(|_| "meter registry poisoned")?;
+
+    let mut results = Vec::with_capacity(reg.len());
+
+    for (&track_id, meters) in reg.iter() {
+        results.push(daw_modules::audio_runtime::MeterSnapshot {
+            track_id,
+            peak_l: f32::from_bits(meters.peak_l.load(std::sync::atomic::Ordering::Relaxed)),
+            peak_r: f32::from_bits(meters.peak_r.load(std::sync::atomic::Ordering::Relaxed)),
+            hold_l: f32::from_bits(meters.hold_l.load(std::sync::atomic::Ordering::Relaxed)),
+            hold_r: f32::from_bits(meters.hold_r.load(std::sync::atomic::Ordering::Relaxed)),
+            rms_l: f32::from_bits(meters.rms_l.load(std::sync::atomic::Ordering::Relaxed)),
+            rms_r: f32::from_bits(meters.rms_r.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+
+    // ❌ Remove sorting (registry should not change order during playback)
+    // results.sort_by_key(|m| m.track_id);
+
+    Ok(results)
 }
 
 #[tauri::command]
@@ -619,6 +650,14 @@ fn set_bpm(bpm: f32, state: State<AppState>) -> Result<(), String> {
     let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
     // You'll need to expose a set_bpm method on AudioRuntime that calls Engine::set_bpm
     audio.set_bpm(bpm); 
+    Ok(())
+}
+
+#[tauri::command]
+fn set_time_signature(numerator: u32, state: State<AppState>) -> Result<(), String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    // We pass the numerator from the UI, and default the denominator to 4
+    audio.set_time_signature(numerator, 4); 
     Ok(())
 }
 
@@ -677,15 +716,11 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
         gain: 1.0,
         pan: 0.0,
         muted: false,
-        solo: false
+        solo: false,
+        source: "mic".to_string()
     })
 }
 
-#[tauri::command]
-fn get_all_meters(state: State<AppState>) -> Result<Vec<daw_modules::audio_runtime::MeterSnapshot>, String> {
-    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
-    Ok(audio.get_meters())
-}
 
 // --- NEW: Tauri command for AI analysis ---
 #[tauri::command]
@@ -847,7 +882,7 @@ fn get_compressor_state(
 
 #[tauri::command]
 async fn get_project_state(
-    app: tauri::AppHandle, 
+    _app: tauri::AppHandle, 
     state: State<'_, AppState>
 ) -> Result<ProjectState, String> {
     
@@ -861,44 +896,45 @@ async fn get_project_state(
 
     // 2. Build UI State (Reuse Helper)
     // Pass cache AND color store
-    let state = build_ui_state(&app, tracks_info, bpm, master_gain, true, &state.cache)?;
+    let state = build_ui_state(tracks_info, bpm, master_gain, true, &state.cache)?;
     Ok(state)
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LoadedClip {
-    id: String,
-    track_id: u32,
-    name: String,
-    path: String,
-    start_time: f64,
-    duration: f64,
-    offset: f64,
-    waveform: ImportResult,
-    color: String,
-    clip_number: usize, // <--- NEW
+pub struct LoadedClip {
+    pub id: String,
+    pub track_id: u32,
+    pub name: String,
+    pub path: String,
+    pub start_time: f64,
+    pub duration: f64,
+    pub offset: f64,
+    pub waveform: ImportResult,
+    pub color: String,
+    pub clip_number: usize, // <--- NEW
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LoadedTrack {
-    id: u32,
-    name: String,
-    color: String,
-    clips: Vec<LoadedClip>,
-    gain: f32,
-    pan: f32,
-    muted: bool,
-    solo: bool,
+pub struct LoadedTrack {
+    pub id: u32,
+    pub name: String,
+    pub color: String,
+    pub clips: Vec<LoadedClip>,
+    pub gain: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub solo: bool,
+    pub source: String,
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProjectState {
-    tracks: Vec<LoadedTrack>,
-    bpm: f32,
-    master_gain: f32,
+pub struct ProjectState {
+    pub tracks: Vec<LoadedTrack>,
+    pub bpm: f32,
+    pub master_gain: f32,
 }
 
 
@@ -909,28 +945,28 @@ fn save_project(path: String, state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn export_project(app: tauri::AppHandle,path: String, state: State<AppState>) -> Result<(), String> {
-    // 1. Show Loader
+async fn export_project(app: tauri::AppHandle, path: String) -> Result<(), String> {
     let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Rendering Project...".into(), 
-        progress: 0.0, // Indeterminate start
-        visible: true 
+        message: "Rendering Project...".into(), progress: 0.0, visible: true 
     });
     
-    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    // 1. Clone the app handle so we can move it into the background thread safely
+    let app_clone = app.clone();
+    
+    // 2. Offload rendering to prevent UI freeze
+    tauri::async_runtime::spawn_blocking(move || {
+        // Extract the state and lock the mutex INSIDE the thread
+        let state = app_clone.state::<AppState>();
+        let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+        
+        audio.export_project(path)
+    }).await.map_err(|e| e.to_string())??; // Double unwrap: one for thread panic, one for our Result
 
-    // NOTE: If audio.export_project takes a long time, it will block this thread.
-    // Ideally, export_project inside AudioRuntime should accept a callback closure 
-    // to report progress. For now, this ensures the loader at least appears.
-    let result = audio.export_project(path);
-
-    // 2. Hide Loader
     let _ = app.emit("progress-update", ProgressPayload { 
-        message: "Export Complete".into(), 
-        progress: 100.0, 
-        visible: false 
+        message: "Export Complete".into(), progress: 100.0, visible: false 
     });
-    result
+    
+    Ok(())
 }
 
 #[tauri::command]
@@ -983,7 +1019,7 @@ async fn load_project(
 
     // 3. Build UI State (Reuse Helper)
     // Pass cache AND color store
-    let state = build_ui_state(&app, tracks_info, bpm, master_gain, false, &state.cache)?;
+    let state = build_ui_state(tracks_info, bpm, master_gain, false, &state.cache)?;
 
     let _ = app.emit("load-percent", 100.0);
     let _ = app.emit("load-progress", "Ready");
@@ -1050,80 +1086,48 @@ async fn ask_ai(
          }).unwrap());
     }
 
-    // 3. Construct System Prompt (Strict JSON Schema)
-    // 3. System Prompt (Strict JSON-Only API)
-    // 3. System Prompt (Refined for Reset Logic & JSON Stability)
+    // 3. System Prompt (Strict JSON-Only API Aligned with Layer 1 Contract)
     let system_prompt = format!(
-        "You are a strict JSON API for a DAW. You speak ONLY JSON.\n\
+        "You are an elite Audio DSP Engineer and a strict JSON API for a DAW. You speak ONLY JSON.\n\
         \n\
-        CONTEXT:\nTracks: [{}]\n\
+        CONTEXT:\n{}\n\
         USER REQUEST: '{}'\n\
         \n\
-        SCHEMA:\n\
-        {{ \n\
-          \"steps\": [ \n\
-            {{ \n\
-              \"action\": \"play\" | \"pause\" | \"record\" | \"seek\" | \"set_gain\" | \"set_master_gain\" | \"set_pan\" | \"toggle_monitor\" | \"toggle_mute\" | \"toggle_solo\" | \"unmute\" | \"unsolo\" | \"separate_stems\" | \"cancel_job\" | \"split_clip\" | \"merge_clips\" | \"delete_track\" | \"create_track\" | \"undo\" | \"redo\" | \"update_eq\" | \"update_compressor\" | \"none\", \n\
-              \"parameters\": {{ \n\
-                \"track_id\": number (optional, default to 0), \n\
-                \"value\": number (optional), \n\
-                \"time\": number (optional), \n\
-                \"clip_number\": number (optional, the 1-based ID of the clip), \n\
-                \"job_id\": string (optional), \n\
-                \"band_index\": number (optional, 0-3), \n\
-                \"filter_type\": \"LowPass\" | \"HighPass\" | \"Peaking\" | \"LowShelf\" | \"HighShelf\" | \"Notch\" | \"BandPass\" (optional), \n\
-                \"freq\": number (optional), \n\
-                \"q\": number (optional), \n\
-                \"gain\": number (optional, -24.0 to 24.0), \n\
-                \"threshold_db\": number (optional, -60.0 to 0.0), \n\
-                \"ratio\": number (optional, 1.0 to 20.0), \n\
-                \"attack_ms\": number (optional), \n\
-                \"release_ms\": number (optional), \n\
-                \"makeup_gain_db\": number (optional) \n\
-              }} \n\
-            }} \n\
-          ], \n\
-          \"message\": \"Short confirmation text or detailed conversational answer\" \n\
-        }}\n\
+        CRITICAL RULES:\n\
+        1. YOU MUST OUTPUT A VALID JSON OBJECT WITH 'version': '1.0' and a 'commands' array. NO PLAIN TEXT.\n\
+        2. FLATTEN PARAMETERS. Put 'track_id', 'value', 'time', 'new_time', 'bpm', 'clip_number' DIRECTLY inside the command object.\n\
+        3. ACTION NAMES MUST MATCH EXACTLY: play, pause, record, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor,separate_stems, none.\n\
+        4. DSP MATH: \n\
+           - Gain is 0.0 (silent) to 2.0 (+6dB). Default/Unity volume is 1.0.\n\
+           - Pan is -1.0 (Left) to 1.0 (Right). Default pan is 0.0.\n\
+        5. MUSICAL TIMING & MATH:\n\
+           - You are provided with the current BPM and Time Signature in the context.\n\
+           - 1 Quarter Note = 60 / BPM seconds.\n\
+           - If Time Signature is 4/4, 1 Bar = 4 Quarter Notes.\n\
+           - If Time Signature is 6/8, 1 Bar = 3 Quarter Notes (6 * (4/8)).\n\
+           - ALWAYS calculate 'time' or 'new_time' parameters in exact SECONDS based on this math.\n\
+        6. RELATIVE AWARENESS: \n\
+           - If the user says 'here' or 'current position', use the 'playhead_position_seconds' from the context.\n\
+           - If the user references a color (e.g., 'the red track'), find the track with that color in the context.\n\
+        7. DO NOT INVENT FIELDS. \n\
+           - For 'merge_clips': ONLY use 'track_id' and 'clip_number' (the left-most clip).\n\
+           - For 'move_clip': Requires 'track_id', 'clip_number', and 'new_time' (in seconds).\n\
+           - For 'reset volume': ONLY output 'set_gain' with 'value': 1.0. Do NOT output mute or solo commands.\n\
+           - For 'reset track': Output 'set_gain' to 1.0, 'set_pan' to 0.0, 'unmute', and 'unsolo'.\n\
+        8. OMIT UNUSED KEYS. If a command doesn't need a parameter, do not include it. Do NOT output null values.\n\
+        9. TRACK IDENTIFICATION: You MUST accurately map the user's requested instrument or track name to the correct 'id' provided in the context tracks array. Do NOT default to \"track_id\": 0 unless the user explicitly asks to modify the 'master', 'original', or 'default' track. If you cannot find a matching track for their request, output the 'none' action with an error message.\n\
         \n\
-        RULES:\n\
-        1. CRITICAL: YOU MUST OUTPUT A VALID JSON OBJECT. NO PLAIN TEXT.\n\
-        2. STRICT DATA TYPES (PREVENT API CRASH): \n\
-           - For 'value', 'track_id', and all numerical fields, YOU MUST USE REAL NUMBERS (e.g., 1.0, -1.0, 0). \n\
-           - NEVER use strings like \"full\", \"max\", \"left\", or \"right\" for numbers. \n\
-           - If the user does not specify a track number, you MUST assume \"track_id\": 0.\n\
-           - NEVER output a parameter with a 'null' value. If a parameter is not needed, omit the key completely.\n\
-        3. CONVERSATION VS COMMANDS:\n\
-           - If user ASKS A QUESTION: Use action \"none\" and put the answer in \"message\".\n\
-           - If user ISSUES A COMMAND: Use the correct action ('set_gain', 'set_pan', etc.). NEVER use \"none\" for a command.\n\
-        4. GAIN/VOLUME SCALE:\n\
-            - Range is 0.0 (Silence) to 2.0 (Max Volume). 1.0 is Unity.\n\
-            - If user says 'max volume', use 'set_gain' with \"value\": 2.0.\n\
-            - If user says 'half volume', use 'set_gain' with \"value\": 0.5.\n\
-        5. PAN SCALE:\n\
-            - Range is -1.0 (Full Left) to 1.0 (Full Right). 0.0 is Center.\n\
-            - If user says 'pan right' or 'right pan full', use 'set_pan' with \"value\": 1.0.\n\
-            - If user says 'pan left' or 'left pan full', use 'set_pan' with \"value\": -1.0.\n\
-        6. MUTE & SOLO LOGIC:\n\
-            - Use 'toggle_mute', 'unmute', 'toggle_solo', or 'unsolo' as actions where appropriate.\n\
-        7. RESET LOGIC (CRITICAL FOR MUTE/SOLO): When asked to 'Reset' a track or 'Reset Everything', you must neutralize active states by outputting multiple steps:\n\
-           - ALWAYS include 'set_gain' with \"value\": 1.0.\n\
-           - ALWAYS include 'set_pan' with \"value\": 0.0.\n\
-           - DO NOT include 'unmute' UNLESS the context explicitly says 'muted: true'.\n\
-           - DO NOT include 'unsolo' UNLESS the context explicitly says 'solo: true'.\n\
-        8. EQ & COMPRESSION LOGIC:\n\
-           - To EQ, use 'update_eq'. Bands: 0=Lows, 1=LowMids, 2=HighMids, 3=Highs. Default Q is 1.0.\n\
-           - To Compress, use 'update_compressor'. Standard: threshold -20.0, ratio 4.0, attack 5.0, release 50.0.\n\
-        9. CLIP EDITING:\n\
-           - To split, use 'split_clip' with \"time\".\n\
-           - To merge clips (e.g. \"merge clip 1 and 2\"), use 'merge_clips' and pass the left-most clip as \"clip_number\" (e.g. \"clip_number\": 1).\n\
+        SCHEMA EXAMPLES:\n\
+        User: \"reset the volume of track 0\"\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"set_gain\", \"track_id\": 0, \"value\": 1.0}}], \"message\": \"Track 0 volume reset to default (1.0).\", \"confidence\": 1.0}}\n\
         \n\
-        EXAMPLES OF CORRECT BEHAVIOR:\n\
-        User: \"max the volume of track 0\"\n\
-        Assistant: {{\"steps\": [{{\"action\": \"set_gain\", \"parameters\": {{\"track_id\": 0, \"value\": 2.0}}}}], \"message\": \"Track 0 volume set to maximum.\"}}\n\
+        User: \"move the blue track's first clip to bar 5\"\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"move_clip\", \"track_id\": 1, \"clip_number\": 1, \"new_time\": 8.0}}], \"message\": \"Moved clip 1 on the blue track to Bar 5.\", \"confidence\": 0.95}}\n\
         \n\
-        User: \"reset track 0\" (Assume context says muted: false, solo: false)\n\
-        Assistant: {{\"steps\": [{{\"action\": \"set_gain\", \"parameters\": {{\"track_id\": 0, \"value\": 1.0}}}}, {{\"action\": \"set_pan\", \"parameters\": {{\"track_id\": 0, \"value\": 0.0}}}}], \"message\": \"Track 0 reset.\"}}\n\
+        User: \"undo that\"\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"undo\"}}], \"message\": \"Undoing last action.\", \"confidence\": 1.0}}\n\
+        User: \"isolate the vocals on track 1\"\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"separate_stems\", \"track_id\": 1}}], \"message\": \"Extracting stems from track 1...\", \"confidence\": 0.99}}\n\
         ",
         track_context, user_input
     );
@@ -1370,6 +1374,9 @@ fn main() {
     dotenv().ok();
     let runtime = AudioRuntime::new(None).expect("Failed to init Audio Engine");
 
+    let master_meter = runtime.master_meter.clone();
+    let meter_registry = runtime.meter_registry.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_log::Builder::default().build())
@@ -1378,6 +1385,8 @@ fn main() {
             recorder: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
             pending_stems: Mutex::new(HashMap::new()),
+            master_meter,
+            meter_registry,
         })
         .invoke_handler(tauri::generate_handler![
             play,
@@ -1391,6 +1400,7 @@ fn main() {
             stop_recording,
             get_recording_status,
             set_bpm,
+            set_time_signature,
             get_grid_lines,
             move_clip,
             seek,
@@ -1401,7 +1411,6 @@ fn main() {
             set_master_gain,
             get_master_gain,
             get_master_meter,
-            get_track_meters,
             save_project,
             load_project,
             export_project,
@@ -1424,6 +1433,7 @@ fn main() {
             undo,
             redo,
             ask_ai,
+            ai_transaction::execute_ai_transaction,
             stem_separation::separate_stems,
             stem_separation::cancel_ai_job,
             commit_pending_stems,

@@ -102,41 +102,56 @@
     let rmsScale = $state(0); // <--- NEW: RMS State
     let displayDb = $state('-inf');
     let meterRunning = false;
-    let reqId: number;
+    let meterInterval: number;
 
     function toDB(linear: number) {
-        if (linear <= 0.00001) return -60;
-        return Math.max(-60, 20 * Math.log10(linear));
+        return 20 * Math.log10(Math.max(linear, 1e-9));
     }
 
     const pollMasterMeter = async () => {
         if (!meterRunning) return;
         try {
-            // Fetch Peak and RMS from the new struct
-            const { peak_l, peak_r, rms_l, rms_r } = await invoke<{peak_l: number, peak_r: number, rms_l: number, rms_r: number}>('get_master_meter');
+            // 1. Fetch all linear values cleanly
+            const { peak_l, peak_r, hold_l, hold_r, rms_l, rms_r } = await invoke<{
+                peak_l: number, 
+                peak_r: number, 
+                hold_l: number, 
+                hold_r: number, 
+                rms_l: number, 
+                rms_r: number
+            }>('get_master_meter');
             
-            const maxPeak = Math.max(peak_l, peak_r);
-            const maxRms = Math.max(rms_l, rms_r);
+            // 2. Check for true peak clipping
+            const isClipping = Math.max(peak_l, peak_r) >= 1.0;
 
-            const pDb = toDB(maxPeak);
+            // 3. Convert hold and RMS to DB for visuals
+            const maxHoldDb = toDB(Math.max(hold_l, hold_r));
+            const maxRmsDb = toDB(Math.max(rms_l, rms_r));
 
-            // Format text: show "-inf" if silent, otherwise format to 1 decimal with optional '+' sign
-            displayDb = pDb <= -59.5 ? '-inf' : (pDb > 0 ? '+' : '') + pDb.toFixed(1);
+            // 4. Format the text display
+            if (isClipping) {
+                displayDb = 'CLIP';
+            } else {
+                displayDb = maxHoldDb <= -59.5 ?
+                '-inf' : (maxHoldDb > 0 ? '+' : '') + maxHoldDb.toFixed(1);
+            }
 
-            meterScale = Math.max(0, Math.min(1.0, dbToPercent(pDb) / 100));
-            rmsScale = Math.max(0, Math.min(1.0, dbToPercent(toDB(maxRms)) / 100));
-        } catch(e) {}
-        reqId = requestAnimationFrame(pollMasterMeter);
+            // 5. Update scales
+            meterScale = Math.max(0, Math.min(1.0, dbToPercent(maxHoldDb) / 100));
+            rmsScale = Math.max(0, Math.min(1.0, dbToPercent(maxRmsDb) / 100));
+        } catch(e) {
+            if (e !== "busy") console.error("Meter fetch failed:", e);
+        }
     };
 
     onMount(() => {
         meterRunning = true;
-        pollMasterMeter();
+        meterInterval = window.setInterval(pollMasterMeter, 33); // 30 FPS polling
     });
 
     onDestroy(() => {
         meterRunning = false;
-        cancelAnimationFrame(reqId);
+        clearInterval(meterInterval);
     });
 
   // --- NEW FUNCTIONS ---

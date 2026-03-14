@@ -28,7 +28,20 @@
     
     // --- GLOBAL BPM STATE ---
     let bpm = $state(120); 
+    let timeSignatureNumerator = $state(4);
     let masterGain = $state(1.0); // Add this near 'bpm'
+
+    // Sync BPM & Time Signature with Backend whenever they change
+    $effect(() => {
+        if (bpm > 0) {
+            invoke('set_bpm', { bpm: bpm }).catch(e => console.error("Failed to set BPM:", e));
+        }
+        if (timeSignatureNumerator > 0) {
+            invoke('set_time_signature', { numerator: timeSignatureNumerator })
+                .catch(e => console.error("Failed to set Time Sig:", e));
+        }
+    });
+
     let projectName = $state("untitled Project");
 
     let isRecordingMode = $state(false);
@@ -66,7 +79,11 @@
 
     // --- TRACKS STATE ---
     let tracks = $state<Track[]>([]);
-    let animationFrameId: number;
+    // --- PLAYHEAD TIMING ARCHITECTURE ---
+    let animationFrameId: number | null = null;
+    let syncIntervalId: ReturnType<typeof setInterval> | null = null;
+    let lastSyncTime = 0;
+    let lastEnginePosition = 0;
 
     // Sync BPM with Backend whenever it changes
     $effect(() => {
@@ -86,10 +103,14 @@
                 const projectState = await invoke<{
                   tracks: Track[],
                   bpm: number,
+                  timeSignatureNumerator?: number, // Made optional to not break old save files
                   masterGain: number
-                }>('load_project', { path });
+                }>('load_project', { path }); // (Do the exact same update in 'get_project_state')
 
                 bpm = projectState.bpm;
+                if (projectState.timeSignatureNumerator) {
+                    timeSignatureNumerator = projectState.timeSignatureNumerator;
+                }
                 
 
                 const fileName = path.split(/[\\/]/).pop();
@@ -317,7 +338,10 @@
             if (!isPlaying) {
                await invoke('play');
                isPlaying = true;
-               pollPosition();
+               // Fetch initial hardware position to anchor the interpolation perfectly
+               lastEnginePosition = await invoke<number>('get_position');
+               currentTime = lastEnginePosition;
+               startPlaybackLoop();
             }
 
             // 5. Start Manager (FIXED ARGUMENTS)
@@ -379,7 +403,7 @@
     async function stopRecordingLogic() {
         await invoke('pause');
         isPlaying = false;
-        cancelAnimationFrame(animationFrameId);
+        stopPlaybackLoop(); // Safely clears rAF and interval
 
         isRecordingMode = false;
         const result = await recordingManager.stop();
@@ -413,7 +437,7 @@
                     ...newTrack,
                     isRecording: oldTrack ? oldTrack.isRecording : false,
                     monitor: oldTrack ? oldTrack.monitor : false,
-                    source: oldTrack ? oldTrack.source : 'media',
+                    source: oldTrack ? oldTrack.source : newTrack.source,
                     savePath: oldTrack ? oldTrack.savePath : undefined
                 };
             });
@@ -432,66 +456,98 @@
     $effect(() => {
         const handleRefresh = () => refreshProjectState();
 
-        const handleAICommand = async (e: Event) => {
-            const customEvent = e as CustomEvent;
-            const { action, mode, time, direction } = customEvent.detail;
-            console.log("⚡ Page received AI Command:", action, mode);
+        // --- NEW: ASYNC COMMAND QUEUE ---
+        // Prevents Race Conditions when AI sends multiple commands at once
+        let aiCommandQueue: any[] = [];
+        let isProcessingQueue = false;
 
-            switch (action) {
-                case 'play':
-                    if (!isPlaying) togglePlayback();
-                    break;
-                case 'pause':
-                    if (isPlaying) togglePlayback();
-                    break;
-                case 'rewind':
-                    rewind(); // Calls your existing rewind() function (Seek 0)
-                    break;
+        const processQueue = async () => {
+            if (isProcessingQueue) return;
+            isProcessingQueue = true;
 
-                // --- NEW SEEK LOGIC ---
-                case 'seek':
-                    if (time === undefined) return;
-                    
-                    let targetTime = time;
+            while (aiCommandQueue.length > 0) {
+                const detail = aiCommandQueue.shift();
+                const { action, mode, time, direction } = detail;
+                console.log("⚡ Processing AI Command:", action, mode);
 
-                    if (direction === 'forward') {
-                        targetTime = currentTime + time;
-                    } else if (direction === 'backward') {
-                        targetTime = currentTime - time;
-                    }
-                    
-                    // Clamp to 0 (cannot seek before start)
-                    seekTo(Math.max(0, targetTime));
-                    break;
-                // ----------------------
-                    
-                case 'record':
-                    // Toggle recording logic
-                    // FIX: If AI specified a track (e.g., "Record on Track 2"), ARM it first!
-                    if (customEvent.detail.trackId) {
-                        console.log("🤖 AI Arming Track:", customEvent.detail.trackId);
-                        armTrack(customEvent.detail.trackId);
-                    }
+                switch (action) {
+                    case 'play':
+                        if (!isPlaying) togglePlayback();
+                        break;
+                    case 'pause':
+                        if (isPlaying) togglePlayback();
+                        break;
+                    case 'rewind':
+                        rewind(); 
+                        break;
 
-                    // Then proceed with toggle logic
-                    if (isRecordingMode) stopRecordingLogic();
-                    else startRecordingLogic();
-                    break;
-                case 'create_track':
-                    // Handle "Add audio track" vs "Add empty track"
-                    if (mode === 'record') await addNewTrack('record');
-                    else await addNewTrack('default');
-                    break;
+                    case 'seek':
+                        if (time === undefined) break;
+                        let targetTime = time;
+                        if (direction === 'forward') {
+                            targetTime = currentTime + time;
+                        } else if (direction === 'backward') {
+                            targetTime = currentTime - time;
+                        }
+                        seekTo(Math.max(0, targetTime));
+                        break;
 
-                case 'toggle_monitor':
-                    if (customEvent.detail.trackId) {
-                         // Reuse your existing logic!
-                         // We create a fake event structure because your handleToggleMonitor expects CustomEvent<number>
-                         handleToggleMonitor(new CustomEvent('toggle', { detail: customEvent.detail.trackId }));
-                    }
-                    break; 
-                    
+                    case 'record':
+                        if (detail.trackId !== undefined) {
+                            console.log("🤖 AI Arming Track:", detail.trackId);
+                            armTrack(detail.trackId);
+                        } else if (!isRecordingMode && tracks.length > 0 && !tracks.some(t => t.isRecording)) {
+                            console.log("🤖 Auto-Arming newest track");
+                            armTrack(tracks[tracks.length - 1].id);
+                        }
+
+                        if (isRecordingMode) stopRecordingLogic();
+                        else startRecordingLogic(); 
+                        break;
+
+                    case 'create_track':
+                        // AWAIT is crucial here so the queue pauses until Rust finishes making the track
+                        if (mode === 'record') await addNewTrack('record');
+                        else await addNewTrack('default');
+                        
+                        // Give Svelte a tiny moment to update the DOM/tracks array before moving to the next command
+                        await new Promise(resolve => setTimeout(resolve, 50));
+                        break;
+
+                    case 'toggle_monitor':
+                        let targetTrackId = detail.trackId;
+                        
+                        // Fallbacks if AI didn't specify a track ID
+                        if (targetTrackId === undefined) {
+                            const armed = tracks.find(t => t.isRecording);
+                            if (armed) {
+                                targetTrackId = armed.id; // Target armed track
+                            } else if (tracks.length > 0) {
+                                targetTrackId = tracks[tracks.length - 1].id; // Target newest track
+                            }
+                        }
+
+                        if (targetTrackId !== undefined) {
+                            handleToggleMonitor(new CustomEvent('toggle', { detail: targetTrackId }));
+                        }
+                        break;
+                    case 'separate_stems':  // <--- ADD THIS CASE
+                        if (detail.track_id !== undefined) {
+                            console.log("🤖 AI Triggering Stem Separation on Track:", detail.track_id);
+                            invoke('separate_stems', { trackId: detail.track_id })
+                                .catch(e => console.error("Stem separation failed:", e));
+                        }
+                        break;    
+                }
             }
+            isProcessingQueue = false;
+        };
+
+        const handleAICommand = (e: Event) => {
+            const customEvent = e as CustomEvent;
+            // Push the command into the queue instead of running it immediately
+            aiCommandQueue.push(customEvent.detail);
+            processQueue(); // Kick off the queue processor
         };
         
         window.addEventListener('refresh-project', handleRefresh);
@@ -518,7 +574,7 @@
         if (isPlaying) {
             await invoke('pause');
             isPlaying = false;
-            cancelAnimationFrame(animationFrameId);
+            stopPlaybackLoop(); // Safely clears rAF and interval
         } else {
             // AUTO-REWIND FIX
             // If we are within 0.1s of the end (or past it), restart from 0
@@ -528,23 +584,70 @@
 
             await invoke('play');
             isPlaying = true;
-            pollPosition();
+            
+            // Fetch initial hardware position to anchor the interpolation perfectly
+            lastEnginePosition = await invoke<number>('get_position');
+            currentTime = lastEnginePosition;
+            startPlaybackLoop();
         }
     }
 
-    function pollPosition() {
-        invoke<number>('get_position')
-            .then((pos) => {
+    // 1. Low-Frequency Hardware Sync (Corrects JS drift against Rust clock)
+    async function syncEngineClock() {
+        if (!isPlaying) return;
+        try {
+            const pos = await invoke<number>('get_position');
+            lastEnginePosition = pos;
+            lastSyncTime = performance.now();
+            
+            // Hard snap if background tab throttling caused severe drift (> 50ms)
+            if (Math.abs(currentTime - pos) > 0.05) {
                 currentTime = pos;
-                if (isPlaying) {
-                    animationFrameId = requestAnimationFrame(pollPosition);
-                }
-            })
-            .catch(console.error);
+            }
+        } catch (e) {
+            console.error("Hardware sync failed:", e);
+        }
+    }
+
+    // 2. High-Frequency UI Interpolation (Runs at Monitor Refresh Rate)
+    function startPlaybackLoop() {
+        // GUARD: Prevent multiple ghost loops
+        if (!isPlaying || animationFrameId) return;
+        
+        lastSyncTime = performance.now();
+        
+        const renderLoop = (now: number) => {
+            if (!isPlaying) return;
+            
+            const deltaSec = (now - lastSyncTime) / 1000.0;
+            currentTime = lastEnginePosition + deltaSec; // Optimistic smooth advance
+            
+            animationFrameId = requestAnimationFrame(renderLoop);
+        };
+        
+        animationFrameId = requestAnimationFrame(renderLoop);
+        syncIntervalId = setInterval(syncEngineClock, 100);
+    }
+
+    // 3. Centralized Cleanup Helper
+    function stopPlaybackLoop() {
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+        }
+        if (syncIntervalId) {
+            clearInterval(syncIntervalId);
+            syncIntervalId = null;
+        }
     }
 
     async function seekTo(time: number) {
-        currentTime = time; 
+        currentTime = time;
+        
+        // Update anchor points so the interpolator doesn't fight the seek
+        lastEnginePosition = time; 
+        lastSyncTime = performance.now(); 
+        
         try {
             await invoke('seek', { pos: time });
         } catch (e) {
@@ -557,7 +660,7 @@
         if (isPlaying) {
             await invoke('pause');
             isPlaying = false;
-            cancelAnimationFrame(animationFrameId);
+            stopPlaybackLoop(); // Safely clears both rAF and the interval
         }
     }
 
@@ -603,7 +706,7 @@
     }
 
     onDestroy(() => {
-      cancelAnimationFrame(animationFrameId);
+      stopPlaybackLoop(); // Safely clears rAF and interval
     });
 </script>
 
@@ -659,7 +762,8 @@
             <Timeline 
                 bind:tracks={tracks} 
                 currentTime={currentTime} 
-                bpm={bpm} 
+                bpm={bpm}
+                timeSignatureNumerator={timeSignatureNumerator} 
                 on:seek={(e) => seekTo(e.detail)}
                 on:select={handleTrackSelect}
                 on:refresh={refreshProjectState}
@@ -667,7 +771,14 @@
 
         </div>
 
-        <AIChatbot {tracks} />
+        <AIChatbot 
+            tracks={tracks} 
+            globalState={{ 
+                bpm: bpm, 
+                timeSignature: `${timeSignatureNumerator}/4`, 
+                playheadTime: currentTime 
+            }} 
+        />
 
     {/if}
     {#if showEqWindow}

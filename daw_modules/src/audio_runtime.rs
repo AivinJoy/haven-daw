@@ -12,6 +12,7 @@ use crate::audio::setup_output_device;
 use crate::engine::Engine;
 use crate::session::{Session, commands::*}; 
 use crate::engine::time::GridLine;
+use crate::ai::ai_schema::{AiAction, EqFilterType as SchemaEqFilterType};
 use crate::effects::equalizer::EqParams; // <--- Import this
 use crate::effects::compressor::CompressorParams;
 use crate::analyzer::AnalysisProfile;
@@ -25,12 +26,15 @@ pub enum EngineCommand {
     Seek(Duration),
     SetMasterGain(f32),
     SetBpm(f32),
+    SetTimeSignature(u32, u32),
     ToggleMute(usize),
+    SetTrackMute(usize, bool), // <--- NEW: Strict Mute/Unmute
     ToggleSolo(usize),
     ClearSolo,
     SetTrackGain(usize, f32),
     SetTrackPan(usize, f32),
     UpdateCompressor(usize, CompressorParams),
+    UpdateEq(usize, usize, EqParams), // <--- NEW: Lock-Free EQ
     SetMonitor(crate::recorder::monitor::Monitor), // <--- NEW
     ClearMonitor, // <--- NEW
 }
@@ -55,8 +59,8 @@ pub struct AudioRuntime {
     stream: Option<Stream>, // Changed to Option to allow hot-swapping
     command_tx: Mutex<SyncSender<EngineCommand>>, // Wrapped in Mutex to allow channel recreation
     // --- ADDED: A safe map of Track ID -> Lock-Free Atomics ---
-    meter_registry: Arc<Mutex<std::collections::HashMap<u32, std::sync::Arc<crate::engine::metering::TrackMeters>>>>,
-    master_meter: Arc<crate::engine::metering::TrackMeters>, // <--- CHANGED TYPE
+    pub meter_registry: Arc<Mutex<std::collections::HashMap<u32, std::sync::Arc<crate::engine::metering::TrackMeters>>>>,
+    pub master_meter: Arc<crate::engine::metering::TrackMeters>, // <--- CHANGED TYPE
     pub recorder: Arc<Mutex<Option<crate::recorder::Recorder>>>, // <--- NEW
 }
 
@@ -175,7 +179,7 @@ impl AudioRuntime {
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _| {
-                if let Ok(mut eng) = engine_cb.try_lock() {
+                if let Ok(mut eng) = engine_cb.lock() {
                     while let Ok(cmd) = command_rx.try_recv() {
                         match cmd {
                             EngineCommand::SetMonitor(m) => active_monitor = Some(m),
@@ -188,8 +192,21 @@ impl AudioRuntime {
                             EngineCommand::Seek(pos) => eng.seek(pos),
                             EngineCommand::SetMasterGain(g) => eng.master_gain = g,
                             EngineCommand::SetBpm(bpm) => eng.set_bpm(bpm),
+                            EngineCommand::SetTimeSignature(num, den) => {
+                                eng.transport.tempo.signature.numerator = num;
+                                eng.transport.tempo.signature.denominator = den;
+                            }
                             EngineCommand::ToggleMute(idx) => {
                                 if let Some(t) = eng.tracks_mut().get_mut(idx) { t.muted = !t.muted; }
+                            }
+                            // --- NEW HANDLERS ---
+                            EngineCommand::SetTrackMute(idx, state) => {
+                                if let Some(t) = eng.tracks_mut().get_mut(idx) { t.muted = state; }
+                            }
+                            EngineCommand::UpdateEq(track_idx, band_idx, params) => {
+                                if let Some(t) = eng.tracks_mut().get_mut(track_idx) {
+                                    t.track_eq.update_band(band_idx, params);
+                                }
                             }
                             EngineCommand::SetTrackGain(idx, gain) => {
                                 if let Some(t) = eng.tracks_mut().get_mut(idx) { t.gain = gain; }
@@ -435,6 +452,11 @@ impl AudioRuntime {
         let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetBpm(bpm));
     }
 
+    // 3. ADD THIS PUBLIC METHOD
+    pub fn set_time_signature(&self, numerator: u32, denominator: u32) {
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetTimeSignature(numerator, denominator));
+    }
+
     pub fn bpm(&self) -> f32 {
         if let Ok(eng) = self.engine.lock() {
             eng.transport.tempo.bpm as f32
@@ -582,33 +604,15 @@ impl AudioRuntime {
 
     // --- EQ COMMANDS ---
 
+    // KEEP THIS ONE
     pub fn update_eq(&self, track_index: usize, band_index: usize, params: EqParams) {
-        let (track_id, old_params) = {
-            let eng = self.engine.lock().unwrap();
-            if let Some(track) = eng.tracks().get(track_index) {
-                let current_state = track.track_eq.get_state(); 
-                if band_index < current_state.len() {
-                    (Some(track.id), Some(current_state[band_index]))
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            }
-        };
+        // PRO FIX: Send directly to the lock-free queue! Bypasses the Undo Session for AI adjustments.
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::UpdateEq(track_index, band_index, params));
+    }
 
-        if let (Some(tid), Some(old)) = (track_id, old_params) {
-            let cmd = Box::new(UpdateEq {
-                track_id: tid,
-                band_index,
-                old_params: old,
-                new_params: params,
-            });
-            
-            if let Ok(mut session) = self.session.lock() {
-                let _ = session.apply(&self.engine, cmd);
-            }
-        }
+    // NEW Helper
+    pub fn set_track_mute(&self, track_index: usize, state: bool) {
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetTrackMute(track_index, state));
     }
 
     pub fn get_eq_state(&self, track_index: usize) -> Vec<EqParams> {
@@ -807,10 +811,9 @@ impl AudioRuntime {
     // --- ADD NEW METHOD TO AUDIORUNTIME ---
     pub fn get_meters(&self) -> Vec<MeterSnapshot> {
         let mut results = Vec::new();
-        // UI thread quickly locks the registry map (NOT the engine)
+        // UI thread quickly locks the registry map
         if let Ok(reg) = self.meter_registry.lock() {
             for (&track_id, meters) in reg.iter() {
-                // Instantly read the lock-free atomics
                 results.push(MeterSnapshot {
                     track_id,
                     peak_l: f32::from_bits(meters.peak_l.load(std::sync::atomic::Ordering::Relaxed)),
@@ -822,6 +825,11 @@ impl AudioRuntime {
                 });
             }
         }
+        
+        // 🐛 BUG FIX: HashMaps are unordered! We MUST sort them by track_id 
+        // so the UI doesn't assign meters to random tracks every frame.
+        results.sort_by_key(|m| m.track_id);
+        
         results
     }
 
@@ -845,4 +853,107 @@ impl AudioRuntime {
         }
         results
     }
+
+    // --- AI TRANSACTION BATCH EXECUTION ---
+    // --- AI TRANSACTION BATCH EXECUTION ---
+    pub fn apply_ai_batch(&self, commands: Vec<AiAction>) -> anyhow::Result<()> {
+        
+        // 🛠️ FIX: Helper to map stable track_id to the current array track_index
+        let resolve = |tid: usize| -> Option<usize> {
+            self.get_tracks_list().into_iter().position(|t| t.id == tid as u32)
+        };
+
+        for action in commands {
+            match action {
+                // 🚀 ALL MIXING COMMANDS NOW ROUTE THROUGH THE LOCK-FREE QUEUE
+                AiAction::SetGain { track_id, value } => {
+                    if let Some(idx) = resolve(track_id) { self.set_track_gain(idx, value); }
+                },
+                AiAction::SetMasterGain { value } => self.set_master_gain(value),
+                AiAction::SetPan { track_id, value } => {
+                    if let Some(idx) = resolve(track_id) { self.set_track_pan(idx, value); }
+                },
+                AiAction::ToggleMute { track_id } => {
+                    if let Some(idx) = resolve(track_id) { self.toggle_mute(idx); }
+                },
+                AiAction::Unmute { track_id } => {
+                    if let Some(idx) = resolve(track_id) { self.set_track_mute(idx, false); }
+                },
+                AiAction::ToggleSolo { track_id } => {
+                    if let Some(idx) = resolve(track_id) { self.toggle_solo(idx); }
+                },
+                AiAction::Unsolo { track_id: _ } => self.clear_solo(),
+                
+                AiAction::SplitClip { track_id, time, clip_number: _ } => { 
+                    if let Some(idx) = resolve(track_id) { let _ = self.split_clip(idx, time); }
+                },
+                AiAction::MergeClips { track_id, clip_number } => {
+                    if let Some(idx) = resolve(track_id) {
+                        let clip_idx = clip_number.saturating_sub(1); 
+                        let _ = self.merge_clip_with_next(idx, clip_idx);
+                    }
+                },
+                AiAction::DeleteClip { track_id, clip_number } => {
+                    if let Some(idx) = resolve(track_id) {
+                        let clip_idx = clip_number.saturating_sub(1);
+                        let _ = self.delete_clip(idx, clip_idx);
+                    }
+                },
+                AiAction::MoveClip { track_id, clip_number, new_time } => {
+                    if let Some(idx) = resolve(track_id) {
+                        let clip_idx = clip_number.saturating_sub(1);
+                        let _ = self.move_clip(idx, clip_idx, new_time);
+                    }
+                },
+                AiAction::SetBpm { bpm } => {
+                    self.set_bpm(bpm);
+                },
+                AiAction::DeleteTrack { track_id } => { 
+                    if let Some(idx) = resolve(track_id) { let _ = self.delete_track(idx); }
+                },
+                AiAction::CreateTrack { count: _, track_id: _ } => { let _ = self.create_empty_track(); },
+                
+                AiAction::UpdateEq { track_id, band_index, filter_type, freq, q, gain } => {
+                    if let Some(idx) = resolve(track_id) {
+                        let mapped_filter = match filter_type {
+                            SchemaEqFilterType::Peaking => crate::effects::equalizer::EqFilterType::Peaking,
+                            SchemaEqFilterType::LowShelf => crate::effects::equalizer::EqFilterType::LowShelf,
+                            SchemaEqFilterType::HighShelf => crate::effects::equalizer::EqFilterType::HighShelf,
+                            SchemaEqFilterType::LowPass => crate::effects::equalizer::EqFilterType::LowPass,
+                            SchemaEqFilterType::HighPass => crate::effects::equalizer::EqFilterType::HighPass,
+                        };
+                        let params = crate::effects::equalizer::EqParams {
+                            filter_type: mapped_filter,
+                            freq: freq.clamp(20.0, 20_000.0),
+                            q: q.clamp(0.1, 10.0),
+                            gain: gain.clamp(-18.0, 18.0),
+                            active: true,
+                        };
+                        self.update_eq(idx, band_index, params);
+                    }
+                },
+                AiAction::UpdateCompressor { track_id, threshold_db, ratio, attack_ms, release_ms, makeup_gain_db } => {
+                    if let Some(idx) = resolve(track_id) {
+                        let params = crate::effects::compressor::CompressorParams {
+                            is_active: true,
+                            threshold_db: threshold_db.clamp(-60.0, 0.0),
+                            ratio: ratio.clamp(1.0, 20.0),
+                            attack_ms: attack_ms.clamp(0.1, 200.0),
+                            release_ms: release_ms.clamp(10.0, 1000.0),
+                            makeup_gain_db: makeup_gain_db.clamp(0.0, 24.0),
+                        };
+                        self.update_compressor(idx, params);
+                    }
+                },
+                AiAction::SeparateStems { .. } => {
+                    // Handled async by UI
+                },
+                AiAction::Undo => self.undo(),
+                AiAction::Redo => self.redo(),
+            }
+        }
+
+        Ok(())
+    }
+
 }

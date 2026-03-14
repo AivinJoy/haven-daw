@@ -7,10 +7,10 @@ pub mod metering;
 
 pub use track::{Track, TrackId, TrackState};
 pub use mixer::Mixer;
+use rand::seq::IndexedRandom; // Required for .choose()
 pub use time::TempoMap;
 
 use std::time::Duration;
-use rand::seq::IndexedRandom;
 use metering::{TrackMeters, MeterState}; // <--- ADD THIS IMPORT
 use std::sync::Arc;
 
@@ -74,20 +74,35 @@ impl Engine {
             "bg-cyan-500", "bg-indigo-500", "bg-rose-500"
         ];
 
-        // 2. Pick Random Color
-        let mut rng = rand::rng(); // For rand 0.9+
-        // If using older rand (0.8), use: let mut rng = rand::thread_rng();
-        // Based on your cargo.toml having rand 0.9.0, rand::rng() is correct.
+        // 2. Deterministic Color Allocation
+        // Gather all currently used colors into a HashSet for fast lookup
+        let used_colors: std::collections::HashSet<&str> = self.tracks
+            .iter()
+            .map(|t| t.color.as_str())
+            .collect();
         
-        let chosen_color = colors.choose(&mut rng)
-            .unwrap_or(&"bg-brand-blue")
-            .to_string();
+        // 3. Create a pool of ONLY the available (unused) colors
+        let available_colors: Vec<&str> = colors
+            .into_iter()
+            .filter(|&c| !used_colors.contains(c))
+            .collect();
 
-        // 3. Create Track with Color
+        // 4. Randomly pick from the available pool
+        let chosen_color = if !available_colors.is_empty() {
+            let mut rng = rand::rng(); 
+            // Pick a random color from the unused subset
+            available_colors.choose(&mut rng).unwrap().to_string()
+        } else {
+            // 5. FALLBACK: If the user creates more tracks than we have colors (e.g., 10th track),
+            // safely loop back to the beginning based on the track ID.
+            colors[(id.0 as usize) % colors.len()].to_string()
+        };
+
+        // 6. Create Track
         let track = Track::new(
             id, 
             format!("Track {}", id.0 + 1), 
-            chosen_color, // <--- Pass Color Here
+            chosen_color,
             self.sample_rate, 
             self.channels
         );

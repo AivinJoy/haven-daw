@@ -7,8 +7,21 @@
     import { listen } from '@tauri-apps/api/event';
 	import { invoke } from '@tauri-apps/api/core';
 
-    // Props to get context
-    let { tracks = [] } = $props();
+    // 1. ADD THIS INTERFACE
+    interface Props {
+        tracks?: any[];
+        globalState?: {
+            bpm: number;
+            timeSignature: string;
+            playheadTime: number;
+        };
+    }
+
+    // 2. APPLY THE INTERFACE TO $props()
+    let { 
+        tracks = [], 
+        globalState = { bpm: 120, timeSignature: "4/4", playheadTime: 0 } 
+    }: Props = $props();
 
     let input = $state("");
     let isLoading = $state(false);
@@ -135,9 +148,11 @@
         isLoading = true;
 
         try {
-            const response = await aiAgent.sendMessage(currentInput, tracks, historyToSend);
+            // 2. FIXED: Pass globalState correctly as the 3rd argument
+            const response = await aiAgent.sendMessage(currentInput, tracks, globalState, historyToSend);
             messages = [...messages, response];
         } catch (e) {
+            console.error("🛑 Chatbot Exception:", e); // <--- Add this line!
             messages = [...messages, { role: 'assistant', content: "Error connecting to AI.", timestamp: Date.now() }];
         } finally {
             isLoading = false;
