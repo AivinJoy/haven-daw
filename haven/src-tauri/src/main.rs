@@ -7,7 +7,6 @@
 mod stem_separation;
 mod ai_transaction;
 mod automation;
-use crate::automation::*;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -135,6 +134,7 @@ fn build_ui_state(
             muted: info.muted,
             solo: info.solo,
             source: source_type,
+            volume_automation: info.volume_automation.clone(),
         });
     }
     
@@ -720,7 +720,8 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
         pan: 0.0,
         muted: false,
         solo: false,
-        source: "mic".to_string()
+        source: "mic".to_string(),
+        volume_automation: vec![],
     })
 }
 
@@ -930,6 +931,7 @@ pub struct LoadedTrack {
     pub muted: bool,
     pub solo: bool,
     pub source: String,
+    pub volume_automation: Vec<daw_modules::engine::automation::AutomationNode<f32>>,
 }
 
 #[derive(serde::Serialize)]

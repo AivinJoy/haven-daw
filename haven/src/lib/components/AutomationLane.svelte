@@ -2,67 +2,76 @@
     import { invoke } from '@tauri-apps/api/core'; 
     import { onMount } from 'svelte';
 
+    type AutomationNode = { time: number; value: number };
+
     let { 
         trackId, 
         width, 
         height = 100, 
         pixelsPerSecond, 
-        sampleRate = 44100 
     } = $props<{
-        trackId: string;
+        trackId: number; 
         width: number;
-        height: number;
+        height?: number;
         pixelsPerSecond: number;
-        sampleRate?: number;
     }>();
 
-    type AutomationNode = { time: number; value: number };
     let nodes = $state<AutomationNode[]>([]);
 
-    // --- Dragging State ---
     let draggingIndex = $state<number | null>(null);
     let originalDragTime = $state<number | null>(null);
 
-    // --- Coordinate Mapping ---
-    function timeToX(timeInSamples: number): number {
-        return (timeInSamples / sampleRate) * pixelsPerSecond;
+    const MAX_GAIN = 2.0;
+
+    // --- Time Math is now incredibly simple (Seconds <-> Pixels) ---
+    function timeToX(timeInSeconds: number): number {
+        return timeInSeconds * pixelsPerSecond;
     }
 
     function xToTime(x: number): number {
-        return Math.round((x / pixelsPerSecond) * sampleRate);
+        return x / pixelsPerSecond;
     }
 
     function gainToY(gain: number): number {
-        const clampedGain = Math.max(0, Math.min(1, gain));
-        return height - (clampedGain * height);
+        const clampedGain = Math.max(0, Math.min(MAX_GAIN, gain));
+        return height - ((clampedGain / MAX_GAIN) * height);
     }
 
     function yToGain(y: number): number {
         const clampedY = Math.max(0, Math.min(height, y));
-        return 1.0 - (clampedY / height);
+        return MAX_GAIN - ((clampedY / height) * MAX_GAIN);
     }
 
-    // Sort nodes dynamically so the polyline doesn't criss-cross if nodes overlap during drag
-    let polylinePoints = $derived(
-        [...nodes]
-            .sort((a, b) => a.time - b.time)
-            .map(n => `${timeToX(n.time)},${gainToY(n.value)}`)
-            .join(' ')
-    );
+    // --- Dynamic Polyline ---
+    let polylinePoints = $derived.by(() => {
+        if (nodes.length === 0) {
+            const defaultY = gainToY(1.0);
+            return `0,${defaultY} ${width},${defaultY}`;
+        }
 
-    // --- Backend Sync ---
+        const sorted = [...nodes].sort((a, b) => a.time - b.time);
+        const first = sorted[0];
+        const last = sorted[sorted.length - 1];
+
+        let pts = `0,${gainToY(first.value)} `;
+        pts += sorted.map(n => `${timeToX(n.time)},${gainToY(n.value)}`).join(' ');
+        pts += ` ${width},${gainToY(last.value)}`;
+
+        return pts;
+    });
+
     async function loadNodes() {
         try {
-            nodes = await invoke('get_volume_automation', { trackId });
-            nodes.sort((a, b) => a.time - b.time);
+            const fetchedNodes: AutomationNode[] = await invoke('get_volume_automation', { trackId });
+            nodes = fetchedNodes.sort((a, b) => a.time - b.time);
         } catch (error) {
             console.error("Failed to load automation:", error);
         }
     }
 
-    // --- Mouse Interactions ---
-    async function handleLaneDblClick(e: MouseEvent) {
-        // Prevent adding a node if we double-clicked an existing circle
+    // --- Single Click to Add Node ---
+    async function handleCanvasClick(e: PointerEvent) {
+        // Guard: Don't add a node if they are clicking on an existing one
         if (e.target instanceof SVGCircleElement) return;
 
         const rect = (e.currentTarget as SVGElement).getBoundingClientRect();
@@ -72,33 +81,30 @@
         const time = xToTime(x);
         const value = yToGain(y);
 
-        // Optimistic UI Update
         nodes = [...nodes, { time, value }].sort((a, b) => a.time - b.time);
 
         try {
             await invoke('add_volume_automation_node', { trackId, time, value });
         } catch (err) {
             console.error("Failed to add node:", err);
-            loadNodes(); // Rollback on failure
+            loadNodes(); 
         }
     }
 
     function startDrag(index: number, e: PointerEvent) {
-        e.stopPropagation();
+        e.stopPropagation(); // Prevents the canvas click from firing
         draggingIndex = index;
         originalDragTime = nodes[index].time;
-        // Capture the pointer so dragging works even if the mouse leaves the circle
         (e.target as Element).setPointerCapture(e.pointerId);
     }
 
     function onDrag(e: PointerEvent) {
         if (draggingIndex === null) return;
-        
         const rect = (e.currentTarget as SVGElement).getBoundingClientRect();
-        const x = Math.max(0, e.clientX - rect.left); // Prevent dragging off-screen left
+        
+        const x = Math.max(0, e.clientX - rect.left);
         const y = Math.max(0, Math.min(height, e.clientY - rect.top));
 
-        // Update local state smoothly for 60fps rendering
         nodes[draggingIndex] = {
             time: xToTime(x),
             value: yToGain(y)
@@ -115,13 +121,10 @@
         originalDragTime = null;
         (e.target as Element).releasePointerCapture(e.pointerId);
 
-        // Re-sort array based on new time
         nodes.sort((a, b) => a.time - b.time);
-        nodes = [...nodes]; // Trigger reactivity
+        nodes = [...nodes]; 
 
         try {
-            // Because our Rust backend uses `time` as the sorted key, 
-            // if the time changed, we must delete the old one and add the new one.
             if (oldTime !== draggedNode.time) {
                 await invoke('remove_volume_automation_node', { trackId, time: oldTime });
             }
@@ -138,7 +141,6 @@
 
         const nodeTime = nodes[index].time;
         
-        // Optimistic remove
         nodes.splice(index, 1);
         nodes = [...nodes];
 
@@ -151,6 +153,7 @@
     }
 
     onMount(() => {
+        // Always fetch from backend on mount to guarantee perfect precision
         loadNodes();
     });
 </script>
@@ -160,29 +163,36 @@
     {width} 
     {height} 
     xmlns="http://www.w3.org/2000/svg"
-    ondblclick={handleLaneDblClick}
+    onpointerdown={handleCanvasClick}
     onpointermove={onDrag}
     role="application"
     aria-label="Automation Lane Canvas"
 >
     <rect width="100%" height="100%" fill="transparent" />
 
-    {#if nodes.length > 1}
-        <polyline 
-            points={polylinePoints} 
-            fill="none" 
-            stroke="#00FFCC" 
-            stroke-width="2" 
-            opacity="0.8" 
-        />
-    {/if}
+    <polyline 
+        points={polylinePoints} 
+        fill="none" 
+        stroke="#00FFCC" 
+        stroke-width="5" 
+        opacity="0.3" 
+        style="filter: drop-shadow(0px 0px 4px #00FFCC);"
+    />
+
+    <polyline 
+        points={polylinePoints} 
+        fill="none" 
+        stroke="#FFFFFF" 
+        stroke-width="1.5" 
+        opacity="0.9" 
+    />
 
     {#each nodes as node, i}
         <circle 
             cx={timeToX(node.time)} 
             cy={gainToY(node.value)} 
             r={draggingIndex === i ? "6" : "4"} 
-            fill={draggingIndex === i ? "#00FFCC" : "#FFFFFF"} 
+            fill="#FFFFFF" 
             stroke="#00FFCC" 
             stroke-width="2" 
             class="automation-node"
@@ -201,14 +211,13 @@
         position: absolute;
         top: 0;
         left: 0;
-        /* Must be auto to receive clicks/drags */
-        pointer-events: auto; 
-        z-index: 25; /* Above clips, below menus */
+        pointer-events: auto;
+        z-index: 25; 
     }
 
     .automation-node {
         cursor: grab;
-        transition: r 0.1s ease, fill 0.1s ease;
+        transition: r 0.1s ease;
     }
 
     .automation-node:active {

@@ -576,7 +576,7 @@
                         {/each}
                         {#if ui.showAutomation}
                             <AutomationLane 
-                                trackId={track.id.toString()} 
+                                trackId={track.id}
                                 width={maxDurationSeconds * PIXELS_PER_SECOND * zoomMultiplier} 
                                 height={96} 
                                 pixelsPerSecond={PIXELS_PER_SECOND * zoomMultiplier} 

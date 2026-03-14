@@ -90,6 +90,7 @@ pub struct FrontendTrackInfo {
     pub clips: Vec<FrontendClipInfo>,
     pub compressor: Option<CompressorParams>,
     pub eq: Option<Vec<EqParams>>,
+    pub volume_automation: Vec<crate::engine::automation::AutomationNode<f32>>,
 }
 
 pub struct EngineSnapshot {
@@ -757,6 +758,7 @@ impl AudioRuntime {
                     clips, // <--- Add the clips here
                     compressor: Some(t.track_compressor.get_params()),
                     eq: Some(t.track_eq.get_state()),
+                    volume_automation: t.volume_automation.nodes().to_vec(),
                 }
             }).collect()
         } else {
@@ -791,7 +793,7 @@ impl AudioRuntime {
         }
     }
 
-    // --- ADD THIS NEW METHOD HERE ---
+    
     // UPDATED: Now takes 'track_id: u32' instead of index
     pub fn set_clip_duration(&self, track_id: u32, duration: f64) -> Result<(), String> {
         if let Ok(mut eng) = self.engine.lock() {
@@ -803,6 +805,38 @@ impl AudioRuntime {
                 } else {
                     return Err(format!("Track {} exists but has no clips (Empty Track)", track_id));
                 }
+            }
+            return Err(format!("Track ID {} not found", track_id));
+        }
+        Err("Failed to lock engine".to_string())
+    }
+
+    pub fn get_volume_automation(&self, track_id: u32) -> Result<Vec<crate::engine::automation::AutomationNode<f32>>, String> {
+        if let Ok(eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks().iter().find(|t| t.id.0 == track_id) {
+                return Ok(track.volume_automation.nodes().to_vec());
+            }
+            return Err(format!("Track ID {} not found", track_id));
+        }
+        Err("Failed to lock engine".to_string())
+    }
+
+    pub fn add_volume_automation_node(&self, track_id: u32, time: u64, value: f32) -> Result<(), String> {
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
+                track.volume_automation.insert_node(time, value);
+                return Ok(());
+            }
+            return Err(format!("Track ID {} not found", track_id));
+        }
+        Err("Failed to lock engine".to_string())
+    }
+
+    pub fn remove_volume_automation_node(&self, track_id: u32, time: u64) -> Result<(), String> {
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
+                track.volume_automation.remove_node_at_time(time);
+                return Ok(());
             }
             return Err(format!("Track ID {} not found", track_id));
         }

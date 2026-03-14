@@ -57,6 +57,8 @@
         waveform: { mins: number[], maxs: number[], duration: number, binsPerSecond: number };
         color: string;
     };
+
+    type AutomationNode = { time: number; value: number; };
     // --- TYPE DEFINITION (UPDATED) ---
     type Track = {
       id: number;
@@ -75,6 +77,7 @@
       savePath?: string;
       source: 'mic' | 'media';
       monitor: boolean;
+      volume_automation?: AutomationNode[];
     };
 
     // --- TRACKS STATE ---

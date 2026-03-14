@@ -1,50 +1,54 @@
-use crate::AppState; // Adjust this path to where your state type is defined
-use daw_modules::engine::automation::AutomationNode;
+// src-tauri/src/automation.rs
+use crate::AppState;
 use tauri::State;
+
+// Create a UI-friendly struct that uses seconds instead of samples
+#[derive(serde::Serialize)]
+pub struct UiAutomationNode {
+    pub time: f64, // Time in SECONDS
+    pub value: f32,
+}
 
 #[tauri::command]
 pub fn get_volume_automation(
-    state: State<'_, SharedAudioEngine>,
-    track_id: String,
-) -> Result<Vec<AutomationNode<f32>>, String> {
-    let engine = state.lock().map_err(|e| e.to_string())?;
+    track_id: u32,
+    state: State<'_, AppState>,
+) -> Result<Vec<UiAutomationNode>, String> {
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    let sr = audio.sample_rate() as f64; // Get the TRUE hardware sample rate
+    let nodes = audio.get_volume_automation(track_id).map_err(|e| e.to_string())?;
     
-    if let Some(track) = engine.tracks().iter().find(|t| t.id == track_id) {
-        Ok(track.volume_automation.nodes().to_vec())
-    } else {
-        Err(format!("Track {} not found", track_id))
-    }
+    // Convert samples to seconds for the UI
+    Ok(nodes.into_iter().map(|n| UiAutomationNode {
+        time: (n.time as f64) / sr,
+        value: n.value
+    }).collect())
 }
 
 #[tauri::command]
 pub fn add_volume_automation_node(
-    state: State<'_, SharedAudioEngine>,
-    track_id: String,
-    time: u64,
+    track_id: u32,
+    time: f64, // Time in SECONDS
     value: f32,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut engine = state.lock().map_err(|e| e.to_string())?;
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    let sr = audio.sample_rate() as f64;
+    // Safely convert seconds to exact hardware samples
+    let sample_time = (time * sr).round() as u64; 
     
-    if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == track_id) {
-        track.volume_automation.insert_node(time, value);
-        Ok(())
-    } else {
-        Err(format!("Track {} not found", track_id))
-    }
+    audio.add_volume_automation_node(track_id, sample_time, value).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn remove_volume_automation_node(
-    state: State<'_, SharedAudioEngine>,
-    track_id: String,
-    time: u64,
+    track_id: u32,
+    time: f64, // Time in SECONDS
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut engine = state.lock().map_err(|e| e.to_string())?;
+    let audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    let sr = audio.sample_rate() as f64;
+    let sample_time = (time * sr).round() as u64;
     
-    if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == track_id) {
-        track.volume_automation.remove_node_at_time(time);
-        Ok(())
-    } else {
-        Err(format!("Track {} not found", track_id))
-    }
+    audio.remove_volume_automation_node(track_id, sample_time).map_err(|e| e.to_string())
 }
