@@ -6,6 +6,8 @@
 
 mod stem_separation;
 mod ai_transaction;
+mod automation;
+use crate::automation::*;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -21,6 +23,7 @@ use daw_modules::recorder::Recorder;
 use daw_modules::waveform::Waveform;
 use daw_modules::bpm; // Import the new BPM module
 use daw_modules::engine::time::GridLine; // Import GridLine
+
 
 
 // [NEW STRUCT] Holds separation results waiting for user confirmation
@@ -1438,7 +1441,10 @@ fn main() {
             stem_separation::cancel_ai_job,
             commit_pending_stems,
             discard_pending_stems,
-            sanitize_ai_batch
+            sanitize_ai_batch,
+            automation::get_volume_automation,
+            automation::add_volume_automation_node,
+            automation::remove_volume_automation_node
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

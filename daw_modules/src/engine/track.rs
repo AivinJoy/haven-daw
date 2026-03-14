@@ -19,8 +19,9 @@ use crate::decoder::{spawn_decoder_with_ctrl, DecoderCmd};
 use crate::bpm::adapter;
 use crate::effects::equalizer::TrackEq;
 use crate::effects::compressor::CompressorNode;
-use crate::engine::metering::{MeterState, TrackMeters}; // <--- ADD IMPORT
+use crate::engine::metering::{MeterState, TrackMeters}; 
 use crate::analyzer::AnalysisProfile;
+use crate::engine::automation::AutomationCurve; 
 
 /// Identifier for a track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -323,6 +324,7 @@ pub struct Track {
     pub meters: std::sync::Arc<TrackMeters>, // <--- Shared with UI
     meter_state: MeterState,                 // <--- Owned by Audio Thread
     pub analysis: Arc<std::sync::Mutex<Option<AnalysisProfile>>>,
+    pub volume_automation: AutomationCurve<f32>, 
     // --- Track Start Time (for Drag & Drop) ---
 }
 
@@ -379,9 +381,10 @@ impl Track {
             clips: Vec::new(),
             track_eq: TrackEq::new(sample_rate, channels),
             track_compressor: CompressorNode::new(sample_rate as f32),
-            meters: TrackMeters::new(),                       // <--- ADDED
-            meter_state: MeterState::new(sample_rate as f32), // <--- ADDED
+            meters: TrackMeters::new(),                      
+            meter_state: MeterState::new(sample_rate as f32),
             analysis: Arc::new(std::sync::Mutex::new(None)),
+            volume_automation: AutomationCurve::new(),
         }
     }
 
@@ -607,10 +610,19 @@ impl Track {
 
         let mut active_clips = 0;
 
+        // --- NEW: Calculate Automation Boundaries ---
+        let frames = dst.len() / channels;
+        let start_sample = (start_secs * sample_rate as f64).round() as u64;
+        let end_sample = start_sample + frames as u64;
+
+        // Pass self.gain as the fallback if no automation exists
+        let start_gain = self.volume_automation.get_value_at_time(start_sample, self.gain);
+        let end_gain = self.volume_automation.get_value_at_time(end_sample, self.gain);
+
         // Determine if we should actually mix audio or just discard it
-        // Note: Solo logic is usually handled by the caller (Mixer) setting 'muted' effectively,
-        // or passing a flag. Here we rely on self.muted being set correctly.
-        let is_audible = !self.muted && self.gain > 0.0;
+        // Note: We now check if either the start or end gain is above 0.0, 
+        // allowing automation to fade the track in from silence.
+        let is_audible = !self.muted && (start_gain > 0.0 || end_gain > 0.0);
 
         // 1. Loop through all clips and mix them
         // 1. Loop through all clips and mix them
@@ -689,7 +701,15 @@ impl Track {
 
         // Apply Gain/Pan only if we actually mixed something
         if active_clips > 0 && is_audible {
-            let gain = self.gain;
+            // --- NEW: Calculate Per-Sample Gain Step ---
+            // We divide by (frames - 1.0) to ensure the final frame hits exact end_gain.
+            let gain_step = if frames > 1 {
+                (end_gain - start_gain) / (frames as f32 - 1.0)
+            } else {
+                0.0
+            };
+            
+            let mut current_gain = start_gain;
             let pan = self.pan.clamp(-1.0, 1.0);
             
             let (pan_l, pan_r) = if channels >= 2 {
@@ -701,14 +721,17 @@ impl Track {
 
             for i in (0..dst.len()).step_by(channels) {
                 if channels >= 2 {
-                    dst[i] *= gain * pan_l;   
-                    dst[i+1] *= gain * pan_r; 
+                    dst[i] *= current_gain * pan_l;   
+                    dst[i+1] *= current_gain * pan_r; 
                     for c in 2..channels {
-                        dst[i+c] *= gain;
+                        dst[i+c] *= current_gain;
                     }
                 } else {
-                    dst[i] *= gain;
+                    dst[i] *= current_gain;
                 }
+                
+                // Step the gain for the next frame block
+                current_gain += gain_step;
             }
         }
 

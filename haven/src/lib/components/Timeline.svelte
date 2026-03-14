@@ -5,6 +5,8 @@
     import { invoke } from '@tauri-apps/api/core';
     import DraggableTrackItem from './DraggableTrackItem.svelte';
     import ContextMenu from './ContextMenu.svelte';
+    import AutomationLane from './AutomationLane.svelte';
+    import { ui } from '$lib/stores/ui.svelte';
 
     const dispatch = createEventDispatcher();
 
@@ -331,6 +333,19 @@
       }
     }
 
+    // --- AUTOMATION KEYBOARD SHORTCUT (A Key) ---
+    function handleAutomationShortcut(e: KeyboardEvent) {
+        const el = e.target as HTMLElement | null;
+        const typing = el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+        if (typing) return;
+
+        if (e.key.toLowerCase() === "a" && !e.ctrlKey && !e.metaKey) {
+            e.preventDefault();
+            e.stopPropagation();
+            ui.toggleAutomation();
+        }
+    }
+
 
     // --- CONTEXT MENU ACTION ---
     async function performSplit() {
@@ -447,7 +462,15 @@
 
 </script>
 
-<svelte:window onmousemove={onScrubMove} onmouseup={stopScrub} on:keydown={handleKeyDown}/>
+<svelte:window 
+    onmousemove={onScrubMove} 
+    onmouseup={stopScrub} 
+    on:keydown={(e) => {
+        handleKeyDown(e);
+        handleAutomationShortcut(e);
+    }}
+/>
+
 {#if showMenu}
     <ContextMenu
       x={menuPos.x}
@@ -551,6 +574,14 @@
                             on:contextmenu={(e) => handleClipContextMenu(e, trackIndex, clipIndex)}
                           />
                         {/each}
+                        {#if ui.showAutomation}
+                            <AutomationLane 
+                                trackId={track.id.toString()} 
+                                width={maxDurationSeconds * PIXELS_PER_SECOND * zoomMultiplier} 
+                                height={96} 
+                                pixelsPerSecond={PIXELS_PER_SECOND * zoomMultiplier} 
+                            />
+                        {/if}
                     </div>
                 {/each}
             </div>

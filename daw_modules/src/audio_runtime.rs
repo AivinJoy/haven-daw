@@ -698,6 +698,7 @@ impl AudioRuntime {
                 muted: t.muted,
                 solo: t.solo,
                 clips, // Add the list of clips
+                volume_automation: t.volume_automation.clone(),
                 compressor: Some(t.track_compressor.get_params()),
                 eq: Some(t.track_eq.get_state()),
             }

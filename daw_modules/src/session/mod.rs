@@ -60,7 +60,8 @@ impl Session {
                 muted: t.muted,
                 solo: t.solo,
                 clips,
-                compressor: Some(t.track_compressor.get_params()), // <--- ADD THIS 
+                volume_automation: t.volume_automation.clone(),
+                compressor: Some(t.track_compressor.get_params()),
                 eq: Some(t.track_eq.get_state()),
             }    
         }).collect();

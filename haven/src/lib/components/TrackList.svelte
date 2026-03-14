@@ -1,9 +1,10 @@
 <!-- haven\src\lib\components\TrackList.svelte -->
 <script lang="ts">
-  import { Plus } from 'lucide-svelte';
+  import { Plus, Activity } from 'lucide-svelte';
   import TrackControl from './TrackControl.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import { createEventDispatcher } from 'svelte';
+  import { ui } from '$lib/stores/ui.svelte';
   
   const dispatch = createEventDispatcher<{
     requestAdd: null;        // No payload
@@ -111,6 +112,19 @@
                 />
             </div>
         {/each}
+    </div>
+    <div class="p-3 border-t border-white/5 bg-[#0a0a0f]/90 shrink-0">
+        <button 
+            onclick={() => ui.toggleAutomation()}
+            class={`w-full h-8 rounded-lg flex items-center justify-center gap-2 text-[10px] font-bold uppercase tracking-wider transition-all border ${
+                ui.showAutomation 
+                ? 'bg-[#00FFCC]/10 border-[#00FFCC]/50 text-[#00FFCC] shadow-[0_0_10px_rgba(0,255,204,0.2)]' 
+                : 'bg-white/5 border-transparent text-white/40 hover:bg-white/10 hover:text-white/80'
+            }`}
+        >
+            <Activity size={14} />
+            <span>Automation (A)</span>
+        </button>
     </div>
 </div>
 {#if showMenu}
