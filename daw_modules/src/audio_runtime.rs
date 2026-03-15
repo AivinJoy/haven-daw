@@ -758,7 +758,11 @@ impl AudioRuntime {
                     clips, // <--- Add the clips here
                     compressor: Some(t.track_compressor.get_params()),
                     eq: Some(t.track_eq.get_state()),
-                    volume_automation: t.volume_automation.nodes().to_vec(),
+                    // Convert stored dB values into Linear values (0.0 to ~2.0) for Svelte UI rendering
+                    volume_automation: t.volume_automation.nodes().iter().map(|n| crate::engine::automation::AutomationNode {
+                        time: n.time,
+                        value: 10.0_f32.powf(n.value / 20.0), 
+                    }).collect(),
                 }
             }).collect()
         } else {
@@ -823,8 +827,42 @@ impl AudioRuntime {
 
     pub fn add_volume_automation_node(&self, track_id: u32, time: u64, value: f32) -> Result<(), String> {
         if let Ok(mut eng) = self.engine.lock() {
+            let sample_rate = eng.sample_rate as f64; // Grab SR for time calculations
+            
             if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
+                
+                // --- NEW: THE AUTO-ANCHOR FIX ---
+                let is_empty = track.volume_automation.nodes().is_empty();
+                
+                if is_empty {
+                    // 1. Insert Start Anchor (0.0 dB at exactly 0 seconds)
+                    track.volume_automation.insert_node(0, 0.0);
+                    
+                    // 2. Find the absolute end of the track's audio to place the End Anchor
+                    let mut max_time_secs = 600.0; // Fallback: 10 minutes if track is empty
+                    if let Some(last_clip) = track.clips.iter().max_by(|a, b| {
+                        let a_end = a.start_time + a.duration;
+                        let b_end = b.start_time + b.duration;
+                        a_end.cmp(&b_end)
+                    }) {
+                        max_time_secs = (last_clip.start_time + last_clip.duration).as_secs_f64();
+                    }
+                    
+                    // Place the end anchor 60 seconds past the last clip to ensure the UI line stays flat to the right
+                    let end_sample = ((max_time_secs + 60.0) * sample_rate).round() as u64;
+                    track.volume_automation.insert_node(end_sample, 0.0);
+                }
+
+                // --- DEBUG LOG ---
+                let time_sec = time as f64 / sample_rate;
+                println!("🎚️ Engine Stored Node -> Track: {} | Time: {:.3}s (Sample: {}) | Value: {:.2} dB", 
+                    track_id, time_sec, time, value
+                );
+                // -----------------
+
+                // 3. Insert the actual node the user or AI requested
                 track.volume_automation.insert_node(time, value);
+                
                 return Ok(());
             }
             return Err(format!("Track ID {} not found", track_id));
@@ -836,6 +874,17 @@ impl AudioRuntime {
         if let Ok(mut eng) = self.engine.lock() {
             if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
                 track.volume_automation.remove_node_at_time(time);
+                return Ok(());
+            }
+            return Err(format!("Track ID {} not found", track_id));
+        }
+        Err("Failed to lock engine".to_string())
+    }
+
+    pub fn clear_volume_automation(&self, track_id: u32) -> Result<(), String> {
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
+                track.volume_automation.clear();
                 return Ok(());
             }
             return Err(format!("Track ID {} not found", track_id));
@@ -979,6 +1028,34 @@ impl AudioRuntime {
                         };
                         self.update_compressor(idx, params);
                     }
+                },
+                AiAction::ClearVolumeAutomation { track_id } => {
+                    // Note: ai_schema uses usize for track_id, but the backend methods expect u32
+                    let _ = self.clear_volume_automation(track_id as u32);
+                },
+                AiAction::AddVolumeAutomation { track_id, time, value } => {
+                    let sr = self.sample_rate() as f64;
+                    // Safely convert AI seconds to exact hardware samples
+                    let time_samples = (time * sr).round() as u64; 
+                    let _ = self.add_volume_automation_node(track_id as u32, time_samples, value);
+                },
+                AiAction::DuckVolume { track_id, time, depth_db } => {
+                    let sr = self.sample_rate() as f64;
+                    let t_id = track_id as u32;
+
+                    // Let Rust do the math! 50ms attack, 200ms release.
+                    let anchor_start = (time - 0.05).max(0.0);
+                    let duck_time = time;
+                    let anchor_end = time + 0.20;
+
+                    let sample_start = (anchor_start * sr).round() as u64;
+                    let sample_duck = (duck_time * sr).round() as u64;
+                    let sample_end = (anchor_end * sr).round() as u64;
+
+                    // Safely insert the 3 nodes
+                    let _ = self.add_volume_automation_node(t_id, sample_start, 0.0);
+                    let _ = self.add_volume_automation_node(t_id, sample_duck, depth_db);
+                    let _ = self.add_volume_automation_node(t_id, sample_end, 0.0);
                 },
                 AiAction::SeparateStems { .. } => {
                     // Handled async by UI

@@ -610,19 +610,22 @@ impl Track {
 
         let mut active_clips = 0;
 
-        // --- NEW: Calculate Automation Boundaries ---
+        // --- NEW: Calculate Automation Boundaries in dB ---
         let frames = dst.len() / channels;
         let start_sample = (start_secs * sample_rate as f64).round() as u64;
         let end_sample = start_sample + frames as u64;
 
-        // Pass self.gain as the fallback if no automation exists
-        let start_gain = self.volume_automation.get_value_at_time(start_sample, self.gain);
-        let end_gain = self.volume_automation.get_value_at_time(end_sample, self.gain);
+        // 1. Fetch from automation curve (default to 0.0 dB / unity gain if no automation exists)
+        let start_gain_db = self.volume_automation.get_value_at_time(start_sample, 0.0);
+        let end_gain_db = self.volume_automation.get_value_at_time(end_sample, 0.0);
 
-        // Determine if we should actually mix audio or just discard it
-        // Note: We now check if either the start or end gain is above 0.0, 
-        // allowing automation to fade the track in from silence.
-        let is_audible = !self.muted && (start_gain > 0.0 || end_gain > 0.0);
+        // 2. Convert dB to Linear Multiplier and combine with the static Track Fader (self.gain)
+        let start_gain_linear = self.gain * 10.0_f32.powf(start_gain_db / 20.0);
+        let end_gain_linear = self.gain * 10.0_f32.powf(end_gain_db / 20.0);
+
+        // 3. Determine if we should actually mix audio or just discard it.
+        // A linear gain of > 0.0001 is roughly above -80dB (threshold of hearing)
+        let is_audible = !self.muted && (start_gain_linear > 0.0001 || end_gain_linear > 0.0001);
 
         // 1. Loop through all clips and mix them
         // 1. Loop through all clips and mix them
@@ -703,13 +706,14 @@ impl Track {
         if active_clips > 0 && is_audible {
             // --- NEW: Calculate Per-Sample Gain Step ---
             // We divide by (frames - 1.0) to ensure the final frame hits exact end_gain.
+            // --- NEW: Calculate Per-Sample Gain Step (Linear) ---
             let gain_step = if frames > 1 {
-                (end_gain - start_gain) / (frames as f32 - 1.0)
+                (end_gain_linear - start_gain_linear) / (frames as f32 - 1.0)
             } else {
                 0.0
             };
             
-            let mut current_gain = start_gain;
+            let mut current_gain = start_gain_linear;
             let pan = self.pan.clamp(-1.0, 1.0);
             
             let (pan_l, pan_r) = if channels >= 2 {

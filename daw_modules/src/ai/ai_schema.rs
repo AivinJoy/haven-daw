@@ -94,6 +94,19 @@ pub enum AiAction {
         release_ms: f32,
         makeup_gain_db: f32,
     },
+    ClearVolumeAutomation {
+        track_id: usize,
+    },
+    AddVolumeAutomation {
+        track_id: usize,
+        time: f64,  // Exact time in seconds
+        value: f32, // STRICTLY IN dB (-inf to +12.0)
+    },
+    DuckVolume {
+        track_id: usize,
+        time: f64,
+        depth_db: f32,
+    },
     Undo,
     Redo,
 }

@@ -14,6 +14,7 @@ export interface AICommand {
     track_id?: number;
     value?: number;
     time?: number;
+    depth_db?: number;
     new_time?: number;
     clip_number?: number;
     bpm?: number;
@@ -86,7 +87,7 @@ class AIAgent {
                     id: t.id, 
                     name: t.name.toLowerCase(),
                     color: t.color, // <--- NOW THE AI KNOWS THE COLORS!
-                    gain_db: t.gain, // Note: Let Rust handle if this is linear or dB
+                    fader_linear: t.gain, // Note: Let Rust handle if this is linear or dB
                     pan: t.pan,
                     muted: t.muted,
                     solo: t.solo,
@@ -98,28 +99,43 @@ class AIAgent {
                         duration: Number(c.duration.toFixed(2))
                     })),
                     analysis: profile ? {
-                        integrated_rms_db: Number(profile.integrated_rms_db.toFixed(1)),
-                        max_sample_peak_db: Number(profile.max_sample_peak_db.toFixed(1)),
-                        crest_factor_db: Number(profile.crest_factor_db.toFixed(1)),
-                        spectral_centroid_hz: Math.round(profile.spectral_centroid_hz)
+                        integrated_loudness_db: profile.integrated_loudness_db,
+                        max_sample_peak_db: profile.max_sample_peak_db,
+                        crest_factor_db: profile.crest_factor_db,
+                        loudness_median_db: profile.loudness_p50_db, // P50 is the median
+                        peak_events: profile.peak_events,            // Array of {t, db}
+                        loud_windows: profile.loud_windows,          // Array of {t, db}
+                        quiet_windows: profile.quiet_windows,        // Array of {t, db}
+                        spectral_centroid_hz: profile.spectral_centroid_hz
                     } : "computing..."
                 };
             })
         });
 
-        // 2. STRICT JSON SCHEMA DEFINITION
-        // (Shortened to avoid conflicting with the massive Rust prompt)
+        // 2. STRICT JSON SCHEMA DEFINITION & AUTOMATION RULES
         context += `\n\nCRITICAL INSTRUCTIONS:
         You are an elite Audio DSP Engineer. 
         You MUST respond with a STRICT JSON payload matching the "1.0" API contract.
         Do NOT wrap the JSON in markdown blocks.
         
         RULES:
-        1. 'value' for gain/pan/etc MUST be in standard audio units (dB for gain, -1.0 to 1.0 for pan).
-        2. Never send percentages.
-        3. Only use allowed actions: play, pause, record, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor.`;
+        1. 'depth_db' MUST be in standard audio decibels (dB). 0.0 dB is unity gain.
+        2. Never send percentages or linear gain.
+        3. Allowed actions: play, pause, record, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor, clear_volume_automation, duck_volume.
+
+        AUTOMATION & VOCAL RIDING GUIDELINES:
+        If asked to fix clipping, duck peaks, or balance levels:
+        - Analyze the track's 'analysis' object (peak_events). Note that time is 't' and decibels are 'db'.
+        - ALWAYS issue a "clear_volume_automation" command first for the target track.
+        - You MUST use the "duck_volume" command for every peak. Do not use any other automation command.
+        - For 'duck_volume', provide the exact peak time ('time') and the negative dB value to reduce the peak ('depth_db').
+        - The DSP engine will automatically calculate the attack and release curves for you!
+        - Example: {"action": "duck_volume", "track_id": 0, "time": 38.47, "depth_db": -2.9}`;
+
+        
 
         try {
+            console.log("📊 1. AI Context (Look at the peaks & windows here):", context);
             // 3. Let Backend AI Logic Handle LLM execution
             const rawResponse = await invoke<string>('ask_ai', { 
                 userInput, 
@@ -128,8 +144,9 @@ class AIAgent {
             });
 
             // 4. Parse the raw JSON
-            const data: AIBatchRequest = JSON.parse(rawResponse);
-            console.log("🧠 AI Intent:", data);
+            // Strip markdown blocks if the LLM hallucinated them
+            const cleanResponse = rawResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+            const data: AIBatchRequest = JSON.parse(cleanResponse);
 
             // 5. DELEGATE ENTIRE BATCH TO RUST (Atomic Transaction)
             if (data.version === "1.0" && data.commands && data.commands.length > 0) {
