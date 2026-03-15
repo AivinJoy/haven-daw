@@ -669,7 +669,7 @@ impl AudioRuntime {
             }
         }
         // Fallback default
-        ReverbParams { is_active: true, room_size: 0.8, damping: 0.5, mix: 0.3, width: 1.0, pre_delay_ms: 10.0, low_cut_hz: 100.0, high_cut_hz: 8000.0 }
+        ReverbParams { is_active: false, room_size: 0.8, damping: 0.5, mix: 0.3, width: 1.0, pre_delay_ms: 10.0, low_cut_hz: 100.0, high_cut_hz: 8000.0 } // <--- CHANGED is_active to false
     }
 
     // FIX: Corrected Reset Methods (No Delta, Just Reset)
@@ -1054,6 +1054,19 @@ impl AudioRuntime {
                             makeup_gain_db: makeup_gain_db.clamp(0.0, 24.0),
                         };
                         self.update_compressor(idx, params);
+                    }
+                },
+                AiAction::UpdateReverb { track_id, room_size, damping, pre_delay_ms, mix, width, low_cut_hz, high_cut_hz, is_active } => {
+                    if let Some(idx) = resolve(track_id) {
+                        // Route each provided option to the lock-free generic effect setter
+                        if let Some(v) = is_active { self.set_effect_param(idx, "reverb".into(), "active".into(), if v { 1.0 } else { 0.0 }); }
+                        if let Some(v) = room_size { self.set_effect_param(idx, "reverb".into(), "room_size".into(), v.clamp(0.0, 1.0)); }
+                        if let Some(v) = damping { self.set_effect_param(idx, "reverb".into(), "damping".into(), v.clamp(0.0, 1.0)); }
+                        if let Some(v) = pre_delay_ms { self.set_effect_param(idx, "reverb".into(), "pre_delay".into(), v.clamp(0.0, 500.0)); }
+                        if let Some(v) = mix { self.set_effect_param(idx, "reverb".into(), "mix".into(), v.clamp(0.0, 1.0)); }
+                        if let Some(v) = width { self.set_effect_param(idx, "reverb".into(), "width".into(), v.clamp(0.0, 1.0)); }
+                        if let Some(v) = low_cut_hz { self.set_effect_param(idx, "reverb".into(), "low_cut".into(), v.clamp(20.0, 1000.0)); }
+                        if let Some(v) = high_cut_hz { self.set_effect_param(idx, "reverb".into(), "high_cut".into(), v.clamp(1000.0, 20000.0)); }
                     }
                 },
                 AiAction::ClearVolumeAutomation { track_id } => {

@@ -169,7 +169,7 @@ impl ReverbNode {
         let max_pre_delay_samples = (MAX_PRE_DELAY_MS * sample_rate / 1000.0) as usize;
 
         Self {
-            is_active: AtomicBool::new(true),
+            is_active: AtomicBool::new(false),
             room_size: f32_to_atomic(0.8),
             damping: f32_to_atomic(0.5),
             mix: f32_to_atomic(0.3),

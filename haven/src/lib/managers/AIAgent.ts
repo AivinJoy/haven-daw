@@ -30,6 +30,23 @@ export interface AICommand {
     attack_ms?: number;
     release_ms?: number;
     makeup_gain_db?: number;
+    // Reverb params (NEW)
+    is_active?: boolean;
+    room_size?: number;
+    damping?: number;
+    pre_delay_ms?: number;
+    mix?: number;
+    width?: number;
+    low_cut_hz?: number;
+    high_cut_hz?: number;
+
+    // Vocal Riding / Automation params (NEW)
+    target_lufs?: number;
+    noise_floor_db?: number;
+    max_boost_db?: number;
+    max_cut_db?: number;
+    smoothness?: number;
+    analysis_window_ms?: number;
 }
 
 export interface AIBatchRequest {

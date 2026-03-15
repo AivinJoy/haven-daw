@@ -94,6 +94,17 @@ pub enum AiAction {
         release_ms: f32,
         makeup_gain_db: f32,
     },
+    UpdateReverb { // <--- ADD THIS BLOCK
+        track_id: usize,
+        room_size: Option<f32>,
+        damping: Option<f32>,
+        pre_delay_ms: Option<f32>,
+        mix: Option<f32>,
+        width: Option<f32>,
+        low_cut_hz: Option<f32>,
+        high_cut_hz: Option<f32>,
+        is_active: Option<bool>,
+    },
     ClearVolumeAutomation {
         track_id: usize,
     },

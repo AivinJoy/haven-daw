@@ -1102,7 +1102,7 @@ async fn ask_ai(
         CRITICAL RULES:\n\
         1. YOU MUST OUTPUT A VALID JSON OBJECT WITH 'version': '1.0' and a 'commands' array. NO PLAIN TEXT.\n\
         2. FLATTEN PARAMETERS. Put 'track_id', 'value', 'time', 'new_time', 'bpm', 'clip_number' DIRECTLY inside the command object.\n\
-        3. ACTION NAMES MUST MATCH EXACTLY: play, pause, record, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor,separate_stems, none.\n\
+        3. ACTION NAMES MUST MATCH EXACTLY: play, pause, record, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor, update_reverb, separate_stems, ride_vocal_level, duck_volume, none.\n\
         4. DSP MATH: \n\
            - Gain is 0.0 (silent) to 2.0 (+6dB). Default/Unity volume is 1.0.\n\
            - Pan is -1.0 (Left) to 1.0 (Right). Default pan is 0.0.\n\
@@ -1115,25 +1115,26 @@ async fn ask_ai(
         6. RELATIVE AWARENESS: \n\
            - If the user says 'here' or 'current position', use the 'playhead_position_seconds' from the context.\n\
            - If the user references a color (e.g., 'the red track'), find the track with that color in the context.\n\
-        7. DO NOT INVENT FIELDS. \n\
-           - For 'merge_clips': ONLY use 'track_id' and 'clip_number' (the left-most clip).\n\
-           - For 'move_clip': Requires 'track_id', 'clip_number', and 'new_time' (in seconds).\n\
-           - For 'reset volume': ONLY output 'set_gain' with 'value': 1.0. Do NOT output mute or solo commands.\n\
-           - For 'reset track': Output 'set_gain' to 1.0, 'set_pan' to 0.0, 'unmute', and 'unsolo'.\n\
+        7. EXACT PARAMETER NAMES (CRITICAL): \n\
+           - For 'update_compressor': You MUST use 'makeup_gain_db'. NEVER use 'makeup_db'. Allowed: 'threshold_db', 'ratio', 'attack_ms', 'release_ms', 'makeup_gain_db'.\n\
+           - For 'update_reverb': Allowed parameters: 'room_size' (0.0 to 1.0), 'damping' (0.0 to 1.0), 'mix' (0.0 dry to 1.0 wet), 'width' (0.0 mono to 1.0 stereo), 'pre_delay_ms' (0 to 500), 'low_cut_hz' (20 to 1000), 'high_cut_hz' (1000 to 20000), 'is_active' (boolean).\n\
         8. OMIT UNUSED KEYS. If a command doesn't need a parameter, do not include it. Do NOT output null values.\n\
         9. TRACK IDENTIFICATION: You MUST accurately map the user's requested instrument or track name to the correct 'id' provided in the context tracks array. Do NOT default to \"track_id\": 0 unless the user explicitly asks to modify the 'master', 'original', or 'default' track. If you cannot find a matching track for their request, output the 'none' action with an error message.\n\
+        10. STUDIO MIXING & MASTERING PROTOCOL:\n\
+           - If the user asks for 'studio quality', 'mastering', or a 'professional mix', you must act as a mastering engineer.\n\
+           - Analyze the track context. Apply effects in this EXACT chain order via multiple command objects in the array:\n\
+             1st: 'update_eq' (Cut muddy lows below 100Hz or harsh highs if needed)\n\
+             2nd: 'update_compressor' (Control dynamics, gentle ratio 2:1 for mastering, 4:1 for vocals. MUST use 'makeup_gain_db')\n\
+             3rd: 'update_reverb' (Add subtle space, set is_active: true, keep mix low e.g., 0.15 for mastering)\n\
+             4th: 'ride_vocal_level' or 'set_gain' (Final volume adjustments)\n\
+           - ONLY apply plugins that make sense for the audio source. If a track does not need reverb, leave is_active: false.\n\
         \n\
         SCHEMA EXAMPLES:\n\
-        User: \"reset the volume of track 0\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"set_gain\", \"track_id\": 0, \"value\": 1.0}}], \"message\": \"Track 0 volume reset to default (1.0).\", \"confidence\": 1.0}}\n\
-        \n\
-        User: \"move the blue track's first clip to bar 5\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"move_clip\", \"track_id\": 1, \"clip_number\": 1, \"new_time\": 8.0}}], \"message\": \"Moved clip 1 on the blue track to Bar 5.\", \"confidence\": 0.95}}\n\
+        User: \"Master my track to studio quality\"\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"update_eq\", \"track_id\": 1, \"band_index\": 0, \"filter_type\": \"HighPass\", \"freq\": 120.0, \"q\": 0.7, \"gain\": 0.0}}, {{\"action\": \"update_compressor\", \"track_id\": 1, \"threshold_db\": -18.0, \"ratio\": 4.0, \"attack_ms\": 10.0, \"release_ms\": 100.0, \"makeup_gain_db\": 2.0}}, {{\"action\": \"update_reverb\", \"track_id\": 1, \"is_active\": true, \"room_size\": 0.6, \"mix\": 0.15}}, {{\"action\": \"ride_vocal_level\", \"track_id\": 1, \"target_lufs\": -16.0, \"noise_floor_db\": -40.0}}], \"message\": \"Applied studio master chain: EQ, Compression, Reverb, and Volume Riding.\", \"confidence\": 0.98}}\n\
         \n\
         User: \"undo that\"\n\
         Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"undo\"}}], \"message\": \"Undoing last action.\", \"confidence\": 1.0}}\n\
-        User: \"isolate the vocals on track 1\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"separate_stems\", \"track_id\": 1}}], \"message\": \"Extracting stems from track 1...\", \"confidence\": 0.99}}\n\
         ",
         track_context, user_input
     );
