@@ -22,16 +22,28 @@ pub async fn execute_ai_transaction(
 
     // 2. The Automation Firewall (Safety Guard)
     let mut automation_counts: HashMap<usize, usize> = HashMap::new();
+    let mut rider_counts: HashMap<usize, usize> = HashMap::new(); // <--- NEW: Track rider calls
     
     for cmd in &commands {
-        if let AiAction::AddVolumeAutomation { track_id, .. } = cmd {
-            let count = automation_counts.entry(*track_id).or_insert(0);
-            *count += 1;
-            if *count > MAX_AUTOMATION_NODES { return Err("Security Block".into()); }
-        } else if let AiAction::DuckVolume { track_id, .. } = cmd {
-            let count = automation_counts.entry(*track_id).or_insert(0);
-            *count += 3; // Ducking creates an anchor, a duck, and a release node
-            if *count > MAX_AUTOMATION_NODES { return Err("Security Block".into()); }
+        match cmd {
+            AiAction::AddVolumeAutomation { track_id, .. } => {
+                let count = automation_counts.entry(*track_id).or_insert(0);
+                *count += 1;
+                if *count > MAX_AUTOMATION_NODES { return Err("Security Block: Too many nodes".into()); }
+            }
+            AiAction::DuckVolume { track_id, .. } => {
+                let count = automation_counts.entry(*track_id).or_insert(0);
+                *count += 3;
+                if *count > MAX_AUTOMATION_NODES { return Err("Security Block: Too many nodes".into()); }
+            }
+            AiAction::RideVocalLevel { track_id, .. } => { // <--- NEW: Rider Firewall Limit
+                let count = rider_counts.entry(*track_id).or_insert(0);
+                *count += 1;
+                // SECURITY: Strictly allow only ONE rider process per track per transaction 
+                // to prevent blocking the audio thread with heavy offline analysis.
+                if *count > 1 { return Err("Security Block: Only one Vocal Rider per track allowed per transaction.".into()); }
+            }
+            _ => {} // Ignore other commands for firewall purposes
         }
     }
 

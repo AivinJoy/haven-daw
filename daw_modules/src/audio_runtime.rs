@@ -1057,6 +1057,75 @@ impl AudioRuntime {
                     let _ = self.add_volume_automation_node(t_id, sample_duck, depth_db);
                     let _ = self.add_volume_automation_node(t_id, sample_end, 0.0);
                 },
+
+                AiAction::RideVocalLevel { track_id, target_lufs, max_boost_db, max_cut_db, smoothness, analysis_window_ms, noise_floor_db } => {
+                    let boost = max_boost_db.unwrap_or(6.0);
+                    let cut = max_cut_db.unwrap_or(-4.0);
+                    let smooth = smoothness.unwrap_or(0.7);
+                    let window = analysis_window_ms.unwrap_or(200);
+                    let gate_threshold = noise_floor_db.unwrap_or(-40.0);
+
+                    let engine_sample_rate = self.sample_rate();
+
+                    if let Ok(mut engine) = self.engine.lock() {
+                        // FIX 1: Match t.id.0 against track_id as u32
+                        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id.0 == track_id as u32) {
+                            let mut all_rider_nodes = Vec::new();
+
+                            // FIX 2: Do NOT clone the heavy Clip struct. Extract only the metadata we need.
+                            let clips_meta: Vec<(String, f64)> = track.clips.iter().map(|c| {
+                                (c.path.clone(), c.start_time.as_secs_f64())
+                            }).collect();
+
+                            for (path, start_time_sec) in clips_meta {
+                                // FIX 3 & 4: Use your existing adapter to decode offline audio safely
+                                if let Ok((audio_data, source_sr, source_ch)) = crate::bpm::adapter::decode_to_vec(&path) {
+
+                                    let mut clip_nodes = crate::engine::automation::generate_rider_automation(
+                                        &audio_data, 
+                                        source_ch, 
+                                        source_sr, // Process at native sample rate for accurate RMS
+                                        start_time_sec,
+                                        target_lufs, 
+                                        boost,
+                                        cut,
+                                        smooth,
+                                        window,
+                                        gate_threshold
+                                    );
+
+                                    // Because the clip might be 44.1kHz but the engine is 48kHz,
+                                    // we align the generated node timestamps to the engine's actual sample rate.
+                                    let sample_rate_ratio = engine_sample_rate as f64 / source_sr as f64;
+                                    for node in clip_nodes.iter_mut() {
+                                        node.time = (node.time as f64 * sample_rate_ratio).round() as u64;
+                                    }
+
+                                    all_rider_nodes.append(&mut clip_nodes);
+                                }
+                            }
+
+                            // ==========================================
+                            // 📍 INSERT DEBUG BLOCK HERE 📍
+                            // ==========================================
+                            println!("--- VOCAL RIDER DEBUG ---");
+                            println!("Engine Sample Rate: {}", engine_sample_rate);
+                            for (i, node) in all_rider_nodes.iter().enumerate().take(10) {
+                                let time_in_seconds = node.time as f64 / engine_sample_rate as f64;
+                                println!("Node {}: Time: {:.3}s | Gain: {:.2} dB", i, time_in_seconds, node.value);
+                            }
+                            println!("-------------------------");
+                            // ==========================================
+
+                            // FIX 5: Use the safe, public AutomationCurve API. 
+                            // insert_node handles binary-search sorting automatically!
+                            track.volume_automation.clear();
+                            for node in all_rider_nodes {
+                                track.volume_automation.insert_node(node.time, node.value);
+                            }
+                        }
+                    }
+                },
                 AiAction::SeparateStems { .. } => {
                     // Handled async by UI
                 },

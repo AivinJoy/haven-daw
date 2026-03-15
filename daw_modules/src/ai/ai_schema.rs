@@ -107,6 +107,15 @@ pub enum AiAction {
         time: f64,
         depth_db: f32,
     },
+    RideVocalLevel {               // <--- NEW ACTION ADDED
+        track_id: usize,
+        target_lufs: f32,
+        max_boost_db: Option<f32>, 
+        max_cut_db: Option<f32>,   
+        smoothness: Option<f32>,   
+        analysis_window_ms: Option<u32>, // Brilliant addition
+        noise_floor_db: Option<f32>,
+    },
     Undo,
     Redo,
 }

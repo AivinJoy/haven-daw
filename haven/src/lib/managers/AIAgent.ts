@@ -119,20 +119,30 @@ class AIAgent {
         Do NOT wrap the JSON in markdown blocks.
         
         RULES:
-        1. 'depth_db' MUST be in standard audio decibels (dB). 0.0 dB is unity gain.
+        1. 'depth_db' and 'target_lufs' MUST be in standard audio decibels (dB) or LUFS. 0.0 dB is unity gain.
         2. Never send percentages or linear gain.
-        3. Allowed actions: play, pause, record, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor, clear_volume_automation, duck_volume.
+        3. Allowed actions: play, pause, record, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor, clear_volume_automation, duck_volume, ride_vocal_level.
 
         AUTOMATION & VOCAL RIDING GUIDELINES:
-        If asked to fix clipping, duck peaks, or balance levels:
-        - Analyze the track's 'analysis' object (peak_events). Note that time is 't' and decibels are 'db'.
-        - ALWAYS issue a "clear_volume_automation" command first for the target track.
-        - You MUST use the "duck_volume" command for every peak. Do not use any other automation command.
-        - For 'duck_volume', provide the exact peak time ('time') and the negative dB value to reduce the peak ('depth_db').
-        - The DSP engine will automatically calculate the attack and release curves for you!
-        - Example: {"action": "duck_volume", "track_id": 0, "time": 38.47, "depth_db": -2.9}`;
+        You have two different tools for volume control. Choose the correct one based on the user's request:
 
-        
+        TOOL A: Peak Protection (duck_volume)
+        - Use this ONLY if the user explicitly asks to "fix clipping", "duck sudden peaks", or "remove plosives".
+        - Analyze the track's 'analysis' object (peak_events). 
+        - You MUST use the "duck_volume" command for individual peaks. 
+        - Provide the exact peak time ('time') and the negative dB value to reduce the peak ('depth_db').
+        - Example: {"action": "duck_volume", "track_id": 0, "time": 38.47, "depth_db": -2.9}
+
+        TOOL B: Vocal Riding & Balancing (ride_vocal_level)
+        - Use this if the user asks to "level the vocals", "balance the track", "make the vocal consistent", or "ride the volume".
+        - This triggers an advanced offline DSP algorithm that handles everything automatically. Do NOT generate individual nodes.
+        - You MUST provide the 'target_lufs' (default to -16.0 if not specified).
+        - DYNAMIC NOISE GATE (Crucial): To prevent boosting background noise, you MUST analyze the 'quiet_windows' array in the track's 'analysis' object.
+        - Find the average 'db' value of these quiet windows (this represents the room noise floor).
+        - Set the 'noise_floor_db' parameter to be 3 to 5 dB HIGHER (closer to 0) than that noise floor average. 
+        - Example: If 'quiet_windows' average around -29.0 dB, you must include "noise_floor_db": -25.0.
+        - Example payload: {"action": "ride_vocal_level", "track_id": 0, "target_lufs": -16.0, "noise_floor_db": -25.0}
+        - Optional parameters you can include: 'max_boost_db', 'max_cut_db', 'smoothness', 'analysis_window_ms'.`;
 
         try {
             console.log("📊 1. AI Context (Look at the peaks & windows here):", context);
