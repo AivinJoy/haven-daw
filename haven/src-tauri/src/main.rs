@@ -7,6 +7,7 @@
 mod stem_separation;
 mod ai_transaction;
 mod automation;
+pub mod effects;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -1432,6 +1433,8 @@ fn main() {
             get_eq_state,
             update_compressor,
             get_compressor_state,
+            effects::set_effect_param, 
+            effects::get_reverb_state,
             reload_audio_device,
             get_output_devices,
             get_input_devices,

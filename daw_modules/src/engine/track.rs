@@ -19,6 +19,7 @@ use crate::decoder::{spawn_decoder_with_ctrl, DecoderCmd};
 use crate::bpm::adapter;
 use crate::effects::equalizer::TrackEq;
 use crate::effects::compressor::CompressorNode;
+use crate::effects::reverb::ReverbNode;
 use crate::engine::metering::{MeterState, TrackMeters}; 
 use crate::analyzer::AnalysisProfile;
 use crate::engine::automation::AutomationCurve; 
@@ -321,6 +322,7 @@ pub struct Track {
     pub clips: Vec<Clip>,
     pub track_eq: TrackEq,
     pub track_compressor: CompressorNode,
+    pub track_reverb: ReverbNode,
     pub meters: std::sync::Arc<TrackMeters>, // <--- Shared with UI
     meter_state: MeterState,                 // <--- Owned by Audio Thread
     pub analysis: Arc<std::sync::Mutex<Option<AnalysisProfile>>>,
@@ -381,6 +383,7 @@ impl Track {
             clips: Vec::new(),
             track_eq: TrackEq::new(sample_rate, channels),
             track_compressor: CompressorNode::new(sample_rate as f32),
+            track_reverb: ReverbNode::new(sample_rate as f32),
             meters: TrackMeters::new(),                      
             meter_state: MeterState::new(sample_rate as f32),
             analysis: Arc::new(std::sync::Mutex::new(None)),
@@ -698,8 +701,22 @@ impl Track {
         // We do this BEFORE gain/pan so the EQ is "Pre-Fader" (standard mixing practice)
         if active_clips > 0 {
            self.track_eq.process_buffer(dst, channels);
-
            self.track_compressor.process(dst);
+
+           // --- ADDED: Process Reverb (Stereo awareness) ---
+           if channels >= 2 {
+               for i in (0..dst.len()).step_by(channels) {
+                   let (l, r) = self.track_reverb.process(dst[i], dst[i+1]);
+                   dst[i] = l;
+                   dst[i+1] = r;
+               }
+           } else if channels == 1 {
+               for i in 0..dst.len() {
+                   // Fallback for mono tracks
+                   let (l, _) = self.track_reverb.process(dst[i], dst[i]); 
+                   dst[i] = l;
+               }
+           }
         }
 
         // Apply Gain/Pan only if we actually mixed something

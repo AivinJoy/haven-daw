@@ -13,6 +13,7 @@
     delete: number;
     openEq: number;
     openCompressor: number;
+    openReverb: number;
   }>();
 
   // Receive tracks prop (bindable if you want the list itself to change, but usually internal props bind)
@@ -144,6 +145,13 @@
                 label: "Open Compressor", // <--- ADD THIS BLOCK
                 action: () => {
                     dispatch('openCompressor', activeTrackId);
+                    showMenu = false;
+                }
+            },
+            { 
+                label: "Open Reverb", // <--- ADD THIS BLOCK
+                action: () => {
+                    dispatch('openReverb', activeTrackId);
                     showMenu = false;
                 }
             },

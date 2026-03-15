@@ -15,6 +15,7 @@ use crate::engine::time::GridLine;
 use crate::ai::ai_schema::{AiAction, EqFilterType as SchemaEqFilterType};
 use crate::effects::equalizer::EqParams; // <--- Import this
 use crate::effects::compressor::CompressorParams;
+use crate::effects::reverb::ReverbParams;
 use crate::analyzer::AnalysisProfile;
 
 
@@ -35,6 +36,7 @@ pub enum EngineCommand {
     SetTrackPan(usize, f32),
     UpdateCompressor(usize, CompressorParams),
     UpdateEq(usize, usize, EqParams), // <--- NEW: Lock-Free EQ
+    SetEffectParam(usize, String, String, f32),
     SetMonitor(crate::recorder::monitor::Monitor), // <--- NEW
     ClearMonitor, // <--- NEW
 }
@@ -90,6 +92,7 @@ pub struct FrontendTrackInfo {
     pub clips: Vec<FrontendClipInfo>,
     pub compressor: Option<CompressorParams>,
     pub eq: Option<Vec<EqParams>>,
+    pub reverb: Option<ReverbParams>,
     pub volume_automation: Vec<crate::engine::automation::AutomationNode<f32>>,
 }
 
@@ -218,6 +221,15 @@ impl AudioRuntime {
                             EngineCommand::UpdateCompressor(idx, params) => {
                                 if let Some(t) = eng.tracks_mut().get_mut(idx) {
                                     t.track_compressor.set_params(params);
+                                }
+                            }
+                            EngineCommand::SetEffectParam(idx, effect, param, value) => {
+                                if let Some(t) = eng.tracks_mut().get_mut(idx) {
+                                    match effect.as_str() {
+                                        "reverb" => t.track_reverb.set_param(&param, value),
+                                        // "compressor" => t.track_compressor.set_param(&param, value), // Future proofing
+                                        _ => {}
+                                    }
                                 }
                             }
                             EngineCommand::ToggleSolo(idx) => {
@@ -646,6 +658,20 @@ impl AudioRuntime {
         }
     }
 
+    pub fn set_effect_param(&self, track_index: usize, effect: String, param: String, value: f32) {
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetEffectParam(track_index, effect, param, value));
+    }
+
+    pub fn get_reverb_state(&self, track_index: usize) -> ReverbParams {
+        if let Ok(eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks().get(track_index) {
+                return track.track_reverb.get_params();
+            }
+        }
+        // Fallback default
+        ReverbParams { is_active: true, room_size: 0.8, damping: 0.5, mix: 0.3, width: 1.0, pre_delay_ms: 10.0, low_cut_hz: 100.0, high_cut_hz: 8000.0 }
+    }
+
     // FIX: Corrected Reset Methods (No Delta, Just Reset)
     pub fn reset_track_gain(&self, track_index: usize) {
         self.set_track_gain(track_index, 1.0);
@@ -758,6 +784,7 @@ impl AudioRuntime {
                     clips, // <--- Add the clips here
                     compressor: Some(t.track_compressor.get_params()),
                     eq: Some(t.track_eq.get_state()),
+                    reverb: Some(t.track_reverb.get_params()),
                     // Convert stored dB values into Linear values (0.0 to ~2.0) for Svelte UI rendering
                     volume_automation: t.volume_automation.nodes().iter().map(|n| crate::engine::automation::AutomationNode {
                         time: n.time,
