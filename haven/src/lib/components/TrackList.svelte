@@ -99,10 +99,10 @@
                     name={track.name}
                     color={track.color}
               
-                    bind:gain={tracks[i].gain}
-                    bind:pan={tracks[i].pan}
-                    bind:muted={tracks[i].muted}
-                    bind:solo={tracks[i].solo}
+                    bind:gain={track.gain}
+                    bind:pan={track.pan}
+                    bind:muted={track.muted}
+                    bind:solo={track.solo}
                     isRecording={track.isRecording}
                     source={track.source}
               

@@ -1,3 +1,7 @@
+<script module>
+    let activeLaneId: number | null = null;
+</script>
+
 <script lang="ts">
     import { invoke } from '@tauri-apps/api/core'; 
     import { onMount } from 'svelte';
@@ -20,6 +24,11 @@
 
     let draggingIndex = $state<number | null>(null);
     let originalDragTime = $state<number | null>(null);
+    let hoveredIndex = $state<number | null>(null);
+    let activeIndex = $derived(draggingIndex !== null ? draggingIndex : hoveredIndex);
+
+    let historyPast = $state<AutomationNode[][]>([]);
+    let historyFuture = $state<AutomationNode[][]>([]);
 
     const MAX_GAIN = 2.0;
 
@@ -40,6 +49,85 @@
     function yToGain(y: number): number {
         const clampedY = Math.max(0, Math.min(height, y));
         return MAX_GAIN - ((clampedY / height) * MAX_GAIN);
+    }
+
+    function gainToDbString(gain: number): string {
+        if (gain <= 0.0001) return "-∞ dB"; // Handle complete silence
+        const db = 20 * Math.log10(gain);
+        const sign = db > 0 ? "+" : "";
+        return `${sign}${db.toFixed(1)} dB`;
+    }
+
+    // --- UNDO/REDO LOGIC ---
+    function saveState() {
+        historyPast = [...historyPast, JSON.parse(JSON.stringify(nodes))];
+        if (historyPast.length > 50) historyPast.shift(); // Keep last 50 actions
+        historyFuture = [];
+    }
+
+    async function syncNodesToBackend(targetNodes: AutomationNode[]) {
+        try {
+            const currentBackendNodes: AutomationNode[] = await invoke('get_volume_automation', { trackId });
+            
+            // Allow a tiny margin of error for f32 (Rust) vs f64 (JS) math
+            const EPSILON = 0.001; 
+            
+            const findMatch = (nodesList: AutomationNode[], time: number) => 
+                nodesList.find(n => Math.abs(n.time - time) < EPSILON);
+
+            // 1. Remove nodes from backend that are NOT in target state
+            for (const backendNode of currentBackendNodes) {
+                const targetMatch = findMatch(targetNodes, backendNode.time);
+                if (!targetMatch || Math.abs(targetMatch.value - backendNode.value) > EPSILON) {
+                    await invoke('remove_volume_automation_node', { trackId, time: backendNode.time });
+                }
+            }
+
+            // 2. Add nodes to backend that are NEW or CHANGED
+            for (const targetNode of targetNodes) {
+                const backendMatch = findMatch(currentBackendNodes, targetNode.time);
+                if (!backendMatch || Math.abs(backendMatch.value - targetNode.value) > EPSILON) {
+                    await invoke('add_volume_automation_node', { trackId, time: targetNode.time, value: targetNode.value });
+                }
+            }
+        } catch (err) {
+            console.error("Failed to sync undo/redo state:", err);
+        } finally {
+            loadNodes(); 
+        }
+    }
+
+    async function undo() {
+        if (historyPast.length === 0) return;
+        const previous = historyPast.pop()!;
+        historyFuture = [...historyFuture, JSON.parse(JSON.stringify(nodes))];
+        nodes = previous;
+        await syncNodesToBackend(nodes);
+    }
+
+    async function redo() {
+        if (historyFuture.length === 0) return;
+        const next = historyFuture.pop()!;
+        historyPast = [...historyPast, JSON.parse(JSON.stringify(nodes))];
+        nodes = next;
+        await syncNodesToBackend(nodes);
+    }
+
+    function handleKeyDown(e: KeyboardEvent) {
+        // Now it checks if THIS lane is the currently active one for the DAW
+        if (activeLaneId !== trackId) return;
+        
+        const isMac = navigator.userAgent.includes('Mac');
+        const cmdOrCtrl = isMac ? e.metaKey : e.ctrlKey;
+        
+        if (cmdOrCtrl && e.key.toLowerCase() === 'z') {
+            e.preventDefault();
+            if (e.shiftKey) redo();
+            else undo();
+        } else if (cmdOrCtrl && e.key.toLowerCase() === 'y') {
+            e.preventDefault();
+            redo();
+        }
     }
 
     // --- Dynamic Polyline ---
@@ -73,6 +161,8 @@
     async function handleCanvasClick(e: PointerEvent) {
         // Guard: Don't add a node if they are clicking on an existing one
         if (e.target instanceof SVGCircleElement) return;
+        activeLaneId = trackId;
+        saveState();
 
         const rect = (e.currentTarget as SVGElement).getBoundingClientRect();
         const x = e.clientX - rect.left;
@@ -93,6 +183,8 @@
 
     function startDrag(index: number, e: PointerEvent) {
         e.stopPropagation(); // Prevents the canvas click from firing
+        activeLaneId = trackId;
+        saveState();
         draggingIndex = index;
         originalDragTime = nodes[index].time;
         (e.target as Element).setPointerCapture(e.pointerId);
@@ -138,6 +230,8 @@
     async function handleRightClick(index: number, e: MouseEvent) {
         e.preventDefault();
         e.stopPropagation();
+        activeLaneId = trackId;
+        saveState();
 
         const nodeTime = nodes[index].time;
         
@@ -152,11 +246,38 @@
         }
     }
 
+    async function handleDoubleClick(index: number, e: MouseEvent) {
+        e.preventDefault();
+        e.stopPropagation();
+        activeLaneId = trackId;
+        saveState();
+
+        const node = nodes[index];
+        const resetValue = 1.0; // 1.0 is 0 dB (Unity Gain)
+
+        // Optimistically update UI
+        nodes[index] = { ...node, value: resetValue };
+        nodes = [...nodes];
+
+        try {
+            await invoke('add_volume_automation_node', { 
+                trackId, 
+                time: node.time, 
+                value: resetValue 
+            });
+        } catch (err) {
+            console.error("Failed to reset node:", err);
+            loadNodes();
+        }
+    }
+
     onMount(() => {
         // Always fetch from backend on mount to guarantee perfect precision
         loadNodes();
     });
 </script>
+
+<svelte:window onkeydown={handleKeyDown} />
 
 <svg 
     class="automation-lane" 
@@ -173,15 +294,6 @@
     <polyline 
         points={polylinePoints} 
         fill="none" 
-        stroke="#00FFCC" 
-        stroke-width="5" 
-        opacity="0.3" 
-        style="filter: drop-shadow(0px 0px 4px #00FFCC);"
-    />
-
-    <polyline 
-        points={polylinePoints} 
-        fill="none" 
         stroke="#FFFFFF" 
         stroke-width="1.5" 
         opacity="0.9" 
@@ -193,17 +305,49 @@
             cy={gainToY(node.value)} 
             r={draggingIndex === i ? "6" : "4"} 
             fill="#FFFFFF" 
-            stroke="#00FFCC" 
+            stroke="#FFFFFF" 
             stroke-width="2" 
             class="automation-node"
             onpointerdown={(e) => startDrag(i, e)}
             onpointerup={endDrag}
             oncontextmenu={(e) => handleRightClick(i, e)}
+            ondblclick={(e) => handleDoubleClick(i, e)}
+            onpointerenter={() => hoveredIndex = i}
+            onpointerleave={() => hoveredIndex = null}
             role="button"
             tabindex="0"
             aria-label="Automation Node"
         />
     {/each}
+
+    {#if activeIndex !== null && nodes[activeIndex]}
+        {@const node = nodes[activeIndex]}
+        {@const x = timeToX(node.time)}
+        {@const y = gainToY(node.value)}
+        {@const tooltipY = y < 30 ? y + 25 : y - 25}
+        
+        <g transform="translate({x}, {tooltipY})" style="pointer-events: none;">
+            <rect 
+                x="-32" y="-12" 
+                width="64" height="24" rx="4" 
+                fill="#0a0a0f" 
+                stroke="rgba(255,255,255,0.15)" 
+                stroke-width="1" 
+                style="filter: drop-shadow(0px 4px 10px rgba(0,0,0,0.5));" 
+            />
+            <text 
+                x="0" y="3" 
+                font-family="monospace" 
+                font-size="10" 
+                fill="#00FFCC" 
+                text-anchor="middle" 
+                dominant-baseline="middle" 
+                font-weight="bold"
+            >
+                {gainToDbString(node.value)}
+            </text>
+        </g>
+    {/if}
 </svg>
 
 <style>

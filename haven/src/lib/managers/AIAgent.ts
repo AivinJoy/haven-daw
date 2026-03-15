@@ -153,8 +153,11 @@ class AIAgent {
                             commands: dspCommands 
                         });
                         
-                        // If successful, refresh the UI
-                        window.dispatchEvent(new CustomEvent('refresh-project')); 
+                        // Buffer Delay: Give the Rust Audio threads a moment to sync the master state
+                        // before the Svelte UI fetches the updated track data.
+                        setTimeout(() => {
+                            window.dispatchEvent(new CustomEvent('refresh-project')); 
+                        }, 150);
                     } catch (transactionError) {
                         console.error("🛑 Rust Engine Rejected AI Transaction:", transactionError);
                         return {
