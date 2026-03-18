@@ -1,53 +1,151 @@
-# HAVEN DAW 🎵
+# Haven DAW
 
-A high-performance Digital Audio Workstation built with **Rust**, **Tauri**, and **SvelteKit**. 
-Features a custom high-performance audio engine, non-destructive arrangement, an integrated AI Music Director, and a real-time lock-free mixer.
+Haven is a modern, AI-assisted Digital Audio Workstation built with a focus on performance, simplicity, and intelligent workflow. The goal of this project is to combine the precision of traditional audio engineering with the flexibility of AI, so creators can spend less time tweaking and more time creating.
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue) ![Rust](https://img.shields.io/badge/built_with-Rust-orange) ![Svelte](https://img.shields.io/badge/frontend-Svelte_5-red)
+The application is powered by a Rust-based audio engine for speed and reliability, with a SvelteKit frontend wrapped using Tauri for a lightweight desktop experience.
 
-## 🚀 Key Features
+---
 
-* **Hybrid Audio Engine:** Built in Rust using `cpal` and `symphonia` for low-latency playback. Employs lock-free multi-producer, single-consumer (MPSC) channels for seamless UI-to-engine thread communication.
-* **AI Music Director:** An intelligent, context-aware chatbot capable of executing complex audio commands naturally (e.g., "Merge clip 1 and 2", "Apply a high-pass EQ to track 1", "Mute the drums", or "Separate stems").
-* **Real-Time Device Hot-Swapping:** Dynamically detects OS hardware changes. Plucking headphones out or switching default outputs gracefully re-hooks the audio thread without crashing the application.
-* **Non-Destructive Clip Editing:** Split, merge, delete, trim, and move clips dynamically. The Rust backend maintains true contiguous source durations for instant timeline recovery.
-* **Instantaneous Undo/Redo System:** Built entirely on a Command Manager pattern. Heavy file operations (like restoring deleted audio) execute in under a millisecond via RAM caching.
-* **Integrated Recording Pipeline:** Multi-track audio recording with live waveform generation and hardware monitoring controls.
-* **Real-time Mixer & FX:** Dynamic volume, parametric EQ, and panning nodes. Gain staging includes accurate Peak and RMS metering shared instantly via lock-free atomic buffers.
-* **High-Performance Visuals:** 60fps canvas waveform rendering mapped smoothly across Svelte 5 Reactive Runes (`$state`, `$derived`).
+## Features
 
-## 🛠️ Prerequisites
+### High-Performance Audio Engine
 
-Before running the project, ensure you have the following installed:
+Haven uses a native Rust audio engine designed for low-latency playback, recording, and processing. It is built on top of `cpal` and `symphonia` to ensure stability across platforms.
 
-1.  **Rust & Cargo:** [Install Rust](https://www.rust-lang.org/tools/install)
-    ```bash
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    ```
-2.  **Node.js & Package Manager:** [Install Node.js](https://nodejs.org/) (v16 or higher).
-3.  **Tauri OS Dependencies:**
-    * **Windows:** Install "C++ Build Tools" via Visual Studio Installer and the "WebView2" runtime.
-    * **Mac/Linux:** See [Tauri Prerequisites](https://tauri.app/v1/guides/getting-started/prerequisites/).
+### AI Mixing Assistant
 
-## 📦 Installation
+You can interact with Haven using natural language. Instead of manually setting up effect chains, you can give simple instructions like:
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/AivinJoy/haven-daw.git
-    cd haven
-    ```
+> "Master this track to studio quality"
 
-2.  **Install Dependencies:**
-    ```bash
-    npm install
-    # or
-    pnpm install
-    ```
+The system interprets your request and automatically applies EQ, compression, and reverb based on context.
 
-## ▶️ Running Development Server
+### AI Stem Separation
 
-To start the app in development mode (with hot-reloading):
+Haven allows you to separate vocals, drums, bass, and other elements directly inside the timeline. This is powered by ONNX models running locally, so your audio stays on your system.
+
+### DSP Effects
+
+The DAW includes built-in effects such as:
+
+* Parametric EQ
+* Dynamic range compressor
+* Algorithmic reverb
+
+### Metering
+
+Real-time peak, RMS, and hold metering is available through a dedicated master bus.
+
+### Automation
+
+Volume automation lanes allow precise control over dynamics during playback.
+
+### Project Management
+
+Projects can be saved, loaded, and exported. Waveforms are cached to improve performance and reduce load times.
+
+---
+
+## Tech Stack
+
+**Frontend**
+
+* Svelte 5
+* SvelteKit
+* Tailwind CSS
+* Vite
+
+**Backend / Desktop**
+
+* Tauri
+* Rust
+
+**Audio DSP**
+
+* daw_modules (custom)
+* cpal
+* rustfft
+* biquad
+
+**AI / ML**
+
+* ONNX Runtime (ort)
+* stem-splitter-core
+* reqwest (Groq API integration)
+
+---
+
+## Installation
+
+### Prerequisites
+
+* Node.js (v18 or higher)
+* npm
+* Rust & Cargo (latest stable via [https://rustup.rs/](https://rustup.rs/))
+
+---
+
+### Linux Requirements
+
+For Linux systems, install the required dependencies for Tauri and audio:
 
 ```bash
-# In the root 'haven' directory
+sudo apt update
+sudo apt install libwebkit2gtk-4.0-dev \
+    build-essential \
+    curl \
+    wget \
+    file \
+    libssl-dev \
+    libgtk-3-dev \
+    libayatana-appindicator3-dev \
+    librsvg2-dev \
+    alsa-base \
+    alsa-utils \
+    libasound2-dev
+```
+
+If you are using Ubuntu 24.04 or newer, you may need `libwebkit2gtk-4.1-dev` instead.
+
+---
+
+## Getting Started
+
+### Clone the repository
+
+```bash
+git clone https://github.com/AivinJoy/haven-daw.git
+cd haven-daw/haven
+```
+
+### Install dependencies
+
+```bash
+npm install
+```
+
+### Environment setup
+
+Create a `.env` file inside:
+
+```
+haven/src-tauri/
+```
+
+Add:
+
+```env
+GROQ_API_KEY=your_groq_api_key_here
+```
+
+### Run in development
+
+```bash
 npm run tauri dev
+```
+
+### Build for production
+
+```bash
+npm run tauri build
+```
