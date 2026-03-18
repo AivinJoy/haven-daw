@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { X, Mic, Speaker, Check } from 'lucide-svelte';
+    import { X, Mic, Speaker, Check, Loader2 } from 'lucide-svelte';
     import { ui } from '$lib/stores/ui.svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { onMount } from 'svelte';
@@ -15,6 +15,8 @@
     
     let selectedOutput = $state("Default");
     let selectedInput = $state("Default");
+
+    let isSwitchingOutput = $state(false);
 
     async function fetchDevices() {
         try {
@@ -34,8 +36,11 @@
         }
     }
 
-    onMount(() => {
-        fetchDevices();
+    // Idiomatic Svelte 5 way to run on open
+    $effect(() => {
+        if (ui.isSettingsOpen) {
+            fetchDevices();
+        }
     });
 
     function close() {
@@ -65,13 +70,29 @@
                 <div class="flex items-center gap-2 text-brand-blue">
                     <Speaker size={18} />
                     <label for="output-device" class="text-sm font-semibold uppercase tracking-wider">Output Device</label>
+                    {#if isSwitchingOutput}
+                        <Loader2 size={14} class="animate-spin text-white/50 ml-2" />
+                    {/if}
                 </div>
                 
                 <div class="relative">
                     <select 
                         id="output-device"
                         bind:value={selectedOutput}
-                        class="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-brand-blue appearance-none"
+                        disabled={isSwitchingOutput}
+                        onchange={async (e) => {
+                            const device = (e.target as HTMLSelectElement).value;
+                            isSwitchingOutput = true;
+                            try {
+                                await invoke('set_output_device', { deviceName: device });
+                            } catch (err) {
+                                console.error("Failed to switch audio device:", err);
+                                // Optional: Revert selection on failure
+                            } finally {
+                                isSwitchingOutput = false;
+                            }
+                        }}
+                        class="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-brand-blue appearance-none disabled:opacity-50"
                     >
                         {#each outputDevices as device}
                             <option value={device.name} class="bg-black text-white">

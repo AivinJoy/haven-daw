@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, SyncSender};
 use std::sync::atomic::{Ordering};
 use std::time::Duration;
 
-use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 
 use crate::audio::setup_output_device;
@@ -60,6 +60,7 @@ pub struct AudioRuntime {
     session: Mutex<Session>,
     stream: Option<Stream>, // Changed to Option to allow hot-swapping
     command_tx: Mutex<SyncSender<EngineCommand>>, // Wrapped in Mutex to allow channel recreation
+    pub target_output_device: Option<String>,
     // --- ADDED: A safe map of Track ID -> Lock-Free Atomics ---
     pub meter_registry: Arc<Mutex<std::collections::HashMap<u32, std::sync::Arc<crate::engine::metering::TrackMeters>>>>,
     pub master_meter: Arc<crate::engine::metering::TrackMeters>, // <--- CHANGED TYPE
@@ -132,6 +133,7 @@ impl AudioRuntime {
             session,
             stream: None,
             command_tx: Mutex::new(command_tx), 
+            target_output_device: None,
             meter_registry,
             master_meter,
             recorder,
@@ -142,6 +144,12 @@ impl AudioRuntime {
         }
 
         Ok(runtime)
+    }
+
+    pub fn set_output_device(&mut self, device_name: String) -> anyhow::Result<()> {
+        println!("🔄 Switching Audio Output to: {}", device_name);
+        self.target_output_device = Some(device_name);
+        self.reload_device() // Re-use the reload logic to safely swap the stream
     }
 
     pub fn reload_device(&mut self) -> anyhow::Result<()> {
@@ -159,9 +167,25 @@ impl AudioRuntime {
     }
 
     fn build_and_start_stream(&mut self, command_rx: mpsc::Receiver<EngineCommand>) -> anyhow::Result<()> {
-        let output = setup_output_device()?;
-        let sample_rate = output.output_sample_rate;
-        let device_channels = output.output_channels;
+        // --- NEW DEVICE SELECTION LOGIC ---
+        let (device, config, sample_rate, device_channels) = if let Some(ref name) = self.target_output_device {
+            let host = cpal::default_host();
+            let dev = host.output_devices()?
+                .find(|d| d.name().unwrap_or_default() == *name)
+                .ok_or_else(|| anyhow::anyhow!("Target output device not found"))?;
+            
+            let conf = dev.default_output_config()?;
+            let sr = conf.sample_rate().0;
+            let ch = conf.channels();
+            
+            // Cast `ch` to `usize` to match the fallback branch
+            (dev, conf.into(), sr, ch as usize) 
+        } else {
+            // Fallback to the original default setup if no specific device is targeted
+            let output = setup_output_device()?;
+            (output.device, output.config, output.output_sample_rate, output.output_channels)
+        };
+        // -----------------------------------
 
         if let Ok(mut eng) = self.engine.lock() {
             eng.sample_rate = sample_rate;
@@ -169,8 +193,9 @@ impl AudioRuntime {
 
         println!("🔊 AudioRuntime: Device running at {} Hz with {} channels", sample_rate, device_channels);
 
-        let device = output.device;
-        let config = output.config;
+        // NOTE: `let device = ...` and `let config = ...` were removed from here 
+        // because we extracted them directly in the if/else block above.
+
         let engine_cb = self.engine.clone();
         let gain_cb = self.master_gain.clone();
 

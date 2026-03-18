@@ -208,6 +208,13 @@ fn get_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     Ok(list)
 }
 
+#[tauri::command]
+fn set_output_device(device_name: String, state: State<AppState>) -> Result<(), String> {
+    let mut audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    audio.set_output_device(device_name).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // Helper: Resolve Stable ID -> Mutable Index
 // Returns the current index of the track with the given ID.
 pub fn resolve_track_index(
@@ -1439,6 +1446,7 @@ fn main() {
             reload_audio_device,
             get_output_devices,
             get_input_devices,
+            set_output_device,
             undo,
             redo,
             ask_ai,
