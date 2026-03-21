@@ -4,6 +4,21 @@ use daw_modules::ai::ai_schema::AiAction;
 use crate::AppState;
 use std::collections::HashMap;
 
+
+fn normalize_action(action: &mut AiAction) {
+    match action {
+        // EQ and Compressor don't have is_active in the schema.
+        // audio_runtime.rs automatically forces them to true when parameters are updated!
+        AiAction::UpdateReverb { is_active, .. } => {
+            if is_active.is_none() {
+                *is_active = Some(true);
+            }
+        }
+        // Catch-all for other commands
+        _ => {} 
+    }
+}
+
 // --- SECURITY LIMIT ---
 // Prevents the LLM from hallucinating thousands of nodes and stalling the audio thread.
 const MAX_AUTOMATION_NODES: usize = 200;
@@ -11,14 +26,19 @@ const MAX_AUTOMATION_NODES: usize = 200;
 #[tauri::command]
 pub async fn execute_ai_transaction(
     version: String,
-    commands: Vec<AiAction>,
+    mut commands: Vec<AiAction>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
 
     // 🛠️ DEBUG LOG 4: RUST ENTRY POINT
     println!("🦀 [AI_TRANSACTION] Received {} commands from Frontend. Version: {}", commands.len(), version);
+    // 0. Normalize Commands BEFORE logging and validation
+    for cmd in &mut commands {
+        normalize_action(cmd);
+    }
+    
     for (i, cmd) in commands.iter().enumerate() {
-        println!("   👉 Incoming Command {}: {:?}", i, cmd);
+        println!("   👉 NOrmalized Incoming Command {}: {:?}", i, cmd);
     }
     
     // 1. Version Check

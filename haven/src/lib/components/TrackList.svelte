@@ -41,11 +41,11 @@
   let menuPos = $state({ x: 0, y: 0 });
   let activeTrackId = $state(-1);
 
-  function handleTrackMenu(e: MouseEvent, index: number) {
+  function handleTrackMenu(e: MouseEvent, id: number) {
       e.stopPropagation(); // Prevent track selection
       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
       menuPos = { x: e.clientX, y: e.clientY };
-      activeTrackId = index;
+      activeTrackId = id; // ✅ FIX: Now stores the true unique Track ID!
       showMenu = true;
   }
 
@@ -109,7 +109,7 @@
               
                     monitor={track.monitor}
                     onmonitor={() => dispatch('toggleMonitor', track.id)}
-                    onmenu={(e: any) => handleTrackMenu(e, i)}
+                    onmenu={(e: any) => handleTrackMenu(e, track.id)} />
                 />
             </div>
         {/each}

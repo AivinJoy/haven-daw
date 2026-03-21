@@ -63,6 +63,29 @@ interface RecordingState {
     is_monitoring: boolean;
 }
 
+// --- DAW SAFETY LAYER: Allowed Actions & DSP Priority ---
+const ALLOWED_ACTIONS = new Set([
+    // UI / Transport Commands
+    "play", "pause", "record", "rewind", "seek", "toggle_monitor", "separate_stems",
+    // Track / Clip Management
+    "set_bpm", "set_gain", "set_pan", "toggle_mute", "toggle_solo", "move_clip", 
+    "split_clip", "merge_clips", "delete_clip", "delete_track", "create_track", 
+    // DSP & Automation
+    "update_eq", "update_compressor", "update_reverb", 
+    "clear_volume_automation", "duck_volume", "ride_vocal_level"
+]);
+
+const DSP_PRIORITY: Record<string, number> = {
+    "set_gain": 1,
+    "update_eq": 2,
+    "update_compressor": 3,
+    "update_reverb": 4,
+    "clear_volume_automation": 5,
+    "duck_volume": 6,
+    "ride_vocal_level": 7
+};
+// ---------------------------------------------------------
+
 class AIAgent {
     // 1. UPDATED SIGNATURE: Accept globalState
     async sendMessage(
@@ -240,9 +263,12 @@ class AIAgent {
         Do NOT wrap the JSON in markdown blocks.
         
         RULES:
-        1. 'depth_db' and 'target_lufs' MUST be in standard audio decibels (dB) or LUFS. 0.0 dB is unity gain.
-        2. Never send percentages or linear gain.
-        3. Allowed actions: play, pause, record, rewind, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor, clear_volume_automation, duck_volume, ride_vocal_level.
+        1. 'depth_db' and 'target_lufs' MUST be in standard audio decibels (dB) or LUFS. 
+        2. GAIN EXCEPTION: The 'set_gain' and 'set_pan' commands strictly use LINEAR values. For 'set_gain', 0.0 is silence, 1.0 is unity gain, and 2.0 is +6dB. If you want to drop the gain for headroom, send a linear value like 0.5. DO NOT SEND DECIBELS FOR SET_GAIN.
+        3. Allowed actions: play, pause, record, rewind, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor, update_reverb, clear_volume_automation, duck_volume, ride_vocal_level.
+        4. GAIN STAGING IS MANDATORY: Before applying any heavy compression or EQ boosts, ALWAYS prepend a "set_gain" command with a linear value of 0.5 to provide headroom.
+        5. VOCAL CHAINS: If asked to process a vocal, you MUST include 'update_reverb' in your chain to provide spatial depth, unless explicitly told to keep it dry.
+
 
         AUTOMATION & VOCAL RIDING GUIDELINES:
         You have two different tools for volume control. Choose the correct one based on the user's request:
@@ -279,8 +305,42 @@ class AIAgent {
             const cleanResponse = rawResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
             console.log("🟢 RAW AI RESPONSE STRING:", cleanResponse);
             const data: AIBatchRequest = JSON.parse(cleanResponse);
-            console.table(data.commands);
 
+            // --- NEW SAFETY & SORTING INTERCEPTOR ---
+            if (data.commands && Array.isArray(data.commands)) {
+                let safeCommands = data.commands
+                    .filter((cmd) => {
+                        if (!ALLOWED_ACTIONS.has(cmd.action)) {
+                            console.warn(`🛑 Blocked illegal/hallucinated AI command: ${cmd.action}`);
+                            return false;
+                        }
+                        return true;
+                    })
+                    .sort((a, b) => {
+                        const priorityA = DSP_PRIORITY[a.action] || 99;
+                        const priorityB = DSP_PRIORITY[b.action] || 99;
+                        return priorityA - priorityB;
+                    });
+
+                // --- PHASE 4: COMMAND EXPANSION & GAIN STAGING ---
+                let expandedCommands: any[] = [];
+                for (let cmd of safeCommands) {
+                    // 1. Auto-Clear old automation before riding new automation
+                    if (cmd.action === 'ride_vocal_level') {
+                        expandedCommands.push({ 
+                            action: 'clear_volume_automation', 
+                            track_id: cmd.track_id 
+                        });
+                    }
+                    expandedCommands.push(cmd);
+                }
+                
+                data.commands = expandedCommands;
+            }
+            // ----------------------------------------
+            // ----------------------------------------
+
+            console.table(data.commands);
             // 5. DELEGATE ENTIRE BATCH TO RUST (Atomic Transaction)
             if (data.version === "1.0" && data.commands && data.commands.length > 0) {
                 

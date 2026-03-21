@@ -65,6 +65,7 @@ pub struct AudioRuntime {
     pub meter_registry: Arc<Mutex<std::collections::HashMap<u32, std::sync::Arc<crate::engine::metering::TrackMeters>>>>,
     pub master_meter: Arc<crate::engine::metering::TrackMeters>, // <--- CHANGED TYPE
     pub recorder: Arc<Mutex<Option<crate::recorder::Recorder>>>, // <--- NEW
+    pub decode_cache: Arc<Mutex<std::collections::HashMap<String, (Arc<Vec<f32>>, u32, usize)>>>,
 }
 
 pub struct TrackSnapshot {
@@ -126,6 +127,7 @@ impl AudioRuntime {
         let recorder = Arc::new(Mutex::new(None::<crate::recorder::Recorder>));
         let master_meter = engine.lock().unwrap().master_meter.clone(); 
         let meter_registry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let decode_cache = Arc::new(Mutex::new(std::collections::HashMap::new())); // <--- INIT CACHE
 
         let mut runtime = Self {
             engine,
@@ -137,6 +139,7 @@ impl AudioRuntime {
             meter_registry,
             master_meter,
             recorder,
+            decode_cache,
         };
 
         if let Err(e) = runtime.build_and_start_stream(command_rx) {
@@ -1158,17 +1161,52 @@ impl AudioRuntime {
                         if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id.0 == track_id as u32) {
                             let mut all_rider_nodes = Vec::new();
 
-                            // FIX 2: Do NOT clone the heavy Clip struct. Extract only the metadata we need.
-                            let clips_meta: Vec<(String, f64)> = track.clips.iter().map(|c| {
-                                (c.path.clone(), c.start_time.as_secs_f64())
+                            // FIX 2: Extract ALL temporal metadata (start_time, offset, duration)
+                            let clips_meta: Vec<(String, f64, f64, f64)> = track.clips.iter().map(|c| {
+                                (
+                                    c.path.clone(), 
+                                    c.start_time.as_secs_f64(), 
+                                    c.offset.as_secs_f64(), 
+                                    c.duration.as_secs_f64()
+                                )
                             }).collect();
 
-                            for (path, start_time_sec) in clips_meta {
-                                // FIX 3 & 4: Use your existing adapter to decode offline audio safely
-                                if let Ok((audio_data, source_sr, source_ch)) = crate::bpm::adapter::decode_to_vec(&path) {
+                           for (path, start_time_sec, offset_sec, duration_sec) in clips_meta {
+                                
+                                // --- AUDIO CACHE CHECK ---
+                                let cache_result = {
+                                    let mut cache = self.decode_cache.lock().unwrap();
+                                    if let Some(cached) = cache.get(&path) {
+                                        Some((cached.0.clone(), cached.1, cached.2)) // Grab Arc clone
+                                    } else {
+                                        // Decode and cache if not found
+                                        if let Ok((data, sr, ch)) = crate::bpm::adapter::decode_to_vec(&path) {
+                                            let data_arc = Arc::new(data);
+                                            cache.insert(path.clone(), (data_arc.clone(), sr, ch));
+                                            Some((data_arc, sr, ch))
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                };
+
+                                if let Some((audio_data, source_sr, source_ch)) = cache_result {
+
+                                    // --- THE TIME DOMAIN FIX ---
+                                    // The file starts at 0, but the clip might be trimmed (offset) and cropped (duration).
+                                    // We MUST slice the raw audio buffer so the AI only analyzes what is visible on the timeline!
+                                    let start_sample = (offset_sec * source_sr as f64).round() as usize * source_ch;
+                                    let len_samples = (duration_sec * source_sr as f64).round() as usize * source_ch;
+                                    let end_sample = (start_sample + len_samples).min(audio_data.len());
+                                    
+                                    let sliced_audio = if start_sample < audio_data.len() {
+                                        &audio_data[start_sample..end_sample]
+                                    } else {
+                                        &[] // Prevent panics if offset is completely out of bounds
+                                    };
 
                                     let mut clip_nodes = crate::engine::automation::generate_rider_automation(
-                                        &audio_data, 
+                                        sliced_audio, 
                                         source_ch, 
                                         source_sr, // Process at native sample rate for accurate RMS
                                         start_time_sec,
