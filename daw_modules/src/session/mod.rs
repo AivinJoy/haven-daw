@@ -63,6 +63,7 @@ impl Session {
                 volume_automation: t.volume_automation.clone(),
                 compressor: Some(t.track_compressor.get_params()),
                 eq: Some(t.track_eq.get_state()),
+                reverb: Some(t.track_reverb.get_params()),
             }    
         }).collect();
 
@@ -108,6 +109,10 @@ impl Session {
 
                 if let Some(eq_state) = t_state.eq {
                     track.track_eq.set_state(eq_state);
+                }
+
+                if let Some(rev_params) = t_state.reverb {
+                    track.track_reverb.set_params(rev_params);
                 }
                 
                 for clip_state in t_state.clips {

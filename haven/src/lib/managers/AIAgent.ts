@@ -72,17 +72,18 @@ const ALLOWED_ACTIONS = new Set([
     "split_clip", "merge_clips", "delete_clip", "delete_track", "create_track", 
     // DSP & Automation
     "update_eq", "update_compressor", "update_reverb", 
-    "clear_volume_automation", "duck_volume", "ride_vocal_level"
+    "clear_volume_automation", "duck_volume", "ride_vocal_level", "auto_gain_stage"
 ]);
 
 const DSP_PRIORITY: Record<string, number> = {
-    "set_gain": 1,
-    "update_eq": 2,
-    "update_compressor": 3,
-    "update_reverb": 4,
-    "clear_volume_automation": 5,
-    "duck_volume": 6,
-    "ride_vocal_level": 7
+    "auto_gain_stage": 1,
+    "set_gain": 2,
+    "update_eq": 3,
+    "update_compressor": 4,
+    "update_reverb": 5,
+    "clear_volume_automation": 6,
+    "duck_volume": 7,
+    "ride_vocal_level": 8
 };
 // ---------------------------------------------------------
 
@@ -289,7 +290,13 @@ class AIAgent {
         - Set the 'noise_floor_db' parameter to be 3 to 5 dB HIGHER (closer to 0) than that noise floor average. 
         - Example: If 'quiet_windows' average around -29.0 dB, you must include "noise_floor_db": -25.0.
         - Example payload: {"action": "ride_vocal_level", "track_id": 0, "target_lufs": -16.0, "noise_floor_db": -25.0}
-        - Optional parameters you can include: 'max_boost_db', 'max_cut_db', 'smoothness', 'analysis_window_ms'.`;
+        - Optional parameters you can include: 'max_boost_db', 'max_cut_db', 'smoothness', 'analysis_window_ms'.
+        
+        TOOL C: Mathematical Auto-Gain Staging (auto_gain_stage)
+        - Use this if the user asks to "gain stage", "normalize", or set a track to a specific LUFS.
+        - NEVER use 'set_gain' for this. Let the backend do the math.
+        - Provide the 'target_lufs' (Industry standard is usually -18.0 LUFS if not specified).
+        - Example: {"action": "auto_gain_stage", "track_id": 0, "target_lufs": -18.0}`;
 
         try {
             console.log("📊 1. AI Context (Look at the peaks & windows here):", context);

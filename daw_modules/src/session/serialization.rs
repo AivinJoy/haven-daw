@@ -6,6 +6,7 @@ use anyhow::Result;
 use crate::engine::automation::AutomationCurve;
 use crate::effects::compressor::CompressorParams;
 use crate::effects::equalizer::EqParams;
+use crate::effects::reverb::ReverbParams;
 
 // Represents a single audio clip within a track
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -32,6 +33,7 @@ pub struct TrackState {
     pub compressor: Option<CompressorParams>,
     #[serde(default)]
     pub eq: Option<Vec<EqParams>>,
+    pub reverb: Option<ReverbParams>,
 }
 
 fn default_automation() -> AutomationCurve<f32> {

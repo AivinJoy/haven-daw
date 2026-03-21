@@ -27,6 +27,10 @@ pub enum AiAction {
         track_id: usize,
         value: f32, // Must be provided, must be a float. No strings.
     },
+    AutoGainStage {                // <--- NEW: Mathematical Gain Staging
+        track_id: usize,
+        target_lufs: f32,
+    },
     SetMasterGain {
         value: f32,
     },

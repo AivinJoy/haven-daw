@@ -756,6 +756,7 @@ impl AudioRuntime {
                 volume_automation: t.volume_automation.clone(),
                 compressor: Some(t.track_compressor.get_params()),
                 eq: Some(t.track_eq.get_state()),
+                reverb: Some(t.track_reverb.get_params()),
             }
         }).collect();
 
@@ -1145,6 +1146,34 @@ impl AudioRuntime {
                     let _ = self.add_volume_automation_node(t_id, sample_start, 0.0);
                     let _ = self.add_volume_automation_node(t_id, sample_duck, depth_db);
                     let _ = self.add_volume_automation_node(t_id, sample_end, 0.0);
+                },
+
+                AiAction::AutoGainStage { track_id, target_lufs } => {
+                    if let Some(idx) = resolve(track_id) {
+                        if let Ok(mut engine) = self.engine.lock() {
+                            if let Some(track) = engine.tracks_mut().get_mut(idx) {
+                                // 1. Pull the exact LUFS from the background analyzer
+                                let current_lufs = if let Ok(guard) = track.analysis.lock() {
+                                    guard.as_ref().map(|p| p.integrated_loudness_db)
+                                } else { None };
+
+                                // 2. Perform the Math
+                                if let Some(lufs) = current_lufs {
+                                    let delta_db = target_lufs - lufs as f32;
+                                    
+                                    // 3. Convert dB change to Linear Fader Multiplier
+                                    let linear_multiplier = 10.0_f32.powf(delta_db / 20.0);
+                                    let new_gain = (track.gain * linear_multiplier).clamp(0.0, 2.0);
+                                    
+                                    track.gain = new_gain;
+                                    println!("🎚️ Auto-Gain Stage [Track {}]: {} LUFS -> {} LUFS | Delta: {:.2} dB | New Linear Fader: {:.3}", 
+                                        track_id, lufs, target_lufs, delta_db, new_gain);
+                                } else {
+                                    println!("⚠️ Auto-Gain Stage failed: No analysis profile ready yet for Track {}.", track_id);
+                                }
+                            }
+                        }
+                    }
                 },
 
                 AiAction::RideVocalLevel { track_id, target_lufs, max_boost_db, max_cut_db, smoothness, analysis_window_ms, noise_floor_db } => {

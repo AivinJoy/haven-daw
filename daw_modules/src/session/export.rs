@@ -9,6 +9,11 @@ use symphonia::core::formats::FormatReader;
 use symphonia::core::codecs::Decoder;
 use rubato::Resampler; 
 
+use crate::effects::equalizer::{TrackEq, EqParams};
+use crate::effects::compressor::{CompressorNode, CompressorParams};
+use crate::effects::reverb::{ReverbNode, ReverbParams};
+use crate::engine::automation::AutomationCurve;
+
 pub struct ExportVoice {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn Decoder>,
@@ -33,11 +38,27 @@ pub struct ExportVoice {
     gain: f32,
     pan: f32,
     muted: bool,
+
+    track_eq: TrackEq,
+    track_compressor: CompressorNode,
+    track_reverb: ReverbNode,
+    volume_automation: AutomationCurve<f32>,
 }
 
 impl ExportVoice {
     // FIX: Added start_time to arguments
-    pub fn new(path: &str, target_sample_rate: u32, start_time: f64, offset: f64, duration: f64) -> Result<Self> {
+    // FIX: Added DSP parameters to signature
+    pub fn new(
+        path: &str, 
+        target_sample_rate: u32, 
+        start_time: f64, 
+        offset: f64, 
+        duration: f64,
+        eq_state: Option<Vec<EqParams>>,
+        comp_state: Option<CompressorParams>,
+        rev_state: Option<ReverbParams>,
+        automation: AutomationCurve<f32>
+    ) -> Result<Self> {
         // FIX: Reverted to standard open_and_probe (returns 2 items, not 3)
         let (format, track_id) = pipe::open_and_probe(path)?;
         
@@ -58,6 +79,17 @@ impl ExportVoice {
         let frames_to_skip = (offset * target_sample_rate as f64).round() as usize;
         let max_frames_to_play = (duration * target_sample_rate as f64).round() as usize;
 
+        // --- ADDED: Setup DSP Nodes ---
+        let mut track_eq = TrackEq::new(target_sample_rate, 2);
+        if let Some(eq) = eq_state { track_eq.set_state(eq); }
+
+        let track_compressor = CompressorNode::new(target_sample_rate as f32);
+        if let Some(comp) = comp_state { track_compressor.set_params(comp); }
+
+        let track_reverb = ReverbNode::new(target_sample_rate as f32);
+        if let Some(rev) = rev_state { track_reverb.set_params(rev); }
+        // ------------------------------
+
         let mut voice = Self {
             format,
             decoder,
@@ -75,6 +107,11 @@ impl ExportVoice {
             frames_processed: 0, 
             frames_played: 0,
             max_frames_to_play,
+            // --- ADDED FIELDS ---
+            track_eq,
+            track_compressor,
+            track_reverb,
+            volume_automation: automation,
         };
 
         // Pre-roll: Decode and discard the trimmed 'offset' audio silently
@@ -89,7 +126,6 @@ impl ExportVoice {
             skipped += actual;
         }
         Ok(voice)
-
     }
 
     fn prepare_samples(&mut self, frames_needed: usize) -> Result<bool> {
@@ -222,26 +258,58 @@ impl ExportVoice {
             let samples_available = self.output_buffer.len() / 2; 
             let frames_to_mix = audio_frames_requested.min(samples_available);
 
-            let pan = self.pan.clamp(-1.0, 1.0);
-            let (pan_l, pan_r) = if self.pan != 0.0 {
-                let angle = (pan + 1.0) * 0.25 * std::f32::consts::PI;
-                (angle.cos(), angle.sin())
-            } else {
-                (1.0, 1.0)
-            };
-
-            for i in 0..frames_to_mix {
-                let out_idx = (buf_offset + i) * 2;
-                let in_idx = i * 2;
-                let l = self.output_buffer[in_idx] * self.gain * pan_l;
-                let r = self.output_buffer[in_idx+1] * self.gain * pan_r;
-                out_buf[out_idx] += l;
-                out_buf[out_idx+1] += r;
-            }
-
             if frames_to_mix > 0 {
-                 self.output_buffer.drain(0..(frames_to_mix * 2));
-                 self.frames_played += frames_to_mix;
+                // 1. Extract audio chunk
+                let mut chunk = vec![0.0f32; frames_to_mix * 2];
+                chunk.copy_from_slice(&self.output_buffer[0..(frames_to_mix * 2)]);
+
+                // 2. Process DSP (Pre-Fader exactly like track.rs)
+                self.track_eq.process_buffer(&mut chunk, 2);
+                self.track_compressor.process(&mut chunk);
+                for i in (0..chunk.len()).step_by(2) {
+                    let (l, r) = self.track_reverb.process(chunk[i], chunk[i+1]);
+                    chunk[i] = l;
+                    chunk[i+1] = r;
+                }
+
+                // 3. Automation & Gain 
+                let start_sample = (self.frames_processed + buf_offset) as u64; // accurate global timeline sample
+                let end_sample = start_sample + frames_to_mix as u64;
+                let start_gain_db = self.volume_automation.get_value_at_time(start_sample, 0.0);
+                let end_gain_db = self.volume_automation.get_value_at_time(end_sample, 0.0);
+
+                let start_gain_linear = self.gain * 10.0_f32.powf(start_gain_db / 20.0);
+                let end_gain_linear = self.gain * 10.0_f32.powf(end_gain_db / 20.0);
+                let gain_step = if frames_to_mix > 1 {
+                    (end_gain_linear - start_gain_linear) / (frames_to_mix as f32 - 1.0)
+                } else { 0.0 };
+
+                let mut current_gain = start_gain_linear;
+                let pan = self.pan.clamp(-1.0, 1.0);
+                let (pan_l, pan_r) = if self.pan != 0.0 {
+                    let angle = (pan + 1.0) * 0.25 * std::f32::consts::PI;
+                    (angle.cos(), angle.sin())
+                } else {
+                    (1.0, 1.0)
+                };
+
+                // 4. Apply Gain/Pan and Mix into Master
+                for i in 0..frames_to_mix {
+                    let out_idx = (buf_offset + i) * 2;
+                    let in_idx = i * 2;
+                    
+                    let l = chunk[in_idx] * current_gain * pan_l;
+                    let r = chunk[in_idx+1] * current_gain * pan_r;
+                    
+                    out_buf[out_idx] += l;
+                    out_buf[out_idx+1] += r;
+                    
+                    current_gain += gain_step;
+                }
+
+                // 5. Drain processed samples
+                self.output_buffer.drain(0..(frames_to_mix * 2));
+                self.frames_played += frames_to_mix;
             }
         }
 
@@ -281,7 +349,17 @@ pub fn export_project_to_wav(manifest: &ProjectManifest, output_path: &str) -> R
             }
 
             // FIX: Pass offset and duration to prevent drift!
-            if let Ok(mut v) = ExportVoice::new(&clip.path, sample_rate, clip.start_time, clip.offset, clip.duration) {
+            if let Ok(mut v) = ExportVoice::new(
+                &clip.path, 
+                sample_rate, 
+                clip.start_time, 
+                clip.offset, 
+                clip.duration,
+                t_state.eq.clone(),
+                t_state.compressor.clone(),
+                t_state.reverb.clone(),
+                t_state.volume_automation.clone()
+            ) {
                 v.gain = t_state.gain;
                 v.pan = t_state.pan;
                 v.muted = t_state.muted; 
