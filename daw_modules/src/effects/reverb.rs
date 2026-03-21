@@ -204,6 +204,18 @@ impl ReverbNode {
         }
     }
 
+    // --- BATCH PARAM SETTER (Required for AI and Undo/Redo) ---
+    pub fn set_params(&self, params: ReverbParams) {
+        self.is_active.store(params.is_active, Ordering::Relaxed);
+        self.room_size.store(params.room_size.to_bits(), Ordering::Relaxed);
+        self.damping.store(params.damping.to_bits(), Ordering::Relaxed);
+        self.mix.store(params.mix.to_bits(), Ordering::Relaxed);
+        self.width.store(params.width.to_bits(), Ordering::Relaxed);
+        self.pre_delay_ms.store(params.pre_delay_ms.to_bits(), Ordering::Relaxed);
+        self.low_cut_hz.store(params.low_cut_hz.to_bits(), Ordering::Relaxed);
+        self.high_cut_hz.store(params.high_cut_hz.to_bits(), Ordering::Relaxed);
+    }
+
     pub fn get_params(&self) -> ReverbParams {
         ReverbParams {
             is_active: self.is_active.load(Ordering::Relaxed),

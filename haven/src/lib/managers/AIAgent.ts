@@ -84,11 +84,49 @@ class AIAgent {
         } catch (e) {
             console.warn("Could not fetch recording status", e);
         }
+
+        // --- SMART CONTEXT FILTER ---
+        // Only fetch heavy DSP analysis if the user is asking for mixing/mastering tasks
+        const mixingKeywords = ['master', 'mix', 'level', 'ride', 'duck', 'eq', 'compressor', 'loudness', 'balance', 'vocal', 'peak', 'plosive'];
+        const needsAnalysis = mixingKeywords.some(kw => userInput.toLowerCase().includes(kw));
         
         let trackAnalysis: any[] = [];
-        try { trackAnalysis = await invoke('get_track_analysis'); } catch (e) {}
+        if (needsAnalysis) {
+            try { trackAnalysis = await invoke('get_track_analysis'); } catch (e) {}
+        }
         
-        // 1. Provide Context (Now includes Project timing, Playhead, FX, and Colors)
+        // 1. INTENT DICTIONARIES
+        const trackAliases: Record<string, string[]> = {
+            "vocal": ["vox", "vocals", "voice", "lead", "singer", "singing"],
+            "guitar": ["guitars", "acoustic", "electric", "strum", "riff"],
+            "bass": ["808", "sub", "bassline"],
+            "drum": ["drums", "kick", "snare", "hihat", "percussion", "beat"]
+        };
+
+        const actionIntents: Record<string, string[]> = {
+            "peaks": ["peak", "clip", "clipping", "plosive", "pop", "duck", "distort", "harsh"],
+            "dynamics": ["ride", "level", "balance", "quiet", "loud", "compress", "compressor", "dynamic", "volume"],
+            "eq": ["eq", "bright", "muddy", "dark", "thin", "frequency", "tone"]
+        };
+
+        // NEW: Global Context Awareness
+        const globalIntents = ["master", "mix", "overall", "final", "entire", "everything", "all"];
+
+        const lowercaseInput = userInput.toLowerCase();
+        const inputWords = lowercaseInput.replace(/[.,!?]/g, '').split(/\s+/);
+
+        // PRECOMPUTE: Actions & Global Scope
+        const activeActions = new Set<string>();
+        for (const [action, keywords] of Object.entries(actionIntents)) {
+            if (keywords.some((kw: string) => inputWords.includes(kw))) {
+                activeActions.add(action);
+            }
+        }
+        
+        const isGlobalRequest = globalIntents.some((term: string) => inputWords.includes(term));
+        const intentConfidence = activeActions.size;
+
+        // 2. BUILD CONTEXT WITH SMART FILTERING
         let context = JSON.stringify({
             project: {
                 bpm: globalState.bpm,
@@ -100,31 +138,97 @@ class AIAgent {
                 const data = trackAnalysis.find(a => a.track_id === t.id);
                 const profile = data?.analysis; 
                 
+                const trackNameLower = t.name.toLowerCase();
+                const trackNameTokens = trackNameLower.split(/[_\-\s]+/);
+                const trackIdStr = t.id.toString();
+
+                // 3. MULTI-TRACK INTENT TRACKING (With Scoring)
+                const matchedReasons: string[] = [];
+
+                // A: Exact ID match
+                if (inputWords.includes(trackIdStr)) {
+                    matchedReasons.push("id");
+                }
+
+                // B: Strict Full Name Match (All tokens must match)
+                if (trackNameTokens.length > 0 && trackNameTokens.every((token: string) => inputWords.includes(token))) {
+                    matchedReasons.push("name_full");
+                } else if (trackNameTokens.some((token: string) => inputWords.includes(token))) {
+                    matchedReasons.push("name_token");
+                }
+
+                // C: Weighted Alias Match
+                for (const [category, aliases] of Object.entries(trackAliases)) {
+                    if (trackNameTokens.includes(category) || trackNameTokens.some((token: string) => aliases.includes(token))) {
+                        let aliasScore = 0;
+                        if (inputWords.includes(category)) aliasScore += 2;
+                        if (aliases.some((alias: string) => inputWords.includes(alias))) aliasScore += 1;
+
+                        if (aliasScore > 0) {
+                            matchedReasons.push(`alias_${category}_${aliasScore}`);
+                        }
+                    }
+                }
+
+                // Target Track Logic now respects Global Intents
+                const isTargetTrack = isGlobalRequest || matchedReasons.length > 0;
+                
                 return { 
                     id: t.id, 
-                    name: t.name.toLowerCase(),
-                    color: t.color, // <--- NOW THE AI KNOWS THE COLORS!
-                    fader_linear: t.gain, // Note: Let Rust handle if this is linear or dB
+                    name: trackNameLower,
+                    color: t.color, 
+                    fader_linear: t.gain, 
                     pan: t.pan,
                     muted: t.muted,
                     solo: t.solo,
-                    compressor: t.compressor, // <--- ADDED FX STATE
-                    eq: t.eq,                 // <--- ADDED FX STATE
+                    compressor: t.compressor, 
+                    eq: t.eq,                 
                     clips: t.clips?.map((c: any) => ({
                         clip_number: c.clipNumber ?? c.clip_number ?? 1,
                         start_time: Number((c.startTime ?? c.start_time ?? 0).toFixed(2)),
                         duration: Number(c.duration.toFixed(2))
                     })),
-                    analysis: profile ? {
-                        integrated_loudness_db: profile.integrated_loudness_db,
-                        max_sample_peak_db: profile.max_sample_peak_db,
-                        crest_factor_db: profile.crest_factor_db,
-                        loudness_median_db: profile.loudness_p50_db, // P50 is the median
-                        peak_events: profile.peak_events,            // Array of {t, db}
-                        loud_windows: profile.loud_windows,          // Array of {t, db}
-                        quiet_windows: profile.quiet_windows,        // Array of {t, db}
-                        spectral_centroid_hz: profile.spectral_centroid_hz
-                    } : "computing..."
+                    
+                    // 4. STRUCTURED OMISSION & PAYLOAD TRIMMING
+                    ...(profile ? {
+                        analysis: isTargetTrack ? {
+                            _match_reasons: matchedReasons, 
+                            _active_actions: Array.from(activeActions),
+                            _is_global: isGlobalRequest,
+                            
+                            // Always include basic scalar numbers
+                            integrated_loudness_db: profile.integrated_loudness_db,
+
+                            // The "Fix This" Fallback: If 0 confidence, send ONLY scalars, NO arrays
+                            ...(intentConfidence === 0 && !isGlobalRequest ? {
+                                max_sample_peak_db: profile.max_sample_peak_db,
+                                crest_factor_db: profile.crest_factor_db,
+                                loudness_median_db: profile.loudness_p50_db,
+                                spectral_centroid_hz: profile.spectral_centroid_hz,
+                                _note: "Detailed arrays omitted due to low intent confidence."
+                            } : {
+                                // High Confidence OR Global Request: Send targeted arrays
+                                ...(activeActions.has("peaks") || isGlobalRequest ? {
+                                    max_sample_peak_db: profile.max_sample_peak_db,
+                                    peak_events: profile.peak_events,
+                                } : {}),
+
+                                ...(activeActions.has("dynamics") || isGlobalRequest ? {
+                                    crest_factor_db: profile.crest_factor_db,
+                                    loudness_median_db: profile.loudness_p50_db,
+                                    loud_windows: profile.loud_windows,          
+                                    quiet_windows: profile.quiet_windows, 
+                                } : {}),
+
+                                ...(activeActions.has("eq") || isGlobalRequest ? {
+                                    spectral_centroid_hz: profile.spectral_centroid_hz
+                                } : {})
+                            })
+                        } : {
+                            status: "omitted",
+                            message: "Explicitly mention this track's name or ID to retrieve full DSP analysis."
+                        }
+                    } : {})
                 };
             })
         });
@@ -138,7 +242,7 @@ class AIAgent {
         RULES:
         1. 'depth_db' and 'target_lufs' MUST be in standard audio decibels (dB) or LUFS. 0.0 dB is unity gain.
         2. Never send percentages or linear gain.
-        3. Allowed actions: play, pause, record, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor, clear_volume_automation, duck_volume, ride_vocal_level.
+        3. Allowed actions: play, pause, record, rewind, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor, clear_volume_automation, duck_volume, ride_vocal_level.
 
         AUTOMATION & VOCAL RIDING GUIDELINES:
         You have two different tools for volume control. Choose the correct one based on the user's request:
@@ -173,7 +277,9 @@ class AIAgent {
             // 4. Parse the raw JSON
             // Strip markdown blocks if the LLM hallucinated them
             const cleanResponse = rawResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+            console.log("🟢 RAW AI RESPONSE STRING:", cleanResponse);
             const data: AIBatchRequest = JSON.parse(cleanResponse);
+            console.table(data.commands);
 
             // 5. DELEGATE ENTIRE BATCH TO RUST (Atomic Transaction)
             if (data.version === "1.0" && data.commands && data.commands.length > 0) {
@@ -182,6 +288,8 @@ class AIAgent {
                 const transportCommands = ['play', 'pause', 'record', 'rewind', 'seek', 'toggle_monitor', 'separate_stems'];
                 const dspCommands = data.commands.filter(c => !transportCommands.includes(c.action));
                 const uiCommands = data.commands.filter(c => transportCommands.includes(c.action));
+
+                console.log(`🔀 Routing: ${uiCommands.length} UI Commands, ${dspCommands.length} DSP Commands sent to Rust.`);
 
                 // A. Dispatch UI/Transport immediately
                 uiCommands.forEach(cmd => {

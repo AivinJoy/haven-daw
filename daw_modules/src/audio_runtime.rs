@@ -1057,6 +1057,8 @@ impl AudioRuntime {
                             SchemaEqFilterType::HighShelf => crate::effects::equalizer::EqFilterType::HighShelf,
                             SchemaEqFilterType::LowPass => crate::effects::equalizer::EqFilterType::LowPass,
                             SchemaEqFilterType::HighPass => crate::effects::equalizer::EqFilterType::HighPass,
+                            SchemaEqFilterType::Notch => crate::effects::equalizer::EqFilterType::Notch,
+                            SchemaEqFilterType::BandPass => crate::effects::equalizer::EqFilterType::BandPass,
                         };
                         let params = crate::effects::equalizer::EqParams {
                             filter_type: mapped_filter,
@@ -1065,7 +1067,13 @@ impl AudioRuntime {
                             gain: gain.clamp(-18.0, 18.0),
                             active: true,
                         };
-                        self.update_eq(idx, band_index, params);
+                        
+                        // FIX: Apply directly to engine to prevent UI race condition
+                        if let Ok(mut engine) = self.engine.lock() {
+                            if let Some(track) = engine.tracks_mut().get_mut(idx) {
+                                track.track_eq.update_band(band_index, params);
+                            }
+                        }
                     }
                 },
                 AiAction::UpdateCompressor { track_id, threshold_db, ratio, attack_ms, release_ms, makeup_gain_db } => {
@@ -1078,20 +1086,33 @@ impl AudioRuntime {
                             release_ms: release_ms.clamp(10.0, 1000.0),
                             makeup_gain_db: makeup_gain_db.clamp(0.0, 24.0),
                         };
-                        self.update_compressor(idx, params);
+                        
+                        // FIX: Apply directly to engine
+                        if let Ok(mut engine) = self.engine.lock() {
+                            if let Some(track) = engine.tracks_mut().get_mut(idx) {
+                                track.track_compressor.set_params(params);
+                            }
+                        }
                     }
                 },
                 AiAction::UpdateReverb { track_id, room_size, damping, pre_delay_ms, mix, width, low_cut_hz, high_cut_hz, is_active } => {
                     if let Some(idx) = resolve(track_id) {
-                        // Route each provided option to the lock-free generic effect setter
-                        if let Some(v) = is_active { self.set_effect_param(idx, "reverb".into(), "active".into(), if v { 1.0 } else { 0.0 }); }
-                        if let Some(v) = room_size { self.set_effect_param(idx, "reverb".into(), "room_size".into(), v.clamp(0.0, 1.0)); }
-                        if let Some(v) = damping { self.set_effect_param(idx, "reverb".into(), "damping".into(), v.clamp(0.0, 1.0)); }
-                        if let Some(v) = pre_delay_ms { self.set_effect_param(idx, "reverb".into(), "pre_delay".into(), v.clamp(0.0, 500.0)); }
-                        if let Some(v) = mix { self.set_effect_param(idx, "reverb".into(), "mix".into(), v.clamp(0.0, 1.0)); }
-                        if let Some(v) = width { self.set_effect_param(idx, "reverb".into(), "width".into(), v.clamp(0.0, 1.0)); }
-                        if let Some(v) = low_cut_hz { self.set_effect_param(idx, "reverb".into(), "low_cut".into(), v.clamp(20.0, 1000.0)); }
-                        if let Some(v) = high_cut_hz { self.set_effect_param(idx, "reverb".into(), "high_cut".into(), v.clamp(1000.0, 20000.0)); }
+                        // FIX: Apply directly to engine using the batch setter
+                        if let Ok(mut engine) = self.engine.lock() {
+                            if let Some(track) = engine.tracks_mut().get_mut(idx) {
+                                let mut p = track.track_reverb.get_params();
+                                if let Some(v) = is_active { p.is_active = v; }
+                                if let Some(v) = room_size { p.room_size = v.clamp(0.0, 1.0); }
+                                if let Some(v) = damping { p.damping = v.clamp(0.0, 1.0); }
+                                if let Some(v) = pre_delay_ms { p.pre_delay_ms = v.clamp(0.0, 500.0); }
+                                if let Some(v) = mix { p.mix = v.clamp(0.0, 1.0); }
+                                if let Some(v) = width { p.width = v.clamp(0.0, 1.0); }
+                                if let Some(v) = low_cut_hz { p.low_cut_hz = v.clamp(20.0, 1000.0); }
+                                if let Some(v) = high_cut_hz { p.high_cut_hz = v.clamp(1000.0, 20000.0); }
+                                
+                                track.track_reverb.set_params(p);
+                            }
+                        }
                     }
                 },
                 AiAction::ClearVolumeAutomation { track_id } => {

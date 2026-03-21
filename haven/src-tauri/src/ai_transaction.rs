@@ -14,6 +14,12 @@ pub async fn execute_ai_transaction(
     commands: Vec<AiAction>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+
+    // 🛠️ DEBUG LOG 4: RUST ENTRY POINT
+    println!("🦀 [AI_TRANSACTION] Received {} commands from Frontend. Version: {}", commands.len(), version);
+    for (i, cmd) in commands.iter().enumerate() {
+        println!("   👉 Incoming Command {}: {:?}", i, cmd);
+    }
     
     // 1. Version Check
     if version != "1.0" {

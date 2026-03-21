@@ -61,11 +61,16 @@ fn build_ui_state(
     master_gain: f32,
     silent: bool,
     cache_store: &Mutex<HashMap<String, ImportResult>>,
+    fx_data: Vec<(
+        Vec<daw_modules::effects::equalizer::EqParams>, 
+        daw_modules::effects::compressor::CompressorParams,
+        daw_modules::effects::reverb::ReverbParams
+    )>
 ) -> Result<ProjectState, String> {
     
     let mut results = Vec::new();
 
-    for info in tracks_info.iter() {
+    for (i, info) in tracks_info.iter().enumerate() {
         
         // 1. Try to find existing color
         let color = info.color.clone();
@@ -125,6 +130,8 @@ fn build_ui_state(
             "media".to_string()
         };
 
+        let (eq, compressor, reverb) = fx_data[i].clone();
+
         results.push(LoadedTrack {
             id: track_id,
             name: info.name.clone(),
@@ -136,6 +143,9 @@ fn build_ui_state(
             solo: info.solo,
             source: source_type,
             volume_automation: info.volume_automation.clone(),
+            eq,           // <--- Attach EQ to UI Payload
+            compressor,
+            reverb,
         });
     }
     
@@ -730,6 +740,25 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
         solo: false,
         source: "mic".to_string(),
         volume_automation: vec![],
+        eq: vec![],
+        compressor: daw_modules::effects::compressor::CompressorParams {
+            is_active: false,
+            threshold_db: -20.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 50.0,
+            makeup_gain_db: 0.0,
+        },
+        reverb: daw_modules::effects::reverb::ReverbParams { 
+            is_active: false, 
+            room_size: 0.8, 
+            damping: 0.5, 
+            mix: 0.3, 
+            width: 1.0, 
+            pre_delay_ms: 10.0, 
+            low_cut_hz: 100.0, 
+            high_cut_hz: 8000.0 
+        },
     })
 }
 
@@ -904,12 +933,20 @@ async fn get_project_state(
     let bpm = audio_runtime.bpm();
     let master_gain = audio_runtime.master_gain();
     let tracks_info = audio_runtime.get_tracks_list();
+    let mut fx_data = Vec::new();
+    for info in &tracks_info {
+        let index = resolve_track_index(&tracks_info, info.id as u32)?;
+        let eq = audio_runtime.get_eq_state(index);
+        let comp = audio_runtime.get_compressor_state(index);
+        let rev = audio_runtime.get_reverb_state(index); // Reverb included!
+        fx_data.push((eq, comp, rev));
+    }
     drop(audio_runtime); // Release lock
 
     // 2. Build UI State (Reuse Helper)
     // Pass cache AND color store
-    let state = build_ui_state(tracks_info, bpm, master_gain, true, &state.cache)?;
-    Ok(state)
+    let state_ui = build_ui_state(tracks_info, bpm, master_gain, false, &state.cache, fx_data)?;
+    Ok(state_ui)
 }
 
 #[derive(serde::Serialize)]
@@ -940,6 +977,9 @@ pub struct LoadedTrack {
     pub solo: bool,
     pub source: String,
     pub volume_automation: Vec<daw_modules::engine::automation::AutomationNode<f32>>,
+    pub eq: Vec<daw_modules::effects::equalizer::EqParams>,
+    pub compressor: daw_modules::effects::compressor::CompressorParams,
+    pub reverb: daw_modules::effects::reverb::ReverbParams,
 }
 
 #[derive(serde::Serialize)]
@@ -997,48 +1037,56 @@ async fn load_project(
     let bpm = audio_runtime.bpm();
     let master_gain = audio_runtime.master_gain();
     let tracks_info = audio_runtime.get_tracks_list();
+    // --- FETCH FX STATES BEFORE DROPPING THE LOCK ---
+    let mut fx_data = Vec::new();
+    for info in &tracks_info {
+        let index = resolve_track_index(&tracks_info, info.id as u32)?;
+        let eq = audio_runtime.get_eq_state(index);
+        let comp = audio_runtime.get_compressor_state(index);
+        let rev = audio_runtime.get_reverb_state(index); // Reverb included!
+        fx_data.push((eq, comp, rev));
+    }
     drop(audio_runtime); // Release lock
 
     for info in &tracks_info {
         for clip in &info.clips {
-             let path_key = clip.path.clone();
-             let needs_load = {
-                 let cache = state.cache.lock().unwrap();
-                 !cache.contains_key(&path_key)
-             };
-
-             if needs_load {
-                 let _ = app.emit("load-progress", format!("Loading {}", clip.path));
-                 if let Ok((samples, sr, ch)) = daw_modules::bpm::adapter::decode_to_vec(&clip.path) {
-                      let wf = Waveform::build_from_samples(&samples, sr, ch, 512);
-                      let pixels_per_second = 100.0;
-                      let spp = (sr as f64) / pixels_per_second;
-                      let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
-                      
-                      let data = ImportResult {
-                            mins: mins.to_vec(),
-                            maxs: maxs.to_vec(), 
-                            duration: wf.duration_secs,
-                            bins_per_second: pixels_per_second,
-                            bpm: None,
-                            color: String::new(),
-                      };
-                      
-                      state.cache.lock().unwrap().insert(path_key, data);
-                 }
-             }
+            let path_key = clip.path.clone();
+            let needs_load = {
+                let cache = state.cache.lock().unwrap();
+                !cache.contains_key(&path_key)
+            };
+            if needs_load {
+                let _ = app.emit("load-progress", format!("Loading {}", clip.path));
+                if let Ok((samples, sr, ch)) = daw_modules::bpm::adapter::decode_to_vec(&clip.path) {
+                    let wf = Waveform::build_from_samples(&samples, sr, ch, 512);
+                    let pixels_per_second = 100.0;
+                    let spp = (sr as f64) / pixels_per_second;
+                    let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
+                    
+                    let data = ImportResult {
+                          mins: mins.to_vec(),
+                          maxs: maxs.to_vec(), 
+                          duration: wf.duration_secs,
+                          bins_per_second: pixels_per_second,
+                          bpm: None,
+                          color: String::new(),
+                    };
+                    
+                    state.cache.lock().unwrap().insert(path_key, data);
+                }
+            }
         }
     }
 
     // 3. Build UI State (Reuse Helper)
     // Pass cache AND color store
-    let state = build_ui_state(tracks_info, bpm, master_gain, false, &state.cache)?;
-
+    let state_ui = build_ui_state(tracks_info, bpm, master_gain, false, &state.cache, fx_data)?;
     let _ = app.emit("load-percent", 100.0);
     let _ = app.emit("load-progress", "Ready");
 
-    Ok(state)
+    Ok(state_ui)
 }
+
 // Add these to the invoke_handler list!
 #[tauri::command]
 fn get_temp_path(filename: String) -> String {
@@ -1109,7 +1157,7 @@ async fn ask_ai(
         CRITICAL RULES:\n\
         1. YOU MUST OUTPUT A VALID JSON OBJECT WITH 'version': '1.0' and a 'commands' array. NO PLAIN TEXT.\n\
         2. FLATTEN PARAMETERS. Put 'track_id', 'value', 'time', 'new_time', 'bpm', 'clip_number' DIRECTLY inside the command object.\n\
-        3. ACTION NAMES MUST MATCH EXACTLY: play, pause, record, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor, update_reverb, separate_stems, ride_vocal_level, duck_volume, none.\n\
+        3. ACTION NAMES MUST MATCH EXACTLY: play, pause, record, rewind, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor, update_reverb, separate_stems, ride_vocal_level, duck_volume, none.\n\
         4. DSP MATH: \n\
            - Gain is 0.0 (silent) to 2.0 (+6dB). Default/Unity volume is 1.0.\n\
            - Pan is -1.0 (Left) to 1.0 (Right). Default pan is 0.0.\n\
@@ -1122,6 +1170,7 @@ async fn ask_ai(
         6. RELATIVE AWARENESS: \n\
            - If the user says 'here' or 'current position', use the 'playhead_position_seconds' from the context.\n\
            - If the user references a color (e.g., 'the red track'), find the track with that color in the context.\n\
+           - If the user asks to 'play from start' or 'play from the beginning', your 'commands' array MUST contain two objects: first a 'rewind' action, then a 'play' action.\n\
         7. EXACT PARAMETER NAMES (CRITICAL): \n\
            - For 'update_compressor': You MUST use 'makeup_gain_db'. NEVER use 'makeup_db'. Allowed: 'threshold_db', 'ratio', 'attack_ms', 'release_ms', 'makeup_gain_db'.\n\
            - For 'update_reverb': Allowed parameters: 'room_size' (0.0 to 1.0), 'damping' (0.0 to 1.0), 'mix' (0.0 dry to 1.0 wet), 'width' (0.0 mono to 1.0 stereo), 'pre_delay_ms' (0 to 500), 'low_cut_hz' (20 to 1000), 'high_cut_hz' (1000 to 20000), 'is_active' (boolean).\n\
@@ -1377,8 +1426,38 @@ fn sanitize_ai_batch(mut steps: Vec<AiStep>) -> Result<Vec<AiStep>, String> {
         }
     }
 
-    // [Future Rules can go here]
-    // e.g., prevent duplicate toggles, prevent destructive commands while recording, etc.
+    // RULE 2: Prevent Contradictory Transport Commands
+    let has_play = steps.iter().any(|s| s.action == "play");
+    let has_pause = steps.iter().any(|s| s.action == "pause");
+    
+    if has_play && has_pause {
+        let original_len = steps.len();
+        // Safety first: if AI says both play and pause, keep pause and drop play
+        steps.retain(|s| s.action != "play");
+        if steps.len() < original_len {
+            println!("🛡️ Engine Guard: Removed 'play' command because 'pause' was also requested.");
+        }
+    }
+
+    // RULE 3: Gain/Volume Safety Limiter (Prevent speaker blowout)
+    for step in &mut steps {
+        if step.action == "set_gain" || step.action == "set_master_gain" {
+            if let Some(params) = &mut step.parameters {
+                if let Some(val) = params.get_mut("value") {
+                    if let Some(mut float_val) = val.as_f64() {
+                        // Clamp between 0.0 (mute) and 2.0 (+6dB max)
+                        if float_val > 2.0 {
+                            println!("🛡️ Engine Guard: Clamped dangerously high gain ({} -> 2.0)", float_val);
+                            float_val = 2.0;
+                        } else if float_val < 0.0 {
+                            float_val = 0.0;
+                        }
+                        *val = serde_json::json!(float_val);
+                    }
+                }
+            }
+        }
+    }
 
     Ok(steps)
 }

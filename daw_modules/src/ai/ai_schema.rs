@@ -141,6 +141,8 @@ pub enum EqFilterType {
     HighShelf,
     HighPass,
     LowPass,
+    Notch,
+    BandPass,
 }
 
 // Custom Error Type for Schema Validation
