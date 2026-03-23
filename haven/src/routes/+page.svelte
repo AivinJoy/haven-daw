@@ -789,7 +789,8 @@
             globalState={{ 
                 bpm: bpm, 
                 timeSignature: `${timeSignatureNumerator}/4`, 
-                playheadTime: currentTime 
+                playheadTime: currentTime,
+                activeTrackId: tracks.find(t => t.isRecording)?.id 
             }} 
         />
 

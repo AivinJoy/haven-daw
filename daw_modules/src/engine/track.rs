@@ -469,8 +469,14 @@ impl Track {
 
     // --- NEW: Automatically numbers clips sequentially from left to right ---
     pub fn renumber_clips(&mut self) {
+        // Ensure clips are strictly sorted by timeline position
+        self.clips.sort_by(|a, b| a.start_time.cmp(&b.start_time));
+        
+        println!("🔍 DEBUG: Renumbering {} clips on Track ID: {}", self.clips.len(), self.id.0);
+        
         for (i, clip) in self.clips.iter_mut().enumerate() {
             clip.clip_number = i + 1;
+            println!("   -> Set Clip at {:.2}s to Number {}", clip.start_time.as_secs_f64(), clip.clip_number);
         }
     }
 
@@ -576,6 +582,8 @@ impl Track {
             // so the change is audible instantly without restart
             // clip.seek(...) 
         }
+        // 🚀 FIX: Re-sort and assign stable IDs after moving
+        self.renumber_clips();
     }
 
     pub fn delete_clip(&mut self, clip_index: usize) -> anyhow::Result<()> {

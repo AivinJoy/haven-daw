@@ -93,7 +93,8 @@ class AIAgent {
         userInput: string, 
         tracks: any[], 
         globalState: { bpm: number, timeSignature: string, playheadTime: number },
-        previousMessages: AIMessage[] = []
+        previousMessages: AIMessage[] = [],
+        selectedTrackId?: number
     ): Promise<AIMessage> {
         
         const chatHistory = previousMessages.map(m => ({
@@ -150,13 +151,23 @@ class AIAgent {
         const isGlobalRequest = globalIntents.some((term: string) => inputWords.includes(term));
         const intentConfidence = activeActions.size;
 
+        // --- NEW: MUTED TRACK FILTER ---
+        const isUnmuteRequest = ['unmute', 'mute', 'listen', 'hear'].some(w => inputWords.includes(w));
+        const activeTracks = tracks.filter(t => {
+            if (!t.muted) return true; // Keep active tracks
+            if (isGlobalRequest || isUnmuteRequest || selectedTrackId === t.id) return true; // Keep if explicitly targeted
+            const trackNameTokens = t.name.toLowerCase().split(/[_\-\s]+/);
+            return trackNameTokens.some((token: string) => inputWords.includes(token)) || inputWords.includes(t.id.toString());
+        });
+
         // 2. BUILD CONTEXT WITH SMART FILTERING
         let context = JSON.stringify({
             project: {
                 bpm: globalState.bpm,
                 time_signature: globalState.timeSignature,
                 playhead_position_seconds: globalState.playheadTime,
-                monitoring_enabled: isMonitoring
+                monitoring_enabled: isMonitoring,
+                target_track_id: selectedTrackId
             },
             tracks: tracks.map(t => {
                 const data = trackAnalysis.find(a => a.track_id === t.id);
@@ -223,30 +234,19 @@ class AIAgent {
                             // Always include basic scalar numbers
                             integrated_loudness_db: profile.integrated_loudness_db,
 
-                            // The "Fix This" Fallback: If 0 confidence, send ONLY scalars, NO arrays
-                            ...(intentConfidence === 0 && !isGlobalRequest ? {
+                            // FIX: If the prompt relates to mixing/mastering, send ALL required arrays
+                            ...(needsAnalysis ? {
                                 max_sample_peak_db: profile.max_sample_peak_db,
                                 crest_factor_db: profile.crest_factor_db,
                                 loudness_median_db: profile.loudness_p50_db,
                                 spectral_centroid_hz: profile.spectral_centroid_hz,
-                                _note: "Detailed arrays omitted due to low intent confidence."
+                                peak_events: profile.peak_events, // Required for duck_volume
+                                loud_windows: profile.loud_windows,          
+                                quiet_windows: profile.quiet_windows, // Required for ride_vocal_level
                             } : {
-                                // High Confidence OR Global Request: Send targeted arrays
-                                ...(activeActions.has("peaks") || isGlobalRequest ? {
-                                    max_sample_peak_db: profile.max_sample_peak_db,
-                                    peak_events: profile.peak_events,
-                                } : {}),
-
-                                ...(activeActions.has("dynamics") || isGlobalRequest ? {
-                                    crest_factor_db: profile.crest_factor_db,
-                                    loudness_median_db: profile.loudness_p50_db,
-                                    loud_windows: profile.loud_windows,          
-                                    quiet_windows: profile.quiet_windows, 
-                                } : {}),
-
-                                ...(activeActions.has("eq") || isGlobalRequest ? {
-                                    spectral_centroid_hz: profile.spectral_centroid_hz
-                                } : {})
+                                // LIGHTWEIGHT PAYLOAD: Normal transport/editing commands
+                                max_sample_peak_db: profile.max_sample_peak_db,
+                                _note: "Detailed arrays omitted. User did not request mixing."
                             })
                         } : {
                             status: "omitted",
@@ -261,41 +261,44 @@ class AIAgent {
         context += `\n\nCRITICAL INSTRUCTIONS:
         You are an elite Audio DSP Engineer. 
         You MUST respond with a STRICT JSON payload matching the "1.0" API contract.
-        Do NOT wrap the JSON in markdown blocks.
+        Do NOT wrap the JSON in markdown blocks. Output only raw, parsable JSON.
         
-        RULES:
+        🚨 1. TRACK LOCKING RULE (HIGHEST PRIORITY): 
+        - Look at 'project.target_track_id'. If provided, use this EXACT 'track_id' for all DSP commands unless the user explicitly names a different track. Do NOT hallucinate track IDs.
+        
+        🚨 2. EFFECT ACTIVATION RULE:
+        - When applying 'update_compressor', 'update_eq', or 'update_reverb', you MUST include "is_active": true in the payload. Otherwise, the effect remains bypassed.
+        
+        🚨 3. ANALYSIS USAGE RULE:
+        - Do not guess dB values. Use the pre-calculated 'calculated_noise_floor_db' and the 'severe_peaks' array provided in the context.
+        
+        GENERAL RULES:
         1. 'depth_db' and 'target_lufs' MUST be in standard audio decibels (dB) or LUFS. 
-        2. GAIN EXCEPTION: The 'set_gain' and 'set_pan' commands strictly use LINEAR values. For 'set_gain', 0.0 is silence, 1.0 is unity gain, and 2.0 is +6dB. If you want to drop the gain for headroom, send a linear value like 0.5. DO NOT SEND DECIBELS FOR SET_GAIN.
-        3. Allowed actions: play, pause, record, rewind, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor, update_reverb, clear_volume_automation, duck_volume, ride_vocal_level.
-        4. GAIN STAGING IS MANDATORY: Before applying any heavy compression or EQ boosts, ALWAYS prepend a "set_gain" command with a linear value of 0.5 to provide headroom.
-        5. VOCAL CHAINS: If asked to process a vocal, you MUST include 'update_reverb' in your chain to provide spatial depth, unless explicitly told to keep it dry.
+        2. GAIN EXCEPTION: 'set_gain' and 'set_pan' strictly use LINEAR values. For 'set_gain', 0.0 is silence, 1.0 is unity gain, 2.0 is +6dB. DO NOT send decibels for set_gain.
+        3. Allowed actions: play, pause, record, rewind, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor, update_reverb, clear_volume_automation, duck_volume, ride_vocal_level, auto_gain_stage.
+        4. MERGE CLIPS: You MUST ONLY provide the 'clip_number' of the left-most clip. Do NOT invent a 'next_clip_number'. Example: {"action": "merge_clips", "track_id": 0, "clip_number": 2}
+        5. MANUAL GAIN STAGING: If you are NOT using 'auto_gain_stage', but are applying heavy compression or EQ boosts, ALWAYS prepend a "set_gain" command with a linear value (e.g., 0.5) for headroom.
+        6. VOCAL CHAINS: If asked to process a vocal, include 'update_reverb' to provide spatial depth, unless explicitly told to keep it dry.
 
-
-        AUTOMATION & VOCAL RIDING GUIDELINES:
-        You have two different tools for volume control. Choose the correct one based on the user's request:
+        AUTOMATION & VOLUME GUIDELINES:
+        Choose the correct tool based on the user's request:
 
         TOOL A: Peak Protection (duck_volume)
-        - Use this ONLY if the user explicitly asks to "fix clipping", "duck sudden peaks", or "remove plosives".
-        - Analyze the track's 'analysis' object (peak_events). 
-        - You MUST use the "duck_volume" command for individual peaks. 
-        - Provide the exact peak time ('time') and the negative dB value to reduce the peak ('depth_db').
-        - Example: {"action": "duck_volume", "track_id": 0, "time": 38.47, "depth_db": -2.9}
+        - Use ONLY to "fix clipping", "duck sudden peaks", or "remove plosives".
+        - Look at the 'severe_peaks' array in the analysis. The math is already done for you.
+        - For each peak in that array, generate a 'duck_volume' command using the provided 'time' and using 'suggested_reduction_db' as your 'depth_db'.
+        - Example: {"action": "duck_volume", "track_id": 0, "time": 38.47, "depth_db": -3.5}
 
         TOOL B: Vocal Riding & Balancing (ride_vocal_level)
-        - Use this if the user asks to "level the vocals", "balance the track", "make the vocal consistent", or "ride the volume".
-        - This triggers an advanced offline DSP algorithm that handles everything automatically. Do NOT generate individual nodes.
-        - You MUST provide the 'target_lufs' (default to -16.0 if not specified).
-        - DYNAMIC NOISE GATE (Crucial): To prevent boosting background noise, you MUST analyze the 'quiet_windows' array in the track's 'analysis' object.
-        - Find the average 'db' value of these quiet windows (this represents the room noise floor).
-        - Set the 'noise_floor_db' parameter to be 3 to 5 dB HIGHER (closer to 0) than that noise floor average. 
-        - Example: If 'quiet_windows' average around -29.0 dB, you must include "noise_floor_db": -25.0.
-        - Example payload: {"action": "ride_vocal_level", "track_id": 0, "target_lufs": -16.0, "noise_floor_db": -25.0}
-        - Optional parameters you can include: 'max_boost_db', 'max_cut_db', 'smoothness', 'analysis_window_ms'.
+        - Use to "level the vocals", "balance the track", or "ride the volume".
+        - Provide the 'target_lufs' (default -16.0 if unspecified).
+        - DYNAMIC NOISE GATE: You MUST use the exact 'calculated_noise_floor_db' provided in the context. Do NOT calculate the average yourself.
+        - Example payload: {"action": "ride_vocal_level", "track_id": 0, "target_lufs": -16.0, "noise_floor_db": -42.5}
         
         TOOL C: Mathematical Auto-Gain Staging (auto_gain_stage)
-        - Use this if the user asks to "gain stage", "normalize", or set a track to a specific LUFS.
-        - NEVER use 'set_gain' for this. Let the backend do the math.
-        - Provide the 'target_lufs' (Industry standard is usually -18.0 LUFS if not specified).
+        - Use to "gain stage", "normalize", or set a track to a specific LUFS.
+        - NEVER use 'set_gain' for this. Let the backend algorithm handle it.
+        - Analyze 'integrated_loudness_db' to determine if a change is needed. Provide the 'target_lufs' (Industry standard -18.0 LUFS if unspecified).
         - Example: {"action": "auto_gain_stage", "track_id": 0, "target_lufs": -18.0}`;
 
         try {
@@ -313,15 +316,33 @@ class AIAgent {
             console.log("🟢 RAW AI RESPONSE STRING:", cleanResponse);
             const data: AIBatchRequest = JSON.parse(cleanResponse);
 
+            // Determine resolved target track (Explicit UI selection OR Highest matched intent)
+            let resolvedTargetId = selectedTrackId;
+            if (resolvedTargetId === undefined) {
+                const deduced = activeTracks.find(t => t.analysis?._match_reasons?.length > 0);
+                if (deduced) resolvedTargetId = deduced.id;
+            }
+
             // --- NEW SAFETY & SORTING INTERCEPTOR ---
             if (data.commands && Array.isArray(data.commands)) {
                 let safeCommands = data.commands
                     .filter((cmd) => {
                         if (!ALLOWED_ACTIONS.has(cmd.action)) {
-                            console.warn(`🛑 Blocked illegal/hallucinated AI command: ${cmd.action}`);
+                            console.warn(`尅 Blocked illegal/hallucinated AI command: ${cmd.action}`);
                             return false;
                         }
                         return true;
+                    })
+                    .map((cmd) => {
+                        // 🚀 TRACK ID LOCK ENFORCER
+                        const transportActions = ['play', 'pause', 'record', 'rewind', 'seek', 'toggle_monitor', 'separate_stems'];
+                        if (!isGlobalRequest && !transportActions.includes(cmd.action) && resolvedTargetId !== undefined) {
+                            if (cmd.track_id !== undefined && cmd.track_id !== resolvedTargetId) {
+                                console.warn(`🚨 Intercepted hallucinated track_id: ${cmd.track_id}. Overriding to ${resolvedTargetId}`);
+                                cmd.track_id = resolvedTargetId; // Force correct ID
+                            }
+                        }
+                        return cmd;
                     })
                     .sort((a, b) => {
                         const priorityA = DSP_PRIORITY[a.action] || 99;

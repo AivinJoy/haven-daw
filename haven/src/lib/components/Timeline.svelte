@@ -291,6 +291,11 @@
     
         // Replace original with left, insert right after it
         track.clips.splice(clipIndex, 1, leftClip, rightClip);
+
+        // 🚀 NEW: Instantly renumber the frontend array so Svelte shows the correct numbers!
+        track.clips.forEach((c: any, i: number) => {
+            c.clipNumber = i + 1;
+        });
     
         // Force reactivity
         tracks = [...tracks];
@@ -371,6 +376,9 @@
       // Optimistic UI: extend left, remove right
       const merged = { ...left, duration: (left.duration ?? 0) + (right.duration ?? 0) };
       t.clips.splice(clipIndex, 2, merged);
+      t.clips.forEach((c: any, i: number) => {
+          c.clipNumber = i + 1;
+      });
       tracks = [...tracks];
         
       try {
@@ -401,6 +409,10 @@
         // 1. Optimistic UI Update
         if (tracks[trackIndex] && tracks[trackIndex].clips) {
             tracks[trackIndex].clips.splice(clipIndex, 1);
+            // 🚀 NEW: Instantly renumber
+            tracks[trackIndex].clips.forEach((c: any, i: number) => {
+                c.clipNumber = i + 1;
+            });
             tracks = [...tracks]; // Trigger Reactivity
         }
         

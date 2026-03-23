@@ -67,10 +67,11 @@ pub fn translate_action(action: AiAction) -> Result<Box<dyn Command>, Governance
             }))
         }
 
-        AiAction::UpdateEq { track_id, band_index, filter_type, freq, q, gain } => {
+        AiAction::UpdateEq { track_id, band_index, filter_type, freq, q, gain, is_active } => {
             let safe_freq = freq.clamp(20.0, 20_000.0);
             let safe_q = q.clamp(0.1, 10.0);
             let safe_gain = gain.clamp(-18.0, 18.0);
+            let active = is_active.unwrap_or(true); // <--- Handle the new field
 
             let mapped_filter = match filter_type {
                 SchemaEqFilterType::Peaking => CoreEqFilterType::Peaking,
@@ -87,7 +88,7 @@ pub fn translate_action(action: AiAction) -> Result<Box<dyn Command>, Governance
                 freq: safe_freq,
                 q: safe_q,
                 gain: safe_gain,
-                active: true,
+                active, // <--- Apply it here
             };
 
             Ok(Box::new(UpdateEq {
@@ -98,15 +99,18 @@ pub fn translate_action(action: AiAction) -> Result<Box<dyn Command>, Governance
             }))
         }
 
-        AiAction::UpdateCompressor { track_id, threshold_db, ratio, attack_ms, release_ms, makeup_gain_db } => {
+        AiAction::UpdateCompressor { track_id, is_active, threshold_db, ratio, attack_ms, release_ms, makeup_gain_db } => {
             let safe_thresh = threshold_db.clamp(-60.0, 0.0);
             let safe_ratio = ratio.clamp(1.0, 20.0);
             let safe_attack = attack_ms.clamp(0.1, 200.0);
             let safe_release = release_ms.clamp(10.0, 1000.0);
             let safe_makeup = makeup_gain_db.clamp(0.0, 24.0);
+            
+            // Respect AI's choice, default to true if missing
+            let active = is_active.unwrap_or(true); 
 
             let new_params = CompressorParams {
-                is_active: true,
+                is_active: active, // <-- Use parsed value
                 threshold_db: safe_thresh,
                 ratio: safe_ratio,
                 attack_ms: safe_attack,
@@ -115,7 +119,7 @@ pub fn translate_action(action: AiAction) -> Result<Box<dyn Command>, Governance
             };
 
             Ok(Box::new(UpdateCompressor {
-                track_id: TrackId(track_id as u32), // <--- Cast to u32
+                track_id: TrackId(track_id as u32),
                 old_params: new_params.clone(),
                 new_params,
             }))

@@ -89,6 +89,7 @@ pub enum AiAction {
         freq: f32,
         q: f32,
         gain: f32,
+        is_active: Option<bool>,
     },
     UpdateCompressor {
         track_id: usize,
@@ -97,6 +98,7 @@ pub enum AiAction {
         attack_ms: f32,
         release_ms: f32,
         makeup_gain_db: f32,
+        is_active: Option<bool>,
     },
     UpdateReverb { // <--- ADD THIS BLOCK
         track_id: usize,

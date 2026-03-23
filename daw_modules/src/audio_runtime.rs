@@ -320,7 +320,18 @@ impl AudioRuntime {
     pub fn undo(&self) {
         if let Ok(mut session) = self.session.lock() {
             if let Ok(success) = session.undo(&self.engine) {
-                if success { println!("Using Undo"); }
+                if success { 
+                    println!("Using Undo"); 
+                    // 🚀 FIX: Force renumbering on all tracks after undoing structural changes
+                    if let Ok(mut eng) = self.engine.lock() {
+                        for track in eng.tracks_mut().iter_mut() {
+                            track.renumber_clips();
+                        }
+                    }
+                    // Re-sync decoders
+                    let pos = self.position();
+                    self.seek(pos);
+                }
                 else { println!("Nothing to Undo"); }
             }
         }
@@ -329,7 +340,18 @@ impl AudioRuntime {
     pub fn redo(&self) {
         if let Ok(mut session) = self.session.lock() {
             if let Ok(success) = session.redo(&self.engine) {
-                if success { println!("Using Redo"); }
+                if success { 
+                    println!("Using Redo"); 
+                    // 🚀 FIX: Force renumbering on all tracks after redoing structural changes
+                    if let Ok(mut eng) = self.engine.lock() {
+                        for track in eng.tracks_mut().iter_mut() {
+                            track.renumber_clips();
+                        }
+                    }
+                    // Re-sync decoders
+                    let pos = self.position();
+                    self.seek(pos);
+                }
                 else { println!("Nothing to Redo"); }
             }
         }
@@ -440,6 +462,17 @@ impl AudioRuntime {
         if let Ok(mut session) = self.session.lock() {
             session.apply(&self.engine, cmd)?;
         }
+
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id == track_id) {
+                track.renumber_clips();
+            }
+        }
+        
+        // 🚀 FIX: Force the decoders to flush buffers and re-align with the new position
+        let pos = self.position();
+        self.seek(pos);
+        
         Ok(())
     }
 
@@ -451,12 +484,26 @@ impl AudioRuntime {
     
         let cmd = Box::new(SplitClip {
             track_id,
-            split_time: Duration::from_secs_f64(time),
+            split_time: std::time::Duration::from_secs_f64(time),
         });
     
         if let Ok(mut session) = self.session.lock() {
             session.apply(&self.engine, cmd)?;
         }
+
+        // 🚀 FIX: Force renumbering and trigger our new debug logs
+        if let Ok(mut eng) = self.engine.lock() {
+            // Match the exact inner u32 ID to guarantee we find the track
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id.0) {
+                println!("🔍 DEBUG: Split successful. Calling renumber_clips on Track {}...", track.id.0);
+                track.renumber_clips();
+            }
+        }
+
+        // Re-sync decoders
+        let pos = self.position();
+        self.seek(pos);
+
         Ok(())
     }
 
@@ -610,6 +657,17 @@ impl AudioRuntime {
         if let Ok(mut session) = self.session.lock() {
             session.apply(&self.engine, cmd)?;
         }
+
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id == track_id) {
+                track.renumber_clips();
+            }
+        }
+
+        // 🚀 FIX: Re-sync decoders
+        let pos = self.position();
+        self.seek(pos);
+
         Ok(())
     }
 
@@ -640,6 +698,17 @@ impl AudioRuntime {
         if let Ok(mut session) = self.session.lock() {
             session.apply(&self.engine, cmd)?;
         }
+
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id == track_id) {
+                track.renumber_clips();
+            }
+        }
+
+        // 🚀 FIX: Re-sync decoders
+        let pos = self.position();
+        self.seek(pos);
+
         Ok(())
     }
 
@@ -1053,7 +1122,7 @@ impl AudioRuntime {
                 },
                 AiAction::CreateTrack { count: _, track_id: _ } => { let _ = self.create_empty_track(); },
                 
-                AiAction::UpdateEq { track_id, band_index, filter_type, freq, q, gain } => {
+                AiAction::UpdateEq { track_id, band_index, filter_type, freq, q, gain, is_active } => {
                     if let Some(idx) = resolve(track_id) {
                         let mapped_filter = match filter_type {
                             SchemaEqFilterType::Peaking => crate::effects::equalizer::EqFilterType::Peaking,
@@ -1069,7 +1138,7 @@ impl AudioRuntime {
                             freq: freq.clamp(20.0, 20_000.0),
                             q: q.clamp(0.1, 10.0),
                             gain: gain.clamp(-18.0, 18.0),
-                            active: true,
+                            active: is_active.unwrap_or(true), // <--- Unpack and apply
                         };
                         
                         // FIX: Apply directly to engine to prevent UI race condition
@@ -1080,10 +1149,10 @@ impl AudioRuntime {
                         }
                     }
                 },
-                AiAction::UpdateCompressor { track_id, threshold_db, ratio, attack_ms, release_ms, makeup_gain_db } => {
+                AiAction::UpdateCompressor { track_id, threshold_db, ratio, attack_ms, release_ms, makeup_gain_db, is_active } => {
                     if let Some(idx) = resolve(track_id) {
                         let params = crate::effects::compressor::CompressorParams {
-                            is_active: true,
+                            is_active: is_active.unwrap_or(true), // <--- Unpack and apply
                             threshold_db: threshold_db.clamp(-60.0, 0.0),
                             ratio: ratio.clamp(1.0, 20.0),
                             attack_ms: attack_ms.clamp(0.1, 200.0),

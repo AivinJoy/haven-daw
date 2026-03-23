@@ -1,6 +1,7 @@
 <script lang="ts">
     import { Send, Bot, Loader2, Cpu, Square, X, Check } from 'lucide-svelte'; // <--- Added Loader2, Cpu
     import { aiAgent, type AIMessage } from '../managers/AIAgent';
+    import { ui } from '../stores/ui.svelte';
     
     // --- NEW IMPORTS ---
     import { onMount } from 'svelte';
@@ -14,6 +15,7 @@
             bpm: number;
             timeSignature: string;
             playheadTime: number;
+            activeTrackId?: number;
         };
     }
 
@@ -148,8 +150,22 @@
         isLoading = true;
 
         try {
-            // 2. FIXED: Pass globalState correctly as the 3rd argument
-            const response = await aiAgent.sendMessage(currentInput, tracks, globalState, historyToSend);
+            // 🚀 NEW: Check Effect Windows first, then fallback to the Selected/Armed track in the timeline!
+            const activeTrackId = ui.openEqTrackId 
+                               ?? ui.openCompressorTrackId 
+                               ?? ui.openReverbTrackId 
+                               ?? globalState.activeTrackId 
+                               ?? undefined;
+
+            // 2. FIXED: Pass globalState correctly, AND pass activeTrackId as the 5th argument
+            const response = await aiAgent.sendMessage(
+                currentInput, 
+                tracks, 
+                globalState, 
+                historyToSend, 
+                activeTrackId 
+            );
+            
             messages = [...messages, response];
         } catch (e) {
             console.error("🛑 Chatbot Exception:", e); // <--- Add this line!
