@@ -24,6 +24,7 @@ export interface AICommand {
     freq?: number;
     q?: number;
     gain?: number;
+    eq?: any[];
     // Compressor params
     threshold_db?: number;
     ratio?: number;
@@ -102,6 +103,18 @@ class AIAgent {
             content: m.content || " "
         }));
 
+        // Guarantee the AI sees newly imported tracks or stems instantly, 
+        // bypassing any UI reactivity delays.
+        let freshTracks = tracks;
+        try {
+            const projectState: any = await invoke('get_project_state');
+            freshTracks = projectState.tracks;
+            globalState.bpm = projectState.bpm;
+            globalState.playheadTime = await invoke('get_position');
+        } catch (e) {
+            console.warn("Failed to sync fresh engine state, falling back to UI state:", e);
+        }
+
         let isMonitoring = false;
         try {
             const recState = await invoke<RecordingState>('get_recording_status');
@@ -112,7 +125,7 @@ class AIAgent {
 
         // --- SMART CONTEXT FILTER ---
         // Only fetch heavy DSP analysis if the user is asking for mixing/mastering tasks
-        const mixingKeywords = ['master', 'mix', 'level', 'ride', 'duck', 'eq', 'compressor', 'loudness', 'balance', 'vocal', 'peak', 'plosive'];
+        const mixingKeywords = ['master', 'mix', 'level', 'ride', 'duck', 'eq', 'compressor', 'loudness', 'balance', 'vocal', 'peak', 'plosive', 'gain', 'automate', 'automation', 'stage', 'normalize', 'dynamics'];
         const needsAnalysis = mixingKeywords.some(kw => userInput.toLowerCase().includes(kw));
         
         let trackAnalysis: any[] = [];
@@ -169,7 +182,7 @@ class AIAgent {
                 monitoring_enabled: isMonitoring,
                 target_track_id: selectedTrackId
             },
-            tracks: tracks.map(t => {
+            tracks:freshTracks.map(t => {
                 const data = trackAnalysis.find(a => a.track_id === t.id);
                 const profile = data?.analysis; 
                 
@@ -233,6 +246,7 @@ class AIAgent {
                             
                             // Always include basic scalar numbers
                             integrated_loudness_db: profile.integrated_loudness_db,
+                            loudness_p10_db: profile.loudness_p10_db,
 
                             // FIX: If the prompt relates to mixing/mastering, send ALL required arrays
                             ...(needsAnalysis ? {
@@ -256,50 +270,6 @@ class AIAgent {
                 };
             })
         });
-
-        // 2. STRICT JSON SCHEMA DEFINITION & AUTOMATION RULES
-        context += `\n\nCRITICAL INSTRUCTIONS:
-        You are an elite Audio DSP Engineer. 
-        You MUST respond with a STRICT JSON payload matching the "1.0" API contract.
-        Do NOT wrap the JSON in markdown blocks. Output only raw, parsable JSON.
-        
-        🚨 1. TRACK LOCKING RULE (HIGHEST PRIORITY): 
-        - Look at 'project.target_track_id'. If provided, use this EXACT 'track_id' for all DSP commands unless the user explicitly names a different track. Do NOT hallucinate track IDs.
-        
-        🚨 2. EFFECT ACTIVATION RULE:
-        - When applying 'update_compressor', 'update_eq', or 'update_reverb', you MUST include "is_active": true in the payload. Otherwise, the effect remains bypassed.
-        
-        🚨 3. ANALYSIS USAGE RULE:
-        - Do not guess dB values. Use the pre-calculated 'calculated_noise_floor_db' and the 'severe_peaks' array provided in the context.
-        
-        GENERAL RULES:
-        1. 'depth_db' and 'target_lufs' MUST be in standard audio decibels (dB) or LUFS. 
-        2. GAIN EXCEPTION: 'set_gain' and 'set_pan' strictly use LINEAR values. For 'set_gain', 0.0 is silence, 1.0 is unity gain, 2.0 is +6dB. DO NOT send decibels for set_gain.
-        3. Allowed actions: play, pause, record, rewind, seek, set_bpm, set_gain, set_pan, toggle_mute, toggle_solo, move_clip, split_clip, merge_clips, delete_clip, delete_track, create_track, update_eq, update_compressor, update_reverb, clear_volume_automation, duck_volume, ride_vocal_level, auto_gain_stage.
-        4. MERGE CLIPS: You MUST ONLY provide the 'clip_number' of the left-most clip. Do NOT invent a 'next_clip_number'. Example: {"action": "merge_clips", "track_id": 0, "clip_number": 2}
-        5. MANUAL GAIN STAGING: If you are NOT using 'auto_gain_stage', but are applying heavy compression or EQ boosts, ALWAYS prepend a "set_gain" command with a linear value (e.g., 0.5) for headroom.
-        6. VOCAL CHAINS: If asked to process a vocal, include 'update_reverb' to provide spatial depth, unless explicitly told to keep it dry.
-
-        AUTOMATION & VOLUME GUIDELINES:
-        Choose the correct tool based on the user's request:
-
-        TOOL A: Peak Protection (duck_volume)
-        - Use ONLY to "fix clipping", "duck sudden peaks", or "remove plosives".
-        - Look at the 'severe_peaks' array in the analysis. The math is already done for you.
-        - For each peak in that array, generate a 'duck_volume' command using the provided 'time' and using 'suggested_reduction_db' as your 'depth_db'.
-        - Example: {"action": "duck_volume", "track_id": 0, "time": 38.47, "depth_db": -3.5}
-
-        TOOL B: Vocal Riding & Balancing (ride_vocal_level)
-        - Use to "level the vocals", "balance the track", or "ride the volume".
-        - Provide the 'target_lufs' (default -16.0 if unspecified).
-        - DYNAMIC NOISE GATE: You MUST use the exact 'calculated_noise_floor_db' provided in the context. Do NOT calculate the average yourself.
-        - Example payload: {"action": "ride_vocal_level", "track_id": 0, "target_lufs": -16.0, "noise_floor_db": -42.5}
-        
-        TOOL C: Mathematical Auto-Gain Staging (auto_gain_stage)
-        - Use to "gain stage", "normalize", or set a track to a specific LUFS.
-        - NEVER use 'set_gain' for this. Let the backend algorithm handle it.
-        - Analyze 'integrated_loudness_db' to determine if a change is needed. Provide the 'target_lufs' (Industry standard -18.0 LUFS if unspecified).
-        - Example: {"action": "auto_gain_stage", "track_id": 0, "target_lufs": -18.0}`;
 
         try {
             console.log("📊 1. AI Context (Look at the peaks & windows here):", context);
@@ -342,6 +312,40 @@ class AIAgent {
                                 cmd.track_id = resolvedTargetId; // Force correct ID
                             }
                         }
+
+                        // 🛠️ HALLUCINATION SANITIZER & FALLBACKS
+                        if (cmd.action === 'update_eq') {
+                            // 1. Flatten if the AI nested it
+                            if (cmd.eq && Array.isArray(cmd.eq)) {
+                                console.warn("🔧 Sanitizing hallucinated nested EQ array from AI...");
+                                const eqParams = cmd.eq[0] || {};
+                                cmd.band_index = eqParams.band_index ?? cmd.band_index;
+                                cmd.filter_type = eqParams.filter_type ?? cmd.filter_type;
+                                cmd.freq = eqParams.freq ?? cmd.freq;
+                                cmd.q = eqParams.q ?? cmd.q;
+                                cmd.gain = eqParams.gain ?? cmd.gain;
+                                cmd.is_active = eqParams.active ?? eqParams.is_active ?? cmd.is_active;
+                                delete cmd.eq; 
+                            }
+                            
+                            // 2. Guarantee Required Fields for Rust
+                            cmd.band_index = cmd.band_index ?? 0;
+                            cmd.filter_type = cmd.filter_type ?? "Peaking";
+                            cmd.freq = cmd.freq ?? 1000.0;
+                            cmd.q = cmd.q ?? 1.0;
+                            cmd.gain = cmd.gain ?? 0.0;
+                            cmd.is_active = cmd.is_active ?? true;
+                        } 
+                        else if (cmd.action === 'update_compressor') {
+                            // Guarantee Required Fields for Rust Compressor
+                            cmd.threshold_db = cmd.threshold_db ?? -18.0;
+                            cmd.ratio = cmd.ratio ?? 4.0;
+                            cmd.attack_ms = cmd.attack_ms ?? 10.0;
+                            cmd.release_ms = cmd.release_ms ?? 100.0;
+                            cmd.makeup_gain_db = cmd.makeup_gain_db ?? 0.0;
+                            cmd.is_active = cmd.is_active ?? true;
+                        }
+
                         return cmd;
                     })
                     .sort((a, b) => {
@@ -373,7 +377,7 @@ class AIAgent {
             if (data.version === "1.0" && data.commands && data.commands.length > 0) {
                 
                 // We separate UI Transport commands from DSP commands
-                const transportCommands = ['play', 'pause', 'record', 'rewind', 'seek', 'toggle_monitor', 'separate_stems'];
+                const transportCommands = ['play', 'pause', 'record', 'rewind', 'seek', 'toggle_monitor', 'separate_stems', 'undo', 'redo', 'create_track', 'set_bpm'];
                 const dspCommands = data.commands.filter(c => !transportCommands.includes(c.action));
                 const uiCommands = data.commands.filter(c => transportCommands.includes(c.action));
 
