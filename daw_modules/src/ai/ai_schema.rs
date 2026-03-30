@@ -27,6 +27,10 @@ pub enum AiAction {
         track_id: usize,
         value: f32, // Must be provided, must be a float. No strings.
     },
+    AutoGainStage {                // <--- NEW: Mathematical Gain Staging
+        track_id: usize,
+        target_lufs: f32,
+    },
     SetMasterGain {
         value: f32,
     },
@@ -85,6 +89,7 @@ pub enum AiAction {
         freq: f32,
         q: f32,
         gain: f32,
+        is_active: Option<bool>,
     },
     UpdateCompressor {
         track_id: usize,
@@ -93,6 +98,40 @@ pub enum AiAction {
         attack_ms: f32,
         release_ms: f32,
         makeup_gain_db: f32,
+        is_active: Option<bool>,
+    },
+    UpdateReverb { // <--- ADD THIS BLOCK
+        track_id: usize,
+        room_size: Option<f32>,
+        damping: Option<f32>,
+        pre_delay_ms: Option<f32>,
+        mix: Option<f32>,
+        width: Option<f32>,
+        low_cut_hz: Option<f32>,
+        high_cut_hz: Option<f32>,
+        is_active: Option<bool>,
+    },
+    ClearVolumeAutomation {
+        track_id: usize,
+    },
+    AddVolumeAutomation {
+        track_id: usize,
+        time: f64,  // Exact time in seconds
+        value: f32, // STRICTLY IN dB (-inf to +12.0)
+    },
+    DuckVolume {
+        track_id: usize,
+        time: f64,
+        depth_db: f32,
+    },
+    RideVocalLevel {               // <--- NEW ACTION ADDED
+        track_id: usize,
+        target_lufs: f32,
+        max_boost_db: Option<f32>, 
+        max_cut_db: Option<f32>,   
+        smoothness: Option<f32>,   
+        analysis_window_ms: Option<u32>, // Brilliant addition
+        noise_floor_db: Option<f32>,
     },
     Undo,
     Redo,
@@ -108,6 +147,8 @@ pub enum EqFilterType {
     HighShelf,
     HighPass,
     LowPass,
+    Notch,
+    BandPass,
 }
 
 // Custom Error Type for Schema Validation

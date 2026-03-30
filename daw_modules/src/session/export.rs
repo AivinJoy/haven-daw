@@ -9,6 +9,11 @@ use symphonia::core::formats::FormatReader;
 use symphonia::core::codecs::Decoder;
 use rubato::Resampler; 
 
+use crate::effects::equalizer::{TrackEq, EqParams};
+use crate::effects::compressor::{CompressorNode, CompressorParams};
+use crate::effects::reverb::{ReverbNode, ReverbParams};
+use crate::engine::automation::AutomationCurve;
+
 pub struct ExportVoice {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn Decoder>,
@@ -24,15 +29,36 @@ pub struct ExportVoice {
     
     start_frame: usize,
     frames_processed: usize,
+
+    // --- NEW FIELDS FOR DRIFT FIX ---
+    frames_played: usize,
+    max_frames_to_play: usize,
+    // --------------------------------
     
     gain: f32,
     pan: f32,
     muted: bool,
+
+    track_eq: TrackEq,
+    track_compressor: CompressorNode,
+    track_reverb: ReverbNode,
+    volume_automation: AutomationCurve<f32>,
 }
 
 impl ExportVoice {
     // FIX: Added start_time to arguments
-    pub fn new(path: &str, target_sample_rate: u32, start_time: f64) -> Result<Self> {
+    // FIX: Added DSP parameters to signature
+    pub fn new(
+        path: &str, 
+        target_sample_rate: u32, 
+        start_time: f64, 
+        offset: f64, 
+        duration: f64,
+        eq_state: Option<Vec<EqParams>>,
+        comp_state: Option<CompressorParams>,
+        rev_state: Option<ReverbParams>,
+        automation: AutomationCurve<f32>
+    ) -> Result<Self> {
         // FIX: Reverted to standard open_and_probe (returns 2 items, not 3)
         let (format, track_id) = pipe::open_and_probe(path)?;
         
@@ -50,8 +76,21 @@ impl ExportVoice {
         };
 
         let start_frame = (start_time * target_sample_rate as f64).round() as usize;
+        let frames_to_skip = (offset * target_sample_rate as f64).round() as usize;
+        let max_frames_to_play = (duration * target_sample_rate as f64).round() as usize;
 
-        Ok(Self {
+        // --- ADDED: Setup DSP Nodes ---
+        let mut track_eq = TrackEq::new(target_sample_rate, 2);
+        if let Some(eq) = eq_state { track_eq.set_state(eq); }
+
+        let track_compressor = CompressorNode::new(target_sample_rate as f32);
+        if let Some(comp) = comp_state { track_compressor.set_params(comp); }
+
+        let track_reverb = ReverbNode::new(target_sample_rate as f32);
+        if let Some(rev) = rev_state { track_reverb.set_params(rev); }
+        // ------------------------------
+
+        let mut voice = Self {
             format,
             decoder,
             track_id,
@@ -65,8 +104,28 @@ impl ExportVoice {
             pan: 0.0,
             muted: false,
             start_frame,
-            frames_processed: 0, // FIX: Comma instead of semicolon
-        })
+            frames_processed: 0, 
+            frames_played: 0,
+            max_frames_to_play,
+            // --- ADDED FIELDS ---
+            track_eq,
+            track_compressor,
+            track_reverb,
+            volume_automation: automation,
+        };
+
+        // Pre-roll: Decode and discard the trimmed 'offset' audio silently
+        let mut skipped = 0;
+        while skipped < frames_to_skip {
+            let chunk = (frames_to_skip - skipped).min(4096);
+            let _ = voice.prepare_samples(chunk);
+            let available = voice.output_buffer.len() / 2;
+            let actual = chunk.min(available);
+            if actual == 0 { break; } // Hit EOF early
+            voice.output_buffer.drain(0..(actual * 2));
+            skipped += actual;
+        }
+        Ok(voice)
     }
 
     fn prepare_samples(&mut self, frames_needed: usize) -> Result<bool> {
@@ -182,47 +241,86 @@ impl ExportVoice {
         if self.frames_processed < self.start_frame {
             let silence_needed = self.start_frame - self.frames_processed;
             if silence_needed >= frames {
-                self.frames_processed += frames;
+                self.frames_processed += frames; // Advance block
                 return Ok(());
             } else {
                 buf_offset = silence_needed;
-                self.frames_processed += silence_needed;
             }
         }
 
-        let audio_frames_needed = frames - buf_offset;
-        self.prepare_samples(audio_frames_needed)?;
+        // --- ENFORCE CLIP DURATION BOUNDARY ---
+        let frames_remaining = self.max_frames_to_play.saturating_sub(self.frames_played);
+        let audio_frames_requested = (frames - buf_offset).min(frames_remaining);
 
-        let samples_available = self.output_buffer.len() / 2; 
-        let frames_to_mix = audio_frames_needed.min(samples_available);
+        if audio_frames_requested > 0 {
+            self.prepare_samples(audio_frames_requested)?;
+            
+            let samples_available = self.output_buffer.len() / 2; 
+            let frames_to_mix = audio_frames_requested.min(samples_available);
 
-        let pan = self.pan.clamp(-1.0, 1.0);
-        let (pan_l, pan_r) = if self.pan != 0.0 {
-            let angle = (pan + 1.0) * 0.25 * std::f32::consts::PI;
-            (angle.cos(), angle.sin())
-        } else {
-            (1.0, 1.0)
-        };
+            if frames_to_mix > 0 {
+                // 1. Extract audio chunk
+                let mut chunk = vec![0.0f32; frames_to_mix * 2];
+                chunk.copy_from_slice(&self.output_buffer[0..(frames_to_mix * 2)]);
 
-        for i in 0..frames_to_mix {
-            let out_idx = (buf_offset + i) * 2;
-            let in_idx = i * 2;
-            let l = self.output_buffer[in_idx] * self.gain * pan_l;
-            let r = self.output_buffer[in_idx+1] * self.gain * pan_r;
-            out_buf[out_idx] += l;
-            out_buf[out_idx+1] += r;
+                // 2. Process DSP (Pre-Fader exactly like track.rs)
+                self.track_eq.process_buffer(&mut chunk, 2);
+                self.track_compressor.process(&mut chunk);
+                for i in (0..chunk.len()).step_by(2) {
+                    let (l, r) = self.track_reverb.process(chunk[i], chunk[i+1]);
+                    chunk[i] = l;
+                    chunk[i+1] = r;
+                }
+
+                // 3. Automation & Gain 
+                let start_sample = (self.frames_processed + buf_offset) as u64; // accurate global timeline sample
+                let end_sample = start_sample + frames_to_mix as u64;
+                let start_gain_db = self.volume_automation.get_value_at_time(start_sample, 0.0);
+                let end_gain_db = self.volume_automation.get_value_at_time(end_sample, 0.0);
+
+                let start_gain_linear = self.gain * 10.0_f32.powf(start_gain_db / 20.0);
+                let end_gain_linear = self.gain * 10.0_f32.powf(end_gain_db / 20.0);
+                let gain_step = if frames_to_mix > 1 {
+                    (end_gain_linear - start_gain_linear) / (frames_to_mix as f32 - 1.0)
+                } else { 0.0 };
+
+                let mut current_gain = start_gain_linear;
+                let pan = self.pan.clamp(-1.0, 1.0);
+                let (pan_l, pan_r) = if self.pan != 0.0 {
+                    let angle = (pan + 1.0) * 0.25 * std::f32::consts::PI;
+                    (angle.cos(), angle.sin())
+                } else {
+                    (1.0, 1.0)
+                };
+
+                // 4. Apply Gain/Pan and Mix into Master
+                for i in 0..frames_to_mix {
+                    let out_idx = (buf_offset + i) * 2;
+                    let in_idx = i * 2;
+                    
+                    let l = chunk[in_idx] * current_gain * pan_l;
+                    let r = chunk[in_idx+1] * current_gain * pan_r;
+                    
+                    out_buf[out_idx] += l;
+                    out_buf[out_idx+1] += r;
+                    
+                    current_gain += gain_step;
+                }
+
+                // 5. Drain processed samples
+                self.output_buffer.drain(0..(frames_to_mix * 2));
+                self.frames_played += frames_to_mix;
+            }
         }
 
-        if frames_to_mix > 0 {
-             self.output_buffer.drain(0..(frames_to_mix * 2));
-        }
-        self.frames_processed += audio_frames_needed;
+        // Always advance the timeline cursor by the exact block size to stay in perfect sync
+        self.frames_processed += frames;
         Ok(())
     }
     
     pub fn is_finished(&self) -> bool {
-        let started = self.frames_processed >= self.start_frame;
-        started && self.finished && self.output_buffer.is_empty() && self.resampler_input_buffer.is_empty()
+        self.frames_played >= self.max_frames_to_play || 
+        (self.finished && self.output_buffer.is_empty() && self.resampler_input_buffer.is_empty())
     }
 }
 
@@ -237,14 +335,34 @@ pub fn export_project_to_wav(manifest: &ProjectManifest, output_path: &str) -> R
     };
     let mut writer = WavWriter::create(output_path, spec)?;
     let mut voices_with_solo: Vec<(ExportVoice, bool)> = Vec::new();
+    
+    // --- THE 10 MINUTE BUG FIX ---
+    // Dynamically calculate the actual end time of the project
+    let mut max_end_time = 0.0;
+    
     for t_state in &manifest.tracks {
         for clip in &t_state.clips {
-            if let Ok(mut v) = ExportVoice::new(&clip.path, sample_rate, clip.start_time) {
+            // Find the furthest point any clip reaches on the timeline
+            let clip_end = clip.start_time + clip.duration;
+            if clip_end > max_end_time {
+                max_end_time = clip_end;
+            }
+
+            // FIX: Pass offset and duration to prevent drift!
+            if let Ok(mut v) = ExportVoice::new(
+                &clip.path, 
+                sample_rate, 
+                clip.start_time, 
+                clip.offset, 
+                clip.duration,
+                t_state.eq.clone(),
+                t_state.compressor.clone(),
+                t_state.reverb.clone(),
+                t_state.volume_automation.clone()
+            ) {
                 v.gain = t_state.gain;
                 v.pan = t_state.pan;
                 v.muted = t_state.muted; 
-                
-                // Store voice + track solo state
                 voices_with_solo.push((v, t_state.solo));
             } else {
                  eprintln!("⚠️ Failed to load clip {}", clip.path);
@@ -252,15 +370,16 @@ pub fn export_project_to_wav(manifest: &ProjectManifest, output_path: &str) -> R
         }
     }
 
-    // Solo Logic
+    // Add a 1.0 second tail so the audio doesn't abruptly cut off (good for reverbs)
+    let max_frames = ((max_end_time + 1.0) * sample_rate as f64).round() as usize;
+
     let any_solo = manifest.tracks.iter().any(|t| t.solo);
     if any_solo {
         for (v, is_track_solo) in &mut voices_with_solo {
-            // If global solo is active, mute anything that isn't soloed
             if !*is_track_solo {
                 v.muted = true;
             } else {
-                v.muted = false; // Unmute soloed tracks (overrides mute button)
+                v.muted = false; 
             }
         }
     }
@@ -268,12 +387,13 @@ pub fn export_project_to_wav(manifest: &ProjectManifest, output_path: &str) -> R
     let block_size = 1024;
     let mut mix_buffer = vec![0.0; block_size * 2]; 
     let mut total_frames = 0;
-    let max_frames = 44100 * 600; 
 
     loop {
-        if voices_with_solo.iter().all(|(v, _)| v.is_finished()) || total_frames > max_frames { 
+        // Break when all voices end OR when we hit the exact calculated project length
+        if voices_with_solo.iter().all(|(v, _)| v.is_finished()) || total_frames >= max_frames { 
             break; 
         }
+        
         mix_buffer.fill(0.0);
         for (v, _) in &mut voices_with_solo { 
             v.add_to_mix(&mut mix_buffer, block_size)?; 
@@ -291,6 +411,8 @@ pub fn export_project_to_wav(manifest: &ProjectManifest, output_path: &str) -> R
         }
         total_frames += block_size;
     }
+    
     writer.finalize()?;
+    println!("✅ Export Complete! Total Length: {:.2}s", total_frames as f64 / sample_rate as f64);
     Ok(())
 }

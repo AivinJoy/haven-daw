@@ -14,6 +14,7 @@
     import { recordingManager } from '$lib/managers/RecordingManager';
     import EqWindow from "$lib/components/EqWindow.svelte";
     import CompressorWindow from "$lib/components/CompressorWindow.svelte";
+    import ReverbWindow from "$lib/components/ReverbWindow.svelte";
     import AIChatbot from '$lib/components/AIChatbot.svelte';
 
     // --- STATE ---
@@ -25,6 +26,8 @@
     let eqTrackId = $state(0);
     let showCompressorWindow = $state(false); // <--- ADD THIS
     let compressorTrackId = $state(0);
+    let showReverbWindow = $state(false);
+    let reverbTrackId = $state(0);
     
     // --- GLOBAL BPM STATE ---
     let bpm = $state(120); 
@@ -57,6 +60,8 @@
         waveform: { mins: number[], maxs: number[], duration: number, binsPerSecond: number };
         color: string;
     };
+
+    type AutomationNode = { time: number; value: number; };
     // --- TYPE DEFINITION (UPDATED) ---
     type Track = {
       id: number;
@@ -75,6 +80,7 @@
       savePath?: string;
       source: 'mic' | 'media';
       monitor: boolean;
+      volume_automation?: AutomationNode[];
     };
 
     // --- TRACKS STATE ---
@@ -288,6 +294,12 @@
         console.log("🔥 OPEN COMPRESSOR CLICKED FOR TRACK:", event.detail);
         compressorTrackId = event.detail;
         showCompressorWindow = true;
+    }
+
+    function handleOpenReverb(event: CustomEvent<number>) {
+        console.log("🌊 OPEN REVERB CLICKED FOR TRACK:", event.detail);
+        reverbTrackId = event.detail;
+        showReverbWindow = true;
     }
 
     // --- NEW HELPER: Exclusive Arming ---
@@ -757,6 +769,7 @@
                 on:delete={handleDeleteTrack}
                 on:openEq={handleOpenEq}
                 on:openCompressor={handleOpenCompressor}
+                on:openReverb={handleOpenReverb}
             />
 
             <Timeline 
@@ -776,7 +789,8 @@
             globalState={{ 
                 bpm: bpm, 
                 timeSignature: `${timeSignatureNumerator}/4`, 
-                playheadTime: currentTime 
+                playheadTime: currentTime,
+                activeTrackId: tracks.find(t => t.isRecording)?.id 
             }} 
         />
 
@@ -793,5 +807,10 @@
             onClose={() => showCompressorWindow = false} 
         />
     {/if}
-
+    {#if showReverbWindow}
+        <ReverbWindow 
+            trackId={reverbTrackId} 
+            onClose={() => showReverbWindow = false} 
+        />
+    {/if}
 </main>

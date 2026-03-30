@@ -4,6 +4,7 @@ pub mod track;
 pub mod mixer;
 pub mod time;
 pub mod metering;
+pub mod automation;
 
 pub use track::{Track, TrackId, TrackState};
 pub use mixer::Mixer;

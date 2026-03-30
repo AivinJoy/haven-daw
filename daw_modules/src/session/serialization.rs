@@ -3,8 +3,10 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use anyhow::Result;
 
+use crate::engine::automation::AutomationCurve;
 use crate::effects::compressor::CompressorParams;
 use crate::effects::equalizer::EqParams;
+use crate::effects::reverb::ReverbParams;
 
 // Represents a single audio clip within a track
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -24,10 +26,18 @@ pub struct TrackState {
     pub muted: bool,
     pub solo: bool,
     pub clips: Vec<ClipState>,
+    // --- NEW: Persist Automation ---
+    #[serde(default = "default_automation")]
+    pub volume_automation: AutomationCurve<f32>,
     #[serde(default)]
     pub compressor: Option<CompressorParams>,
     #[serde(default)]
     pub eq: Option<Vec<EqParams>>,
+    pub reverb: Option<ReverbParams>,
+}
+
+fn default_automation() -> AutomationCurve<f32> {
+    AutomationCurve::new()
 }
 
 #[derive(Serialize, Deserialize)]

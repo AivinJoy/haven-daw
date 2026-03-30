@@ -1,9 +1,10 @@
 <!-- haven\src\lib\components\TrackList.svelte -->
 <script lang="ts">
-  import { Plus } from 'lucide-svelte';
+  import { Plus, Activity } from 'lucide-svelte';
   import TrackControl from './TrackControl.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import { createEventDispatcher } from 'svelte';
+  import { ui } from '$lib/stores/ui.svelte';
   
   const dispatch = createEventDispatcher<{
     requestAdd: null;        // No payload
@@ -12,6 +13,7 @@
     delete: number;
     openEq: number;
     openCompressor: number;
+    openReverb: number;
   }>();
 
   // Receive tracks prop (bindable if you want the list itself to change, but usually internal props bind)
@@ -39,11 +41,11 @@
   let menuPos = $state({ x: 0, y: 0 });
   let activeTrackId = $state(-1);
 
-  function handleTrackMenu(e: MouseEvent, index: number) {
+  function handleTrackMenu(e: MouseEvent, id: number) {
       e.stopPropagation(); // Prevent track selection
       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
       menuPos = { x: e.clientX, y: e.clientY };
-      activeTrackId = index;
+      activeTrackId = id; // ✅ FIX: Now stores the true unique Track ID!
       showMenu = true;
   }
 
@@ -98,19 +100,32 @@
                     name={track.name}
                     color={track.color}
               
-                    bind:gain={tracks[i].gain}
-                    bind:pan={tracks[i].pan}
-                    bind:muted={tracks[i].muted}
-                    bind:solo={tracks[i].solo}
+                    bind:gain={track.gain}
+                    bind:pan={track.pan}
+                    bind:muted={track.muted}
+                    bind:solo={track.solo}
                     isRecording={track.isRecording}
                     source={track.source}
               
                     monitor={track.monitor}
                     onmonitor={() => dispatch('toggleMonitor', track.id)}
-                    onmenu={(e: any) => handleTrackMenu(e, i)}
+                    onmenu={(e: any) => handleTrackMenu(e, track.id)} />
                 />
             </div>
         {/each}
+    </div>
+    <div class="p-3 border-t border-white/5 bg-[#0a0a0f]/90 shrink-0">
+        <button 
+            onclick={() => ui.toggleAutomation()}
+            class={`w-full h-8 rounded-lg flex items-center justify-center gap-2 text-[10px] font-bold uppercase tracking-wider transition-all border ${
+                ui.showAutomation 
+                ? 'bg-[#00FFCC]/10 border-[#00FFCC]/50 text-[#00FFCC] shadow-[0_0_10px_rgba(0,255,204,0.2)]' 
+                : 'bg-white/5 border-transparent text-white/40 hover:bg-white/10 hover:text-white/80'
+            }`}
+        >
+            <Activity size={14} />
+            <span>Automation (A)</span>
+        </button>
     </div>
 </div>
 {#if showMenu}
@@ -130,6 +145,13 @@
                 label: "Open Compressor", // <--- ADD THIS BLOCK
                 action: () => {
                     dispatch('openCompressor', activeTrackId);
+                    showMenu = false;
+                }
+            },
+            { 
+                label: "Open Reverb", // <--- ADD THIS BLOCK
+                action: () => {
+                    dispatch('openReverb', activeTrackId);
                     showMenu = false;
                 }
             },

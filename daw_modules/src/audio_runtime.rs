@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, SyncSender};
 use std::sync::atomic::{Ordering};
 use std::time::Duration;
 
-use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 
 use crate::audio::setup_output_device;
@@ -15,6 +15,7 @@ use crate::engine::time::GridLine;
 use crate::ai::ai_schema::{AiAction, EqFilterType as SchemaEqFilterType};
 use crate::effects::equalizer::EqParams; // <--- Import this
 use crate::effects::compressor::CompressorParams;
+use crate::effects::reverb::ReverbParams;
 use crate::analyzer::AnalysisProfile;
 
 
@@ -35,6 +36,7 @@ pub enum EngineCommand {
     SetTrackPan(usize, f32),
     UpdateCompressor(usize, CompressorParams),
     UpdateEq(usize, usize, EqParams), // <--- NEW: Lock-Free EQ
+    SetEffectParam(usize, String, String, f32),
     SetMonitor(crate::recorder::monitor::Monitor), // <--- NEW
     ClearMonitor, // <--- NEW
 }
@@ -58,10 +60,12 @@ pub struct AudioRuntime {
     session: Mutex<Session>,
     stream: Option<Stream>, // Changed to Option to allow hot-swapping
     command_tx: Mutex<SyncSender<EngineCommand>>, // Wrapped in Mutex to allow channel recreation
+    pub target_output_device: Option<String>,
     // --- ADDED: A safe map of Track ID -> Lock-Free Atomics ---
     pub meter_registry: Arc<Mutex<std::collections::HashMap<u32, std::sync::Arc<crate::engine::metering::TrackMeters>>>>,
     pub master_meter: Arc<crate::engine::metering::TrackMeters>, // <--- CHANGED TYPE
     pub recorder: Arc<Mutex<Option<crate::recorder::Recorder>>>, // <--- NEW
+    pub decode_cache: Arc<Mutex<std::collections::HashMap<String, (Arc<Vec<f32>>, u32, usize)>>>,
 }
 
 pub struct TrackSnapshot {
@@ -90,6 +94,8 @@ pub struct FrontendTrackInfo {
     pub clips: Vec<FrontendClipInfo>,
     pub compressor: Option<CompressorParams>,
     pub eq: Option<Vec<EqParams>>,
+    pub reverb: Option<ReverbParams>,
+    pub volume_automation: Vec<crate::engine::automation::AutomationNode<f32>>,
 }
 
 pub struct EngineSnapshot {
@@ -121,6 +127,7 @@ impl AudioRuntime {
         let recorder = Arc::new(Mutex::new(None::<crate::recorder::Recorder>));
         let master_meter = engine.lock().unwrap().master_meter.clone(); 
         let meter_registry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let decode_cache = Arc::new(Mutex::new(std::collections::HashMap::new())); // <--- INIT CACHE
 
         let mut runtime = Self {
             engine,
@@ -128,9 +135,11 @@ impl AudioRuntime {
             session,
             stream: None,
             command_tx: Mutex::new(command_tx), 
+            target_output_device: None,
             meter_registry,
             master_meter,
             recorder,
+            decode_cache,
         };
 
         if let Err(e) = runtime.build_and_start_stream(command_rx) {
@@ -138,6 +147,12 @@ impl AudioRuntime {
         }
 
         Ok(runtime)
+    }
+
+    pub fn set_output_device(&mut self, device_name: String) -> anyhow::Result<()> {
+        println!("🔄 Switching Audio Output to: {}", device_name);
+        self.target_output_device = Some(device_name);
+        self.reload_device() // Re-use the reload logic to safely swap the stream
     }
 
     pub fn reload_device(&mut self) -> anyhow::Result<()> {
@@ -155,9 +170,25 @@ impl AudioRuntime {
     }
 
     fn build_and_start_stream(&mut self, command_rx: mpsc::Receiver<EngineCommand>) -> anyhow::Result<()> {
-        let output = setup_output_device()?;
-        let sample_rate = output.output_sample_rate;
-        let device_channels = output.output_channels;
+        // --- NEW DEVICE SELECTION LOGIC ---
+        let (device, config, sample_rate, device_channels) = if let Some(ref name) = self.target_output_device {
+            let host = cpal::default_host();
+            let dev = host.output_devices()?
+                .find(|d| d.name().unwrap_or_default() == *name)
+                .ok_or_else(|| anyhow::anyhow!("Target output device not found"))?;
+            
+            let conf = dev.default_output_config()?;
+            let sr = conf.sample_rate().0;
+            let ch = conf.channels();
+            
+            // Cast `ch` to `usize` to match the fallback branch
+            (dev, conf.into(), sr, ch as usize) 
+        } else {
+            // Fallback to the original default setup if no specific device is targeted
+            let output = setup_output_device()?;
+            (output.device, output.config, output.output_sample_rate, output.output_channels)
+        };
+        // -----------------------------------
 
         if let Ok(mut eng) = self.engine.lock() {
             eng.sample_rate = sample_rate;
@@ -165,8 +196,9 @@ impl AudioRuntime {
 
         println!("🔊 AudioRuntime: Device running at {} Hz with {} channels", sample_rate, device_channels);
 
-        let device = output.device;
-        let config = output.config;
+        // NOTE: `let device = ...` and `let config = ...` were removed from here 
+        // because we extracted them directly in the if/else block above.
+
         let engine_cb = self.engine.clone();
         let gain_cb = self.master_gain.clone();
 
@@ -217,6 +249,15 @@ impl AudioRuntime {
                             EngineCommand::UpdateCompressor(idx, params) => {
                                 if let Some(t) = eng.tracks_mut().get_mut(idx) {
                                     t.track_compressor.set_params(params);
+                                }
+                            }
+                            EngineCommand::SetEffectParam(idx, effect, param, value) => {
+                                if let Some(t) = eng.tracks_mut().get_mut(idx) {
+                                    match effect.as_str() {
+                                        "reverb" => t.track_reverb.set_param(&param, value),
+                                        // "compressor" => t.track_compressor.set_param(&param, value), // Future proofing
+                                        _ => {}
+                                    }
                                 }
                             }
                             EngineCommand::ToggleSolo(idx) => {
@@ -279,7 +320,18 @@ impl AudioRuntime {
     pub fn undo(&self) {
         if let Ok(mut session) = self.session.lock() {
             if let Ok(success) = session.undo(&self.engine) {
-                if success { println!("Using Undo"); }
+                if success { 
+                    println!("Using Undo"); 
+                    // 🚀 FIX: Force renumbering on all tracks after undoing structural changes
+                    if let Ok(mut eng) = self.engine.lock() {
+                        for track in eng.tracks_mut().iter_mut() {
+                            track.renumber_clips();
+                        }
+                    }
+                    // Re-sync decoders
+                    let pos = self.position();
+                    self.seek(pos);
+                }
                 else { println!("Nothing to Undo"); }
             }
         }
@@ -288,7 +340,18 @@ impl AudioRuntime {
     pub fn redo(&self) {
         if let Ok(mut session) = self.session.lock() {
             if let Ok(success) = session.redo(&self.engine) {
-                if success { println!("Using Redo"); }
+                if success { 
+                    println!("Using Redo"); 
+                    // 🚀 FIX: Force renumbering on all tracks after redoing structural changes
+                    if let Ok(mut eng) = self.engine.lock() {
+                        for track in eng.tracks_mut().iter_mut() {
+                            track.renumber_clips();
+                        }
+                    }
+                    // Re-sync decoders
+                    let pos = self.position();
+                    self.seek(pos);
+                }
                 else { println!("Nothing to Redo"); }
             }
         }
@@ -399,6 +462,17 @@ impl AudioRuntime {
         if let Ok(mut session) = self.session.lock() {
             session.apply(&self.engine, cmd)?;
         }
+
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id == track_id) {
+                track.renumber_clips();
+            }
+        }
+        
+        // 🚀 FIX: Force the decoders to flush buffers and re-align with the new position
+        let pos = self.position();
+        self.seek(pos);
+        
         Ok(())
     }
 
@@ -410,12 +484,26 @@ impl AudioRuntime {
     
         let cmd = Box::new(SplitClip {
             track_id,
-            split_time: Duration::from_secs_f64(time),
+            split_time: std::time::Duration::from_secs_f64(time),
         });
     
         if let Ok(mut session) = self.session.lock() {
             session.apply(&self.engine, cmd)?;
         }
+
+        // 🚀 FIX: Force renumbering and trigger our new debug logs
+        if let Ok(mut eng) = self.engine.lock() {
+            // Match the exact inner u32 ID to guarantee we find the track
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id.0) {
+                println!("🔍 DEBUG: Split successful. Calling renumber_clips on Track {}...", track.id.0);
+                track.renumber_clips();
+            }
+        }
+
+        // Re-sync decoders
+        let pos = self.position();
+        self.seek(pos);
+
         Ok(())
     }
 
@@ -569,6 +657,17 @@ impl AudioRuntime {
         if let Ok(mut session) = self.session.lock() {
             session.apply(&self.engine, cmd)?;
         }
+
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id == track_id) {
+                track.renumber_clips();
+            }
+        }
+
+        // 🚀 FIX: Re-sync decoders
+        let pos = self.position();
+        self.seek(pos);
+
         Ok(())
     }
 
@@ -599,6 +698,17 @@ impl AudioRuntime {
         if let Ok(mut session) = self.session.lock() {
             session.apply(&self.engine, cmd)?;
         }
+
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id == track_id) {
+                track.renumber_clips();
+            }
+        }
+
+        // 🚀 FIX: Re-sync decoders
+        let pos = self.position();
+        self.seek(pos);
+
         Ok(())
     }
 
@@ -643,6 +753,20 @@ impl AudioRuntime {
             release_ms: 50.0,
             makeup_gain_db: 0.0,
         }
+    }
+
+    pub fn set_effect_param(&self, track_index: usize, effect: String, param: String, value: f32) {
+        let _ = self.command_tx.lock().unwrap().try_send(EngineCommand::SetEffectParam(track_index, effect, param, value));
+    }
+
+    pub fn get_reverb_state(&self, track_index: usize) -> ReverbParams {
+        if let Ok(eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks().get(track_index) {
+                return track.track_reverb.get_params();
+            }
+        }
+        // Fallback default
+        ReverbParams { is_active: false, room_size: 0.8, damping: 0.5, mix: 0.3, width: 1.0, pre_delay_ms: 10.0, low_cut_hz: 100.0, high_cut_hz: 8000.0 } // <--- CHANGED is_active to false
     }
 
     // FIX: Corrected Reset Methods (No Delta, Just Reset)
@@ -698,8 +822,10 @@ impl AudioRuntime {
                 muted: t.muted,
                 solo: t.solo,
                 clips, // Add the list of clips
+                volume_automation: t.volume_automation.clone(),
                 compressor: Some(t.track_compressor.get_params()),
                 eq: Some(t.track_eq.get_state()),
+                reverb: Some(t.track_reverb.get_params()),
             }
         }).collect();
 
@@ -756,6 +882,12 @@ impl AudioRuntime {
                     clips, // <--- Add the clips here
                     compressor: Some(t.track_compressor.get_params()),
                     eq: Some(t.track_eq.get_state()),
+                    reverb: Some(t.track_reverb.get_params()),
+                    // Convert stored dB values into Linear values (0.0 to ~2.0) for Svelte UI rendering
+                    volume_automation: t.volume_automation.nodes().iter().map(|n| crate::engine::automation::AutomationNode {
+                        time: n.time,
+                        value: 10.0_f32.powf(n.value / 20.0), 
+                    }).collect(),
                 }
             }).collect()
         } else {
@@ -790,7 +922,7 @@ impl AudioRuntime {
         }
     }
 
-    // --- ADD THIS NEW METHOD HERE ---
+    
     // UPDATED: Now takes 'track_id: u32' instead of index
     pub fn set_clip_duration(&self, track_id: u32, duration: f64) -> Result<(), String> {
         if let Ok(mut eng) = self.engine.lock() {
@@ -802,6 +934,83 @@ impl AudioRuntime {
                 } else {
                     return Err(format!("Track {} exists but has no clips (Empty Track)", track_id));
                 }
+            }
+            return Err(format!("Track ID {} not found", track_id));
+        }
+        Err("Failed to lock engine".to_string())
+    }
+
+    pub fn get_volume_automation(&self, track_id: u32) -> Result<Vec<crate::engine::automation::AutomationNode<f32>>, String> {
+        if let Ok(eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks().iter().find(|t| t.id.0 == track_id) {
+                return Ok(track.volume_automation.nodes().to_vec());
+            }
+            return Err(format!("Track ID {} not found", track_id));
+        }
+        Err("Failed to lock engine".to_string())
+    }
+
+    pub fn add_volume_automation_node(&self, track_id: u32, time: u64, value: f32) -> Result<(), String> {
+        if let Ok(mut eng) = self.engine.lock() {
+            let sample_rate = eng.sample_rate as f64; // Grab SR for time calculations
+            
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
+                
+                // --- NEW: THE AUTO-ANCHOR FIX ---
+                let is_empty = track.volume_automation.nodes().is_empty();
+                
+                if is_empty {
+                    // 1. Insert Start Anchor (0.0 dB at exactly 0 seconds)
+                    track.volume_automation.insert_node(0, 0.0);
+                    
+                    // 2. Find the absolute end of the track's audio to place the End Anchor
+                    let mut max_time_secs = 600.0; // Fallback: 10 minutes if track is empty
+                    if let Some(last_clip) = track.clips.iter().max_by(|a, b| {
+                        let a_end = a.start_time + a.duration;
+                        let b_end = b.start_time + b.duration;
+                        a_end.cmp(&b_end)
+                    }) {
+                        max_time_secs = (last_clip.start_time + last_clip.duration).as_secs_f64();
+                    }
+                    
+                    // Place the end anchor 60 seconds past the last clip to ensure the UI line stays flat to the right
+                    let end_sample = ((max_time_secs + 60.0) * sample_rate).round() as u64;
+                    track.volume_automation.insert_node(end_sample, 0.0);
+                }
+
+                // --- DEBUG LOG ---
+                let time_sec = time as f64 / sample_rate;
+                println!("🎚️ Engine Stored Node -> Track: {} | Time: {:.3}s (Sample: {}) | Value: {:.2} dB", 
+                    track_id, time_sec, time, value
+                );
+                // -----------------
+
+                // 3. Insert the actual node the user or AI requested
+                track.volume_automation.insert_node(time, value);
+                
+                return Ok(());
+            }
+            return Err(format!("Track ID {} not found", track_id));
+        }
+        Err("Failed to lock engine".to_string())
+    }
+
+    pub fn remove_volume_automation_node(&self, track_id: u32, time: u64) -> Result<(), String> {
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
+                track.volume_automation.remove_node_at_time(time);
+                return Ok(());
+            }
+            return Err(format!("Track ID {} not found", track_id));
+        }
+        Err("Failed to lock engine".to_string())
+    }
+
+    pub fn clear_volume_automation(&self, track_id: u32) -> Result<(), String> {
+        if let Ok(mut eng) = self.engine.lock() {
+            if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
+                track.volume_automation.clear();
+                return Ok(());
             }
             return Err(format!("Track ID {} not found", track_id));
         }
@@ -913,7 +1122,7 @@ impl AudioRuntime {
                 },
                 AiAction::CreateTrack { count: _, track_id: _ } => { let _ = self.create_empty_track(); },
                 
-                AiAction::UpdateEq { track_id, band_index, filter_type, freq, q, gain } => {
+                AiAction::UpdateEq { track_id, band_index, filter_type, freq, q, gain, is_active } => {
                     if let Some(idx) = resolve(track_id) {
                         let mapped_filter = match filter_type {
                             SchemaEqFilterType::Peaking => crate::effects::equalizer::EqFilterType::Peaking,
@@ -921,28 +1130,222 @@ impl AudioRuntime {
                             SchemaEqFilterType::HighShelf => crate::effects::equalizer::EqFilterType::HighShelf,
                             SchemaEqFilterType::LowPass => crate::effects::equalizer::EqFilterType::LowPass,
                             SchemaEqFilterType::HighPass => crate::effects::equalizer::EqFilterType::HighPass,
+                            SchemaEqFilterType::Notch => crate::effects::equalizer::EqFilterType::Notch,
+                            SchemaEqFilterType::BandPass => crate::effects::equalizer::EqFilterType::BandPass,
                         };
                         let params = crate::effects::equalizer::EqParams {
                             filter_type: mapped_filter,
                             freq: freq.clamp(20.0, 20_000.0),
                             q: q.clamp(0.1, 10.0),
                             gain: gain.clamp(-18.0, 18.0),
-                            active: true,
+                            active: is_active.unwrap_or(true), // <--- Unpack and apply
                         };
-                        self.update_eq(idx, band_index, params);
+                        
+                        // FIX: Apply directly to engine to prevent UI race condition
+                        if let Ok(mut engine) = self.engine.lock() {
+                            if let Some(track) = engine.tracks_mut().get_mut(idx) {
+                                track.track_eq.update_band(band_index, params);
+                            }
+                        }
                     }
                 },
-                AiAction::UpdateCompressor { track_id, threshold_db, ratio, attack_ms, release_ms, makeup_gain_db } => {
+                AiAction::UpdateCompressor { track_id, threshold_db, ratio, attack_ms, release_ms, makeup_gain_db, is_active } => {
                     if let Some(idx) = resolve(track_id) {
                         let params = crate::effects::compressor::CompressorParams {
-                            is_active: true,
+                            is_active: is_active.unwrap_or(true), // <--- Unpack and apply
                             threshold_db: threshold_db.clamp(-60.0, 0.0),
                             ratio: ratio.clamp(1.0, 20.0),
                             attack_ms: attack_ms.clamp(0.1, 200.0),
                             release_ms: release_ms.clamp(10.0, 1000.0),
                             makeup_gain_db: makeup_gain_db.clamp(0.0, 24.0),
                         };
-                        self.update_compressor(idx, params);
+                        
+                        // FIX: Apply directly to engine
+                        if let Ok(mut engine) = self.engine.lock() {
+                            if let Some(track) = engine.tracks_mut().get_mut(idx) {
+                                track.track_compressor.set_params(params);
+                            }
+                        }
+                    }
+                },
+                AiAction::UpdateReverb { track_id, room_size, damping, pre_delay_ms, mix, width, low_cut_hz, high_cut_hz, is_active } => {
+                    if let Some(idx) = resolve(track_id) {
+                        // FIX: Apply directly to engine using the batch setter
+                        if let Ok(mut engine) = self.engine.lock() {
+                            if let Some(track) = engine.tracks_mut().get_mut(idx) {
+                                let mut p = track.track_reverb.get_params();
+                                if let Some(v) = is_active { p.is_active = v; }
+                                if let Some(v) = room_size { p.room_size = v.clamp(0.0, 1.0); }
+                                if let Some(v) = damping { p.damping = v.clamp(0.0, 1.0); }
+                                if let Some(v) = pre_delay_ms { p.pre_delay_ms = v.clamp(0.0, 500.0); }
+                                if let Some(v) = mix { p.mix = v.clamp(0.0, 1.0); }
+                                if let Some(v) = width { p.width = v.clamp(0.0, 1.0); }
+                                if let Some(v) = low_cut_hz { p.low_cut_hz = v.clamp(20.0, 1000.0); }
+                                if let Some(v) = high_cut_hz { p.high_cut_hz = v.clamp(1000.0, 20000.0); }
+                                
+                                track.track_reverb.set_params(p);
+                            }
+                        }
+                    }
+                },
+                AiAction::ClearVolumeAutomation { track_id } => {
+                    // Note: ai_schema uses usize for track_id, but the backend methods expect u32
+                    let _ = self.clear_volume_automation(track_id as u32);
+                },
+                AiAction::AddVolumeAutomation { track_id, time, value } => {
+                    let sr = self.sample_rate() as f64;
+                    // Safely convert AI seconds to exact hardware samples
+                    let time_samples = (time * sr).round() as u64; 
+                    let _ = self.add_volume_automation_node(track_id as u32, time_samples, value);
+                },
+                AiAction::DuckVolume { track_id, time, depth_db } => {
+                    let sr = self.sample_rate() as f64;
+                    let t_id = track_id as u32;
+
+                    // Let Rust do the math! 50ms attack, 200ms release.
+                    let anchor_start = (time - 0.05).max(0.0);
+                    let duck_time = time;
+                    let anchor_end = time + 0.20;
+
+                    let sample_start = (anchor_start * sr).round() as u64;
+                    let sample_duck = (duck_time * sr).round() as u64;
+                    let sample_end = (anchor_end * sr).round() as u64;
+
+                    // Safely insert the 3 nodes
+                    let _ = self.add_volume_automation_node(t_id, sample_start, 0.0);
+                    let _ = self.add_volume_automation_node(t_id, sample_duck, depth_db);
+                    let _ = self.add_volume_automation_node(t_id, sample_end, 0.0);
+                },
+
+                AiAction::AutoGainStage { track_id, target_lufs } => {
+                    if let Some(idx) = resolve(track_id) {
+                        if let Ok(mut engine) = self.engine.lock() {
+                            if let Some(track) = engine.tracks_mut().get_mut(idx) {
+                                // 1. Pull the exact LUFS from the background analyzer
+                                let current_lufs = if let Ok(guard) = track.analysis.lock() {
+                                    guard.as_ref().map(|p| p.integrated_loudness_db)
+                                } else { None };
+
+                                // 2. Perform the Math
+                                if let Some(lufs) = current_lufs {
+                                    let delta_db = target_lufs - lufs as f32;
+                                    
+                                    // 3. Convert dB change to Linear Fader Multiplier
+                                    let linear_multiplier = 10.0_f32.powf(delta_db / 20.0);
+                                    let new_gain = (track.gain * linear_multiplier).clamp(0.0, 2.0);
+                                    
+                                    track.gain = new_gain;
+                                    println!("🎚️ Auto-Gain Stage [Track {}]: {} LUFS -> {} LUFS | Delta: {:.2} dB | New Linear Fader: {:.3}", 
+                                        track_id, lufs, target_lufs, delta_db, new_gain);
+                                } else {
+                                    println!("⚠️ Auto-Gain Stage failed: No analysis profile ready yet for Track {}.", track_id);
+                                }
+                            }
+                        }
+                    }
+                },
+
+                AiAction::RideVocalLevel { track_id, target_lufs, max_boost_db, max_cut_db, smoothness, analysis_window_ms, noise_floor_db } => {
+                    let boost = max_boost_db.unwrap_or(6.0);
+                    let cut = max_cut_db.unwrap_or(-4.0);
+                    let smooth = smoothness.unwrap_or(0.7);
+                    let window = analysis_window_ms.unwrap_or(200);
+                    let gate_threshold = noise_floor_db.unwrap_or(-40.0);
+
+                    let engine_sample_rate = self.sample_rate();
+
+                    if let Ok(mut engine) = self.engine.lock() {
+                        // FIX 1: Match t.id.0 against track_id as u32
+                        if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id.0 == track_id as u32) {
+                            let mut all_rider_nodes = Vec::new();
+
+                            // FIX 2: Extract ALL temporal metadata (start_time, offset, duration)
+                            let clips_meta: Vec<(String, f64, f64, f64)> = track.clips.iter().map(|c| {
+                                (
+                                    c.path.clone(), 
+                                    c.start_time.as_secs_f64(), 
+                                    c.offset.as_secs_f64(), 
+                                    c.duration.as_secs_f64()
+                                )
+                            }).collect();
+
+                           for (path, start_time_sec, offset_sec, duration_sec) in clips_meta {
+                                
+                                // --- AUDIO CACHE CHECK ---
+                                let cache_result = {
+                                    let mut cache = self.decode_cache.lock().unwrap();
+                                    if let Some(cached) = cache.get(&path) {
+                                        Some((cached.0.clone(), cached.1, cached.2)) // Grab Arc clone
+                                    } else {
+                                        // Decode and cache if not found
+                                        if let Ok((data, sr, ch)) = crate::bpm::adapter::decode_to_vec(&path) {
+                                            let data_arc = Arc::new(data);
+                                            cache.insert(path.clone(), (data_arc.clone(), sr, ch));
+                                            Some((data_arc, sr, ch))
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                };
+
+                                if let Some((audio_data, source_sr, source_ch)) = cache_result {
+
+                                    // --- THE TIME DOMAIN FIX ---
+                                    // The file starts at 0, but the clip might be trimmed (offset) and cropped (duration).
+                                    // We MUST slice the raw audio buffer so the AI only analyzes what is visible on the timeline!
+                                    let start_sample = (offset_sec * source_sr as f64).round() as usize * source_ch;
+                                    let len_samples = (duration_sec * source_sr as f64).round() as usize * source_ch;
+                                    let end_sample = (start_sample + len_samples).min(audio_data.len());
+                                    
+                                    let sliced_audio = if start_sample < audio_data.len() {
+                                        &audio_data[start_sample..end_sample]
+                                    } else {
+                                        &[] // Prevent panics if offset is completely out of bounds
+                                    };
+
+                                    let mut clip_nodes = crate::engine::automation::generate_rider_automation(
+                                        sliced_audio, 
+                                        source_ch, 
+                                        source_sr, // Process at native sample rate for accurate RMS
+                                        start_time_sec,
+                                        target_lufs, 
+                                        boost,
+                                        cut,
+                                        smooth,
+                                        window,
+                                        gate_threshold
+                                    );
+
+                                    // Because the clip might be 44.1kHz but the engine is 48kHz,
+                                    // we align the generated node timestamps to the engine's actual sample rate.
+                                    let sample_rate_ratio = engine_sample_rate as f64 / source_sr as f64;
+                                    for node in clip_nodes.iter_mut() {
+                                        node.time = (node.time as f64 * sample_rate_ratio).round() as u64;
+                                    }
+
+                                    all_rider_nodes.append(&mut clip_nodes);
+                                }
+                            }
+
+                            // ==========================================
+                            // 📍 INSERT DEBUG BLOCK HERE 📍
+                            // ==========================================
+                            println!("--- VOCAL RIDER DEBUG ---");
+                            println!("Engine Sample Rate: {}", engine_sample_rate);
+                            for (i, node) in all_rider_nodes.iter().enumerate().take(10) {
+                                let time_in_seconds = node.time as f64 / engine_sample_rate as f64;
+                                println!("Node {}: Time: {:.3}s | Gain: {:.2} dB", i, time_in_seconds, node.value);
+                            }
+                            println!("-------------------------");
+                            // ==========================================
+
+                            // FIX 5: Use the safe, public AutomationCurve API. 
+                            // insert_node handles binary-search sorting automatically!
+                            track.volume_automation.clear();
+                            for node in all_rider_nodes {
+                                track.volume_automation.insert_node(node.time, node.value);
+                            }
+                        }
                     }
                 },
                 AiAction::SeparateStems { .. } => {

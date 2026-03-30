@@ -6,6 +6,8 @@
 
 mod stem_separation;
 mod ai_transaction;
+mod automation;
+pub mod effects;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -21,6 +23,7 @@ use daw_modules::recorder::Recorder;
 use daw_modules::waveform::Waveform;
 use daw_modules::bpm; // Import the new BPM module
 use daw_modules::engine::time::GridLine; // Import GridLine
+
 
 
 // [NEW STRUCT] Holds separation results waiting for user confirmation
@@ -58,11 +61,16 @@ fn build_ui_state(
     master_gain: f32,
     silent: bool,
     cache_store: &Mutex<HashMap<String, ImportResult>>,
+    fx_data: Vec<(
+        Vec<daw_modules::effects::equalizer::EqParams>, 
+        daw_modules::effects::compressor::CompressorParams,
+        daw_modules::effects::reverb::ReverbParams
+    )>
 ) -> Result<ProjectState, String> {
     
     let mut results = Vec::new();
 
-    for info in tracks_info.iter() {
+    for (i, info) in tracks_info.iter().enumerate() {
         
         // 1. Try to find existing color
         let color = info.color.clone();
@@ -122,6 +130,8 @@ fn build_ui_state(
             "media".to_string()
         };
 
+        let (eq, compressor, reverb) = fx_data[i].clone();
+
         results.push(LoadedTrack {
             id: track_id,
             name: info.name.clone(),
@@ -132,6 +142,10 @@ fn build_ui_state(
             muted: info.muted,
             solo: info.solo,
             source: source_type,
+            volume_automation: info.volume_automation.clone(),
+            eq,           // <--- Attach EQ to UI Payload
+            compressor,
+            reverb,
         });
     }
     
@@ -202,6 +216,13 @@ fn get_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
         .collect();
         
     Ok(list)
+}
+
+#[tauri::command]
+fn set_output_device(device_name: String, state: State<AppState>) -> Result<(), String> {
+    let mut audio = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+    audio.set_output_device(device_name).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // Helper: Resolve Stable ID -> Mutable Index
@@ -717,7 +738,27 @@ fn create_track(state: State<AppState>) -> Result<LoadedTrack, String> {
         pan: 0.0,
         muted: false,
         solo: false,
-        source: "mic".to_string()
+        source: "mic".to_string(),
+        volume_automation: vec![],
+        eq: vec![],
+        compressor: daw_modules::effects::compressor::CompressorParams {
+            is_active: false,
+            threshold_db: -20.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 50.0,
+            makeup_gain_db: 0.0,
+        },
+        reverb: daw_modules::effects::reverb::ReverbParams { 
+            is_active: false, 
+            room_size: 0.8, 
+            damping: 0.5, 
+            mix: 0.3, 
+            width: 1.0, 
+            pre_delay_ms: 10.0, 
+            low_cut_hz: 100.0, 
+            high_cut_hz: 8000.0 
+        },
     })
 }
 
@@ -892,12 +933,20 @@ async fn get_project_state(
     let bpm = audio_runtime.bpm();
     let master_gain = audio_runtime.master_gain();
     let tracks_info = audio_runtime.get_tracks_list();
+    let mut fx_data = Vec::new();
+    for info in &tracks_info {
+        let index = resolve_track_index(&tracks_info, info.id as u32)?;
+        let eq = audio_runtime.get_eq_state(index);
+        let comp = audio_runtime.get_compressor_state(index);
+        let rev = audio_runtime.get_reverb_state(index); // Reverb included!
+        fx_data.push((eq, comp, rev));
+    }
     drop(audio_runtime); // Release lock
 
     // 2. Build UI State (Reuse Helper)
     // Pass cache AND color store
-    let state = build_ui_state(tracks_info, bpm, master_gain, true, &state.cache)?;
-    Ok(state)
+    let state_ui = build_ui_state(tracks_info, bpm, master_gain, false, &state.cache, fx_data)?;
+    Ok(state_ui)
 }
 
 #[derive(serde::Serialize)]
@@ -927,6 +976,10 @@ pub struct LoadedTrack {
     pub muted: bool,
     pub solo: bool,
     pub source: String,
+    pub volume_automation: Vec<daw_modules::engine::automation::AutomationNode<f32>>,
+    pub eq: Vec<daw_modules::effects::equalizer::EqParams>,
+    pub compressor: daw_modules::effects::compressor::CompressorParams,
+    pub reverb: daw_modules::effects::reverb::ReverbParams,
 }
 
 #[derive(serde::Serialize)]
@@ -984,48 +1037,56 @@ async fn load_project(
     let bpm = audio_runtime.bpm();
     let master_gain = audio_runtime.master_gain();
     let tracks_info = audio_runtime.get_tracks_list();
+    // --- FETCH FX STATES BEFORE DROPPING THE LOCK ---
+    let mut fx_data = Vec::new();
+    for info in &tracks_info {
+        let index = resolve_track_index(&tracks_info, info.id as u32)?;
+        let eq = audio_runtime.get_eq_state(index);
+        let comp = audio_runtime.get_compressor_state(index);
+        let rev = audio_runtime.get_reverb_state(index); // Reverb included!
+        fx_data.push((eq, comp, rev));
+    }
     drop(audio_runtime); // Release lock
 
     for info in &tracks_info {
         for clip in &info.clips {
-             let path_key = clip.path.clone();
-             let needs_load = {
-                 let cache = state.cache.lock().unwrap();
-                 !cache.contains_key(&path_key)
-             };
-
-             if needs_load {
-                 let _ = app.emit("load-progress", format!("Loading {}", clip.path));
-                 if let Ok((samples, sr, ch)) = daw_modules::bpm::adapter::decode_to_vec(&clip.path) {
-                      let wf = Waveform::build_from_samples(&samples, sr, ch, 512);
-                      let pixels_per_second = 100.0;
-                      let spp = (sr as f64) / pixels_per_second;
-                      let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
-                      
-                      let data = ImportResult {
-                            mins: mins.to_vec(),
-                            maxs: maxs.to_vec(), 
-                            duration: wf.duration_secs,
-                            bins_per_second: pixels_per_second,
-                            bpm: None,
-                            color: String::new(),
-                      };
-                      
-                      state.cache.lock().unwrap().insert(path_key, data);
-                 }
-             }
+            let path_key = clip.path.clone();
+            let needs_load = {
+                let cache = state.cache.lock().unwrap();
+                !cache.contains_key(&path_key)
+            };
+            if needs_load {
+                let _ = app.emit("load-progress", format!("Loading {}", clip.path));
+                if let Ok((samples, sr, ch)) = daw_modules::bpm::adapter::decode_to_vec(&clip.path) {
+                    let wf = Waveform::build_from_samples(&samples, sr, ch, 512);
+                    let pixels_per_second = 100.0;
+                    let spp = (sr as f64) / pixels_per_second;
+                    let (mins, maxs, _) = wf.bins_for(spp, 0, 0, usize::MAX);
+                    
+                    let data = ImportResult {
+                          mins: mins.to_vec(),
+                          maxs: maxs.to_vec(), 
+                          duration: wf.duration_secs,
+                          bins_per_second: pixels_per_second,
+                          bpm: None,
+                          color: String::new(),
+                    };
+                    
+                    state.cache.lock().unwrap().insert(path_key, data);
+                }
+            }
         }
     }
 
     // 3. Build UI State (Reuse Helper)
     // Pass cache AND color store
-    let state = build_ui_state(tracks_info, bpm, master_gain, false, &state.cache)?;
-
+    let state_ui = build_ui_state(tracks_info, bpm, master_gain, false, &state.cache, fx_data)?;
     let _ = app.emit("load-percent", 100.0);
     let _ = app.emit("load-progress", "Ready");
 
-    Ok(state)
+    Ok(state_ui)
 }
+
 // Add these to the invoke_handler list!
 #[tauri::command]
 fn get_temp_path(filename: String) -> String {
@@ -1091,45 +1152,42 @@ async fn ask_ai(
         "You are an elite Audio DSP Engineer and a strict JSON API for a DAW. You speak ONLY JSON.\n\
         \n\
         CONTEXT:\n{}\n\
-        USER REQUEST: '{}'\n\
         \n\
         CRITICAL RULES:\n\
-        1. YOU MUST OUTPUT A VALID JSON OBJECT WITH 'version': '1.0' and a 'commands' array. NO PLAIN TEXT.\n\
-        2. FLATTEN PARAMETERS. Put 'track_id', 'value', 'time', 'new_time', 'bpm', 'clip_number' DIRECTLY inside the command object.\n\
-        3. ACTION NAMES MUST MATCH EXACTLY: play, pause, record, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor,separate_stems, none.\n\
-        4. DSP MATH: \n\
-           - Gain is 0.0 (silent) to 2.0 (+6dB). Default/Unity volume is 1.0.\n\
-           - Pan is -1.0 (Left) to 1.0 (Right). Default pan is 0.0.\n\
-        5. MUSICAL TIMING & MATH:\n\
-           - You are provided with the current BPM and Time Signature in the context.\n\
-           - 1 Quarter Note = 60 / BPM seconds.\n\
-           - If Time Signature is 4/4, 1 Bar = 4 Quarter Notes.\n\
-           - If Time Signature is 6/8, 1 Bar = 3 Quarter Notes (6 * (4/8)).\n\
-           - ALWAYS calculate 'time' or 'new_time' parameters in exact SECONDS based on this math.\n\
-        6. RELATIVE AWARENESS: \n\
-           - If the user says 'here' or 'current position', use the 'playhead_position_seconds' from the context.\n\
-           - If the user references a color (e.g., 'the red track'), find the track with that color in the context.\n\
-        7. DO NOT INVENT FIELDS. \n\
-           - For 'merge_clips': ONLY use 'track_id' and 'clip_number' (the left-most clip).\n\
-           - For 'move_clip': Requires 'track_id', 'clip_number', and 'new_time' (in seconds).\n\
-           - For 'reset volume': ONLY output 'set_gain' with 'value': 1.0. Do NOT output mute or solo commands.\n\
-           - For 'reset track': Output 'set_gain' to 1.0, 'set_pan' to 0.0, 'unmute', and 'unsolo'.\n\
-        8. OMIT UNUSED KEYS. If a command doesn't need a parameter, do not include it. Do NOT output null values.\n\
-        9. TRACK IDENTIFICATION: You MUST accurately map the user's requested instrument or track name to the correct 'id' provided in the context tracks array. Do NOT default to \"track_id\": 0 unless the user explicitly asks to modify the 'master', 'original', or 'default' track. If you cannot find a matching track for their request, output the 'none' action with an error message.\n\
+        1. STRICT JSON: Output a valid JSON object with 'version': '1.0' and a 'commands' array. NO markdown blocks. Output raw, parsable JSON.\n\
+        2. FLATTEN PARAMETERS (CRITICAL): ALL parameters MUST be at the root of the command object. Put 'track_id', 'band_index', 'filter_type', 'freq', 'q', 'gain', 'is_active', 'threshold_db', 'ratio' DIRECTLY inside the command object. NEVER nest them inside an 'eq', 'compressor', or 'reverb' sub-object.\n\
+        3. ALLOWED ACTIONS: play, pause, record, rewind, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor, update_reverb, separate_stems, ride_vocal_level, duck_volume, auto_gain_stage, clear_volume_automation, none.\n\
+        4. TRACK LOCKING (HIGHEST PRIORITY): Look at 'project.target_track_id'. If provided, use this EXACT 'track_id' for all DSP commands unless explicitly named otherwise. Do NOT hallucinate track IDs. If a name is given, map it to the correct 'id' from the context tracks array. Do NOT default to \"track_id\": 0.\n\
+        5. EFFECT ACTIVATION: When applying 'update_compressor', 'update_eq', or 'update_reverb', you MUST include \"is_active\": true. Otherwise, the effect remains bypassed.\n\
+        6. DSP MATH & GAIN: 'set_gain' and 'set_pan' strictly use LINEAR values (0.0 is silence, 1.0 is unity, 2.0 is +6dB). All other volume params ('depth_db', 'target_lufs', 'threshold_db') MUST be in standard audio decibels (dB) or LUFS.\n\
+        7. MERGE CLIPS: You MUST ONLY provide the 'clip_number' of the left-most clip. Do NOT invent a 'next_clip_number'.\n\
+        8. RELATIVE TIMING: 1 Quarter Note = 60 / BPM seconds. Calculate 'time' or 'new_time' parameters in exact SECONDS. If the user says 'here' or 'current position', use 'playhead_position_seconds'.\n\
+        9. EXACT PARAMETER NAMES: \n\
+           - 'update_compressor': MUST use 'makeup_gain_db'. Allowed: 'threshold_db', 'ratio', 'attack_ms', 'release_ms', 'makeup_gain_db', 'is_active'.\n\
+           - 'update_reverb': Allowed: 'room_size', 'damping', 'mix', 'width', 'pre_delay_ms', 'low_cut_hz', 'high_cut_hz', 'is_active'.\n\
+        10. STUDIO MIXING & MASTERING PROTOCOL:\n\
+           - If the user asks for 'studio quality' or 'mastering', apply this exact chain via multiple commands:\n\
+             1st: 'update_eq' (Cut muddy lows below 100Hz. You MUST include 'band_index': 0)\n\
+             2nd: 'update_compressor' (Control dynamics, gentle ratio 2:1 for master, 4:1 for vocals. MUST use 'makeup_gain_db')\n\
+             3rd: 'update_reverb' (Add subtle space, set is_active: true, keep mix low e.g., 0.15)\n\
+             4th: 'ride_vocal_level' and apply 'auto_gain_stage' only if its required (Final leveling)\n\
         \n\
+        AUTOMATION & VOLUME GUIDELINES:\n\
+        Choose the correct tool based on the user's request. Do not guess dB values; use the analysis arrays provided in the context.\n\
+        - TOOL A: Peak Protection (duck_volume) - Use ONLY to \"fix clipping\" or \"remove plosives\". Look at the 'peak_events' array in the analysis. Generate a 'duck_volume' command for each peak using its 't' (time) and a calculated 'depth_db'.\n\
+        - TOOL B: Dynamic Automation / Riding (ride_vocal_level) - Use when the user asks for \"automation\", \"automate the gain/volume\", \"ride the fader\", \"level the vocals\", or \"balance the track\". This draws dynamic volume curves over time. You MUST use 'loudness_p10_db' (from context) for 'noise_floor_db'. Default 'target_lufs' is -16.0.\n\
+        - TOOL C: Static Auto-Gain (auto_gain_stage) - Use ONLY when the user asks to \"gain stage\" or \"normalize\". This is a single, static volume change, NOT automation. Target 'target_lufs' is -18.0 if unspecified.\n\
         SCHEMA EXAMPLES:\n\
-        User: \"reset the volume of track 0\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"set_gain\", \"track_id\": 0, \"value\": 1.0}}], \"message\": \"Track 0 volume reset to default (1.0).\", \"confidence\": 1.0}}\n\
+        User: \"Master my track\"\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"update_eq\", \"track_id\": 1, \"band_index\": 0, \"filter_type\": \"HighPass\", \"freq\": 100.0, \"q\": 0.7, \"gain\": 0.0, \"is_active\": true}}, {{\"action\": \"update_compressor\", \"track_id\": 1, \"threshold_db\": -18.0, \"ratio\": 2.0, \"attack_ms\": 10.0, \"release_ms\": 100.0, \"makeup_gain_db\": 2.0, \"is_active\": true}}, {{\"action\": \"update_reverb\", \"track_id\": 1, \"room_size\": 0.6, \"mix\": 0.15, \"is_active\": true}}], \"message\": \"Applied studio master chain.\", \"confidence\": 0.98}}\n\
         \n\
-        User: \"move the blue track's first clip to bar 5\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"move_clip\", \"track_id\": 1, \"clip_number\": 1, \"new_time\": 8.0}}], \"message\": \"Moved clip 1 on the blue track to Bar 5.\", \"confidence\": 0.95}}\n\
+        User: \"Level my vocals and add some space\"\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"ride_vocal_level\", \"track_id\": 1, \"target_lufs\": -16.0, \"noise_floor_db\": -40.0}}, {{\"action\": \"update_reverb\", \"track_id\": 1, \"is_active\": true, \"room_size\": 0.6, \"mix\": 0.2}}], \"message\": \"Applied vocal rider and reverb.\", \"confidence\": 0.95}}\n\
         \n\
         User: \"undo that\"\n\
         Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"undo\"}}], \"message\": \"Undoing last action.\", \"confidence\": 1.0}}\n\
-        User: \"isolate the vocals on track 1\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"separate_stems\", \"track_id\": 1}}], \"message\": \"Extracting stems from track 1...\", \"confidence\": 0.99}}\n\
         ",
-        track_context, user_input
+        track_context
     );
 
 
@@ -1363,8 +1421,38 @@ fn sanitize_ai_batch(mut steps: Vec<AiStep>) -> Result<Vec<AiStep>, String> {
         }
     }
 
-    // [Future Rules can go here]
-    // e.g., prevent duplicate toggles, prevent destructive commands while recording, etc.
+    // RULE 2: Prevent Contradictory Transport Commands
+    let has_play = steps.iter().any(|s| s.action == "play");
+    let has_pause = steps.iter().any(|s| s.action == "pause");
+    
+    if has_play && has_pause {
+        let original_len = steps.len();
+        // Safety first: if AI says both play and pause, keep pause and drop play
+        steps.retain(|s| s.action != "play");
+        if steps.len() < original_len {
+            println!("🛡️ Engine Guard: Removed 'play' command because 'pause' was also requested.");
+        }
+    }
+
+    // RULE 3: Gain/Volume Safety Limiter (Prevent speaker blowout)
+    for step in &mut steps {
+        if step.action == "set_gain" || step.action == "set_master_gain" {
+            if let Some(params) = &mut step.parameters {
+                if let Some(val) = params.get_mut("value") {
+                    if let Some(mut float_val) = val.as_f64() {
+                        // Clamp between 0.0 (mute) and 2.0 (+6dB max)
+                        if float_val > 2.0 {
+                            println!("🛡️ Engine Guard: Clamped dangerously high gain ({} -> 2.0)", float_val);
+                            float_val = 2.0;
+                        } else if float_val < 0.0 {
+                            float_val = 0.0;
+                        }
+                        *val = serde_json::json!(float_val);
+                    }
+                }
+            }
+        }
+    }
 
     Ok(steps)
 }
@@ -1427,9 +1515,12 @@ fn main() {
             get_eq_state,
             update_compressor,
             get_compressor_state,
+            effects::set_effect_param, 
+            effects::get_reverb_state,
             reload_audio_device,
             get_output_devices,
             get_input_devices,
+            set_output_device,
             undo,
             redo,
             ask_ai,
@@ -1438,7 +1529,10 @@ fn main() {
             stem_separation::cancel_ai_job,
             commit_pending_stems,
             discard_pending_stems,
-            sanitize_ai_batch
+            sanitize_ai_batch,
+            automation::get_volume_automation,
+            automation::add_volume_automation_node,
+            automation::remove_volume_automation_node
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
