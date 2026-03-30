@@ -473,6 +473,7 @@ pub struct RideVocalLevelCmd {
     pub smoothness: f32,
     pub analysis_window_ms: u32,
     pub noise_floor_db: f32,
+    pub preserve_dynamics: bool,
 }
 
 impl Command for RideVocalLevelCmd {
@@ -519,6 +520,7 @@ impl Command for RideVocalLevelCmd {
                         self.smoothness,
                         self.analysis_window_ms,
                         self.noise_floor_db,
+                        self.preserve_dynamics
                     );
 
                     // 5. Insert nodes into the track, translating Source Hz to Engine Hz to prevent drift
@@ -534,4 +536,18 @@ impl Command for RideVocalLevelCmd {
     
     fn undo(&self, _engine: &mut Engine) -> Result<()> { Ok(()) }
     fn name(&self) -> &str { "Vocal Rider" }
+}
+
+pub struct AutoGainStageCmd {
+    pub track_id: TrackId,
+    pub target_lufs: f32,
+}
+
+impl Command for AutoGainStageCmd {
+    fn execute(&self, _engine: &mut Engine) -> Result<()> {
+        // Placeholder for Step 4 (Gain Automation)
+        Ok(())
+    }
+    fn undo(&self, _engine: &mut Engine) -> Result<()> { Ok(()) }
+    fn name(&self) -> &str { "Auto Gain Stage" }
 }

@@ -91,6 +91,11 @@ pub enum AiAction {
         gain: f32,
         is_active: Option<bool>,
     },
+    AutoEq {
+        track_id: usize,
+        intent: Option<String>,
+        intensity: Option<f32>,
+    },
     UpdateCompressor {
         track_id: usize,
         threshold_db: f32,
@@ -99,6 +104,11 @@ pub enum AiAction {
         release_ms: f32,
         makeup_gain_db: f32,
         is_active: Option<bool>,
+    },
+    AutoCompress {
+        track_id: usize,
+        style: Option<String>,
+        intensity: Option<f32>,
     },
     UpdateReverb { // <--- ADD THIS BLOCK
         track_id: usize,
@@ -110,6 +120,11 @@ pub enum AiAction {
         low_cut_hz: Option<f32>,
         high_cut_hz: Option<f32>,
         is_active: Option<bool>,
+    },
+    AutoReverb {
+        track_id: usize,
+        space: Option<String>,
+        intensity: Option<f32>,
     },
     ClearVolumeAutomation {
         track_id: usize,
@@ -132,6 +147,7 @@ pub enum AiAction {
         smoothness: Option<f32>,   
         analysis_window_ms: Option<u32>, // Brilliant addition
         noise_floor_db: Option<f32>,
+        preserve_dynamics: Option<bool>
     },
     Undo,
     Redo,

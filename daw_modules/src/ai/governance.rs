@@ -179,7 +179,7 @@ pub fn translate_action(action: AiAction) -> Result<Box<dyn Command>, Governance
             }))
         }
 
-        AiAction::RideVocalLevel { track_id, target_lufs, max_boost_db, max_cut_db, smoothness, analysis_window_ms, noise_floor_db } => {
+        AiAction::RideVocalLevel { track_id, target_lufs, max_boost_db, max_cut_db, smoothness, analysis_window_ms, noise_floor_db, preserve_dynamics } => {
             // 1. Unwrap AI optionals with safe default studio settings
             // 2. Clamp strictly to DSP engine limits
             let safe_target = target_lufs.clamp(-36.0, 0.0);
@@ -188,6 +188,7 @@ pub fn translate_action(action: AiAction) -> Result<Box<dyn Command>, Governance
             let safe_smooth = smoothness.unwrap_or(0.5).clamp(0.0, 1.0);
             let safe_window = analysis_window_ms.unwrap_or(300).clamp(50, 2000);
             let safe_noise = noise_floor_db.unwrap_or(-60.0).clamp(-100.0, 0.0);
+            let safe_preserve = preserve_dynamics.unwrap_or(false);
 
             Ok(Box::new(RideVocalLevelCmd {
                 track_id: TrackId(track_id as u32),
@@ -197,17 +198,83 @@ pub fn translate_action(action: AiAction) -> Result<Box<dyn Command>, Governance
                 smoothness: safe_smooth,
                 analysis_window_ms: safe_window,
                 noise_floor_db: safe_noise,
+                preserve_dynamics: safe_preserve,
             }))
+        }
+
+        AiAction::AutoGainStage { track_id, target_lufs } => {
+            let safe_target = target_lufs.clamp(-36.0, 0.0);
+            Ok(Box::new(crate::session::commands::AutoGainStageCmd {
+                track_id: TrackId(track_id as u32),
+                target_lufs: safe_target,
+            }))
+        }
+
+        AiAction::Unmute { track_id } => {
+            Ok(Box::new(SetTrackMute {
+                track_id: TrackId(track_id as u32),
+                new_state: false, 
+            }))
+        }
+
+        AiAction::Unsolo { track_id } => {
+            Ok(Box::new(ToggleSolo { 
+                track_id: TrackId(track_id as u32) 
+            }))
+        }
+
+        AiAction::MoveClip { track_id, clip_number, new_time } => {
+            let safe_time = new_time.max(0.0); 
+            Ok(Box::new(MoveClip {
+                track_id: TrackId(track_id as u32),
+                clip_index: clip_number,
+                old_start: Duration::ZERO, // Faked for AI (Undo handled in history)
+                new_start: Duration::from_secs_f64(safe_time),
+            }))
+        }
+
+        AiAction::MergeClips { track_id, clip_number } => {
+            Ok(Box::new(MergeClip {
+                track_id: TrackId(track_id as u32),
+                clip_index: clip_number,
+                original_duration: Duration::ZERO,
+                right_clip_data: crate::session::commands::DeletedClipData {
+                    path: String::new(), start_time: Duration::ZERO, offset: Duration::ZERO, 
+                    duration: Duration::ZERO, source_duration: Duration::ZERO, source_sr: 44100, source_ch: 2
+                }
+            }))
+        }
+
+        AiAction::DeleteClip { track_id, clip_number } => {
+            Ok(Box::new(DeleteClip {
+                track_id: TrackId(track_id as u32),
+                clip_index: clip_number,
+                clip_data: crate::session::commands::DeletedClipData {
+                    path: String::new(), start_time: Duration::ZERO, offset: Duration::ZERO, 
+                    duration: Duration::ZERO, source_duration: Duration::ZERO, source_sr: 44100, source_ch: 2
+                }
+            }))
+        }
+
+        // 🛡️ FRONTEND ROUTING FIREWALL 
+        // These are valid AI actions, but they must be executed by the Tauri UI shell, 
+        // not the DSP Engine's CommandManager.
+        AiAction::SetBpm { .. } | 
+        AiAction::CreateTrack { .. } | 
+        AiAction::SeparateStems { .. } | 
+        AiAction::Undo | 
+        AiAction::Redo => {
+            Err(GovernanceError::InvalidParameter("This command must be routed as a UI/Transport command in AIAgent.ts".into()))
         }
 
         AiAction::DeleteTrack { track_id: _ } => {
             Err(GovernanceError::InvalidParameter("Delete track not fully implemented".into()))
         }
-        
-        // 🛠️ DEBUG LOG 6: THE REJECTION WALL (Update your catch-all)
-        unmapped_action => {
-            eprintln!("❌ [GOVERNANCE REJECTED] Command not mapped to DSP: {:?}", unmapped_action);
-            Err(GovernanceError::InvalidParameter(format!("Command translation not yet mapped: {:?}", unmapped_action)))
+        AiAction::AutoCompress { .. } |
+        AiAction::AutoEq { .. } |
+        AiAction::AutoReverb { .. } => {
+            // These are executed natively in apply_ai_batch, so they bypass standard Governance translation
+            Err(GovernanceError::InvalidParameter("Semantic commands safely handled in audio runtime".into()))
         }
     }
 }

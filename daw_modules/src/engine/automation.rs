@@ -101,6 +101,7 @@ pub fn generate_rider_automation(
     smoothness: f32,
     analysis_window_ms: u32,
     noise_floor_db: f32,
+    preserve_dynamics: bool,
 ) -> Vec<AutomationNode<f32>> {
     let mut nodes = Vec::new();
     if audio_buffer.is_empty() || channels == 0 {
@@ -141,11 +142,22 @@ pub fn generate_rider_automation(
         let rms_db = if rms > 1e-5 { 20.0 * rms.log10() } else { -70.0 };
 
         // 3. Silence Gate (-45 dB threshold)
-        // If it's silence, we want the rider to gracefully return to 0.0 dB (Unity)
         let mut raw_gain = 0.0; 
         if rms_db > noise_floor_db {
             // 4. Compute Raw Gain
-            raw_gain = target_lufs - rms_db;
+            let mut calculated_boost = target_lufs - rms_db;
+            
+            // THE MAGIC FIX: Don't boost if it's already within 6dB!
+            if calculated_boost > 0.0 && calculated_boost < 6.0 {
+                calculated_boost = 0.0; // Leave the natural dynamics alone!
+            }
+
+            // If the AI flagged it as emotional/dynamic, halve the automation intensity
+            if preserve_dynamics {
+                calculated_boost *= 0.5; 
+            }
+
+            raw_gain = calculated_boost;
         }
 
         // 5. Clamp Gain Limits

@@ -1124,18 +1124,18 @@ struct AiErrorResponse {
 #[tauri::command]
 async fn ask_ai(
     user_input: String, 
-    track_context: String,
-    chat_history: Vec<GroqMessage>
+    active_track_id: Option<u32>, // <--- NEW: UI state directly passed
+    playhead_time: f64,           // <--- NEW: Playhead context
+    chat_history: Vec<GroqMessage>,
+    state: tauri::State<'_, AppState> // <--- NEW: Access native audio engine!
 ) -> Result<String, String> {
-    // 1. Setup Client with Strict Timeout (Prevent UI Freeze)
+    
+    // 1. Setup Client with Strict Timeout
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8)) // 8-second hard limit
+        .timeout(Duration::from_secs(8)) 
         .build()
         .map_err(|e| e.to_string())?;
 
-    // 2. Get API Key from Environment
-    // NOTE: In production, you might want to load this from a user config file
-    // This checks for the key at BUILD time, and falls back to runtime if needed.
     let api_key = option_env!("GROQ_API_KEY")
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("GROQ_API_KEY").unwrap_or_default());
@@ -1147,87 +1147,180 @@ async fn ask_ai(
          }).unwrap());
     }
 
-    // 3. System Prompt (Strict JSON-Only API Aligned with Layer 1 Contract)
+    // ==========================================
+    // 🧠 2. THE RUST INTENT ENGINE (Scoring)
+    // ==========================================
+    let input_lower = user_input.to_lowercase();
+    let input_words: Vec<&str> = input_lower
+        .split(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut intent_score = 0;
+    let mut edit_score = 0;
+
+    for &word in &input_words {
+        match word {
+            "mix" | "master" | "level" | "ride" | "duck" | "eq" | "compressor" | 
+            "loudness" | "balance" | "automate" | "stage" | "dynamics" | "punchy" | "harsh" => intent_score += 2,
+            "vocal" | "peak" | "plosive" | "gain" | "normalize" => intent_score += 1,
+            "split" | "cut" | "move" | "merge" | "delete" | "clip" | "slice" => edit_score += 2,
+            "timing" | "arrange" | "time" => edit_score += 1,
+            _ => {}
+        }
+    }
+
+    let is_global_request = input_words.iter().any(|&w| matches!(w, "master" | "mix" | "overall" | "final" | "entire" | "everything" | "all"));
+
+    let mode = if intent_score >= 2 { "MIXING" } else if edit_score >= 2 { "EDITING" } else { "MINIMAL" };
+    println!("🤖 AI Intent Evaluated -> Mode: {}, Global: {}", mode, is_global_request);
+
+    // ==========================================
+    // 🏗️ 3. CONTEXT BUILDER (Lock Audio State)
+    // ==========================================
+    let track_context_str = {
+        let audio_runtime = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+        let tracks_info = audio_runtime.get_tracks_list();
+        let bpm = audio_runtime.bpm();
+
+        // Target Resolution
+        let mut target_track_ids = Vec::new();
+        if let Some(id) = active_track_id {
+            target_track_ids.push(id);
+        } else if !is_global_request {
+            if let Some(track) = tracks_info.iter().find(|t| {
+                input_words.contains(&t.id.to_string().as_str()) ||
+                t.name.to_lowercase().split(|c: char| !c.is_alphanumeric()).any(|token| input_words.contains(&token))
+            }) {
+                target_track_ids.push(track.id as u32);
+            }
+        }
+
+        // Fetch Heavy DSP only if needed
+        let analysis_data = if mode == "MIXING" { audio_runtime.get_all_track_analysis() } else { Vec::new() };
+
+        // Build Payload
+        let mut track_payloads = Vec::new();
+        for info in &tracks_info {
+            let is_target = is_global_request || target_track_ids.contains(&(info.id as u32));
+
+            let mut track_obj = serde_json::json!({
+                "id": info.id,
+                "name": info.name.to_lowercase(),
+                "gain": (info.gain * 100.0).round() / 100.0,
+                "pan": (info.pan * 100.0).round() / 100.0,
+                "muted": info.muted,
+                "solo": info.solo,
+            });
+
+            if mode != "MINIMAL" && is_target {
+                let track_idx = resolve_track_index(&tracks_info, info.id as u32).unwrap_or(0);
+                let obj = track_obj.as_object_mut().unwrap();
+
+                // Add Clips
+                let clips_json: Vec<_> = info.clips.iter().map(|c| {
+                    serde_json::json!({
+                        "clip_number": c.clip_number,
+                        "start_time": (c.start_time * 100.0).round() / 100.0,
+                        "duration": (c.duration * 100.0).round() / 100.0
+                    })
+                }).collect();
+                obj.insert("clips".to_string(), serde_json::Value::Array(clips_json));
+
+                // Add DSP
+                if mode == "MIXING" {
+                    obj.insert("eq".to_string(), serde_json::to_value(audio_runtime.get_eq_state(track_idx)).unwrap());
+                    obj.insert("compressor".to_string(), serde_json::to_value(audio_runtime.get_compressor_state(track_idx)).unwrap());
+                    obj.insert("reverb".to_string(), serde_json::to_value(audio_runtime.get_reverb_state(track_idx)).unwrap());
+
+                    if let Some(analysis) = analysis_data.iter().find(|a| (a.track_id as u32) == (info.id as u32)) {
+                        obj.insert("analysis".to_string(), serde_json::to_value(&analysis.analysis).unwrap());
+                    }
+                }
+            }
+            track_payloads.push(track_obj);
+        }
+
+        let context_json = serde_json::json!({
+            "system_directive": format!("MODE: {}. You MUST ONLY apply actions to target_track_ids.", mode),
+            "mode": mode,
+            "target_track_ids": target_track_ids,
+            "project": { "playhead_position_seconds": playhead_time, "bpm": bpm },
+            "tracks": track_payloads
+        });
+
+        serde_json::to_string(&context_json).map_err(|e| e.to_string())?
+    }; // 🔓 MUTEX LOCK DROPPED HERE! 
+
+    // ==========================================
+    // 🌐 4. SYSTEM PROMPT & API CALL
+    // ==========================================
     let system_prompt = format!(
-        "You are an elite Audio DSP Engineer and a strict JSON API for a DAW. You speak ONLY JSON.\n\
+        "You are an elite Audio Producer and a strict JSON API for a DAW. You speak ONLY JSON.\n\
         \n\
         CONTEXT:\n{}\n\
         \n\
         CRITICAL RULES:\n\
-        1. STRICT JSON: Output a valid JSON object with 'version': '1.0' and a 'commands' array. NO markdown blocks. Output raw, parsable JSON.\n\
-        2. FLATTEN PARAMETERS (CRITICAL): ALL parameters MUST be at the root of the command object. Put 'track_id', 'band_index', 'filter_type', 'freq', 'q', 'gain', 'is_active', 'threshold_db', 'ratio' DIRECTLY inside the command object. NEVER nest them inside an 'eq', 'compressor', or 'reverb' sub-object.\n\
-        3. ALLOWED ACTIONS: play, pause, record, rewind, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor, update_reverb, separate_stems, ride_vocal_level, duck_volume, auto_gain_stage, clear_volume_automation, none.\n\
-        4. TRACK LOCKING (HIGHEST PRIORITY): Look at 'project.target_track_id'. If provided, use this EXACT 'track_id' for all DSP commands unless explicitly named otherwise. Do NOT hallucinate track IDs. If a name is given, map it to the correct 'id' from the context tracks array. Do NOT default to \"track_id\": 0.\n\
-        5. EFFECT ACTIVATION: When applying 'update_compressor', 'update_eq', or 'update_reverb', you MUST include \"is_active\": true. Otherwise, the effect remains bypassed.\n\
-        6. DSP MATH & GAIN: 'set_gain' and 'set_pan' strictly use LINEAR values (0.0 is silence, 1.0 is unity, 2.0 is +6dB). All other volume params ('depth_db', 'target_lufs', 'threshold_db') MUST be in standard audio decibels (dB) or LUFS.\n\
-        7. MERGE CLIPS: You MUST ONLY provide the 'clip_number' of the left-most clip. Do NOT invent a 'next_clip_number'.\n\
-        8. RELATIVE TIMING: 1 Quarter Note = 60 / BPM seconds. Calculate 'time' or 'new_time' parameters in exact SECONDS. If the user says 'here' or 'current position', use 'playhead_position_seconds'.\n\
-        9. EXACT PARAMETER NAMES: \n\
-           - 'update_compressor': MUST use 'makeup_gain_db'. Allowed: 'threshold_db', 'ratio', 'attack_ms', 'release_ms', 'makeup_gain_db', 'is_active'.\n\
-           - 'update_reverb': Allowed: 'room_size', 'damping', 'mix', 'width', 'pre_delay_ms', 'low_cut_hz', 'high_cut_hz', 'is_active'.\n\
-        10. STUDIO MIXING & MASTERING PROTOCOL:\n\
-           - If the user asks for 'studio quality' or 'mastering', apply this exact chain via multiple commands:\n\
-             1st: 'update_eq' (Cut muddy lows below 100Hz. You MUST include 'band_index': 0)\n\
-             2nd: 'update_compressor' (Control dynamics, gentle ratio 2:1 for master, 4:1 for vocals. MUST use 'makeup_gain_db')\n\
-             3rd: 'update_reverb' (Add subtle space, set is_active: true, keep mix low e.g., 0.15)\n\
-             4th: 'ride_vocal_level' and apply 'auto_gain_stage' only if its required (Final leveling)\n\
+        1. STRICT JSON: Output a valid JSON object with 'version': '1.0' and a 'commands' array. NO markdown blocks.\n\
+        2. FLATTEN PARAMETERS: ALL parameters MUST be at the root of the command object. NEVER nest them.\n\
+        3. ALLOWED ACTIONS: play, pause, record, rewind, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor, update_reverb, separate_stems, ride_vocal_level, duck_volume, auto_gain_stage, clear_volume_automation, auto_compress, auto_eq, auto_reverb, none.\n\
+        4. TRACK LOCKING: You MUST ONLY apply actions to the exact 'target_track_ids' provided in the context.\n\
+        5. RELATIVE TIMING: If the user says 'here', use 'playhead_position_seconds'.\n\
+        6. CLIP EDITING STRICT PARAMS: \n\
+           - 'split_clip' MUST use 'time' (seconds). NEVER use 'split_time'.\n\
+           - 'merge_clips' MUST use 'clip_number' (left-most clip). NEVER use 'clip_id_1'.\n\
         \n\
-        AUTOMATION & VOLUME GUIDELINES:\n\
-        Choose the correct tool based on the user's request. Do not guess dB values; use the analysis arrays provided in the context.\n\
-        - TOOL A: Peak Protection (duck_volume) - Use ONLY to \"fix clipping\" or \"remove plosives\". Look at the 'peak_events' array in the analysis. Generate a 'duck_volume' command for each peak using its 't' (time) and a calculated 'depth_db'.\n\
-        - TOOL B: Dynamic Automation / Riding (ride_vocal_level) - Use when the user asks for \"automation\", \"automate the gain/volume\", \"ride the fader\", \"level the vocals\", or \"balance the track\". This draws dynamic volume curves over time. You MUST use 'loudness_p10_db' (from context) for 'noise_floor_db'. Default 'target_lufs' is -16.0.\n\
-        - TOOL C: Static Auto-Gain (auto_gain_stage) - Use ONLY when the user asks to \"gain stage\" or \"normalize\". This is a single, static volume change, NOT automation. Target 'target_lufs' is -18.0 if unspecified.\n\
+        --- PRO-LEVEL HYBRID ARCHITECTURE ---\n\
+        7. DO NOT DO AUDIO MATH. Use the Semantic Tools below. The internal Rust DSP engine handles the exact dB physics.\n\
+        8. THE SEMANTIC TOOLS: \n\
+           - 'auto_compress' -> Controls dynamics. Params: 'track_id', 'style' (\"vocal\", \"master\", \"drums\", \"bass\"), 'intensity' (0.0 to 1.0).\n\
+           - 'auto_eq' -> Shapes tone. Params: 'track_id', 'intent' (\"presence\", \"warmth\", \"clarity\", \"mud_cut\", \"air\", \"rumble_cut\"), 'intensity' (0.0 to 1.0).\n\
+           - 'auto_reverb' -> Adds space. Params: 'track_id', 'space' (\"room\", \"hall\", \"plate\", \"chamber\"), 'intensity' (0.0 to 1.0).\n\
+        \n\
+        9. AUTOMATION & RIDING:\n\
+           - 'ride_vocal_level': Use for dynamic leveling. ALWAYS include \"preserve_dynamics\": true, \"max_boost_db\": 6.0, \"max_cut_db\": -12.0, and 'noise_floor_db' (from loudness_p10_db). Target -16.0 LUFS.\n\
+           - 'auto_gain_stage': Single static volume shift. Target -18.0 LUFS.\n\
+        \n\
+        10. STUDIO MIXING & MASTERING PROTOCOL:\n\
+           - If the user asks for 'studio quality', 'mastering', or to 'mix' a track, you MUST apply a full chain:\n\
+             1st: 'auto_eq' (to clean up the tone)\n\
+             2nd: 'auto_compress' (to control dynamics)\n\
+             3rd: 'ride_vocal_level' (to perfectly balance the volume over time)\n\
+             4th: 'auto_reverb' (if space/room is requested)\n\
+        \n\
         SCHEMA EXAMPLES:\n\
         User: \"Master my track\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"update_eq\", \"track_id\": 1, \"band_index\": 0, \"filter_type\": \"HighPass\", \"freq\": 100.0, \"q\": 0.7, \"gain\": 0.0, \"is_active\": true}}, {{\"action\": \"update_compressor\", \"track_id\": 1, \"threshold_db\": -18.0, \"ratio\": 2.0, \"attack_ms\": 10.0, \"release_ms\": 100.0, \"makeup_gain_db\": 2.0, \"is_active\": true}}, {{\"action\": \"update_reverb\", \"track_id\": 1, \"room_size\": 0.6, \"mix\": 0.15, \"is_active\": true}}], \"message\": \"Applied studio master chain.\", \"confidence\": 0.98}}\n\
-        \n\
-        User: \"Level my vocals and add some space\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"ride_vocal_level\", \"track_id\": 1, \"target_lufs\": -16.0, \"noise_floor_db\": -40.0}}, {{\"action\": \"update_reverb\", \"track_id\": 1, \"is_active\": true, \"room_size\": 0.6, \"mix\": 0.2}}], \"message\": \"Applied vocal rider and reverb.\", \"confidence\": 0.95}}\n\
-        \n\
-        User: \"undo that\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"undo\"}}], \"message\": \"Undoing last action.\", \"confidence\": 1.0}}\n\
+        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"auto_eq\", \"track_id\": 1, \"intent\": \"clarity\", \"intensity\": 0.6}}, {{\"action\": \"auto_compress\", \"track_id\": 1, \"style\": \"master\", \"intensity\": 0.4}}, {{\"action\": \"ride_vocal_level\", \"track_id\": 1, \"target_lufs\": -14.0, \"noise_floor_db\": -45.0, \"max_boost_db\": 6.0, \"max_cut_db\": -12.0, \"preserve_dynamics\": true}}], \"message\": \"Applied master EQ, compression, and leveled the audio.\", \"confidence\": 0.98}}\n\
         ",
-        track_context
+        track_context_str
     );
 
-
-    // 4. Construct Message Chain (System -> History -> User)
     let mut messages_payload = Vec::new();
-    
-    // A. System Prompt
     messages_payload.push(serde_json::json!({ "role": "system", "content": system_prompt }));
 
-    // B. Chat History (The Memory)
-    // We limit history to last 6 messages to save tokens/speed
     let history_limit = 6;
     let start_index = if chat_history.len() > history_limit { chat_history.len() - history_limit } else { 0 };
     
     for msg in &chat_history[start_index..] {
-        // Map 'ai' or anything else to strict 'assistant' just in case
         let clean_role = match msg.role.as_str() {
             "user" => "user",
             "system" => "system",
-            _ => "assistant", // Fallback for 'ai' or invalid roles
+            _ => "assistant",
         };
         messages_payload.push(serde_json::json!({ "role": clean_role, "content": msg.content }));
     }
 
-    // C. Current User Input
     messages_payload.push(serde_json::json!({ "role": "user", "content": user_input }));
 
-    // 4. Construct Request Payload
     let payload = serde_json::json!({
-        "model":   "llama-3.3-70b-versatile",  //"qwen/qwen3-32b", //"qwen-2.5-72b-instruct",  //"llama3-70b-8192", // Fast & Good at JSON
+        "model": "llama-3.3-70b-versatile",
         "messages": messages_payload,
         "response_format": { "type": "json_object" },
-
-        "temperature" : 0.0, // Low creativity = High accuracy for code
-        "max_tokens" : 600, // Prevent rambling
-        "top_p": 1.0,   // Standard sampling
-        "stream": false // We need full JSON to execute
+        "temperature" : 0.0,
+        "max_tokens" : 600,
+        "stream": false
     });
 
-    // 5. Send Request
     let res = client.post("https://api.groq.com/openai/v1/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
@@ -1236,19 +1329,15 @@ async fn ask_ai(
         .await
         .map_err(|e| format!("Network Error: {}", e))?;
 
-    // FIX 3: Capture the ACTUAL error message from Groq
     if !res.status().is_success() {
         let error_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-        println!("❌ AI Error Body: {}", error_text); // Prints to your terminal
-        
+        println!("❌ AI Error Body: {}", error_text); 
         return Ok(serde_json::to_string(&AiErrorResponse {
             action: "none".into(),
-            // Send a sanitized message to UI, but you see full error in terminal
             message: "I'm having trouble thinking right now (API Error).".into() 
         }).unwrap());
     }
 
-    // 6. Parse Response
     let chat_res: GroqApiResponse = res.json().await.map_err(|e| format!("Parse Error: {}", e))?;
     
     if let Some(choice) = chat_res.choices.first() {

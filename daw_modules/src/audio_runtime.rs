@@ -1188,6 +1188,90 @@ impl AudioRuntime {
                         }
                     }
                 },
+                // ====================================================
+                // 🚀 THE NEW HYBRID INTENT ENGINE (RUST DOES THE MATH)
+                // ====================================================
+                AiAction::AutoCompress { track_id, style, intensity } => {
+                    if let Some(idx) = resolve(track_id) {
+                        if let Ok(mut engine) = self.engine.lock() {
+                            if let Some(track) = engine.tracks_mut().get_mut(idx) {
+                                let lufs = if let Ok(guard) = track.analysis.lock() { guard.as_ref().map(|a| a.integrated_loudness_db).unwrap_or(-18.0_f32) } else { -18.0_f32 };
+                                let peak = if let Ok(guard) = track.analysis.lock() { guard.as_ref().map(|a| a.max_sample_peak_db).unwrap_or(-6.0_f32) } else { -6.0_f32 };
+                                
+                                let dynamic_range = (peak - lufs).abs();
+                                let style_str = style.clone().unwrap_or("vocal".to_string());
+                                let inten = intensity.unwrap_or(0.5_f32).clamp(0.0_f32, 1.0_f32);
+
+                                let (ratio, attack, release) = match style_str.as_str() {
+                                    "master" => (1.5_f32 + inten * 1.5_f32, 30.0_f32, 150.0_f32),
+                                    "drums" => (4.0_f32 + inten * 4.0_f32, 5.0_f32, 50.0_f32),
+                                    "bass" => (3.0_f32 + inten * 3.0_f32, 15.0_f32, 100.0_f32),
+                                    _ => (2.0_f32 + inten * 3.0_f32, 10.0_f32, 100.0_f32), 
+                                };
+
+                                let threshold_db = lufs - (dynamic_range * 0.3_f32 * inten);
+                                let makeup_gain = (threshold_db.abs() * (1.0_f32 - 1.0_f32 / ratio)) * 0.5_f32;
+
+                                let params = crate::effects::compressor::CompressorParams {
+                                    is_active: true,
+                                    threshold_db: threshold_db.clamp(-60.0_f32, 0.0_f32),
+                                    ratio: ratio.clamp(1.0_f32, 20.0_f32),
+                                    attack_ms: attack.clamp(0.1_f32, 200.0_f32),
+                                    release_ms: release.clamp(10.0_f32, 1000.0_f32),
+                                    makeup_gain_db: makeup_gain.clamp(0.0_f32, 24.0_f32),
+                                };
+                                track.track_compressor.set_params(params);
+                            }
+                        }
+                    }
+                },
+                AiAction::AutoEq { track_id, intent, intensity } => {
+                    if let Some(idx) = resolve(track_id) {
+                        if let Ok(mut engine) = self.engine.lock() {
+                            if let Some(track) = engine.tracks_mut().get_mut(idx) {
+                                let centroid = if let Ok(guard) = track.analysis.lock() { guard.as_ref().map(|a| a.spectral_centroid_hz).unwrap_or(2000.0_f32) } else { 2000.0_f32 };
+                                let inten = intensity.unwrap_or(0.5_f32).clamp(0.0_f32, 1.0_f32);
+                                let intent_str = intent.clone().unwrap_or("presence".to_string());
+
+                                let (freq, gain, filter_type, q, band_idx) = match intent_str.as_str() {
+                                    "presence" => (centroid.clamp(1500.0_f32, 5000.0_f32), 2.0_f32 + (inten * 4.0_f32), crate::effects::equalizer::EqFilterType::Peaking, 1.2_f32, 2),
+                                    "warmth" => (250.0_f32, 1.5_f32 + (inten * 3.0_f32), crate::effects::equalizer::EqFilterType::LowShelf, 0.7_f32, 1),
+                                    "clarity" => (centroid.clamp(3000.0_f32, 8000.0_f32), 2.0_f32 + (inten * 3.0_f32), crate::effects::equalizer::EqFilterType::HighShelf, 0.7_f32, 3),
+                                    "mud_cut" => (250.0_f32, -(2.0_f32 + (inten * 4.0_f32)), crate::effects::equalizer::EqFilterType::Peaking, 1.5_f32, 1),
+                                    "air" => (10000.0_f32, 2.0_f32 + (inten * 3.0_f32), crate::effects::equalizer::EqFilterType::HighShelf, 0.7_f32, 3),
+                                    "rumble_cut" => (80.0_f32, 0.0_f32, crate::effects::equalizer::EqFilterType::HighPass, 0.7_f32, 0),
+                                    _ => (centroid, 2.0_f32, crate::effects::equalizer::EqFilterType::Peaking, 1.0_f32, 2),
+                                };
+
+                                let params = crate::effects::equalizer::EqParams { filter_type, freq, q, gain, active: true };
+                                track.track_eq.update_band(band_idx, params);
+                            }
+                        }
+                    }
+                },
+                AiAction::AutoReverb { track_id, space, intensity } => {
+                    if let Some(idx) = resolve(track_id) {
+                        if let Ok(mut engine) = self.engine.lock() {
+                            if let Some(track) = engine.tracks_mut().get_mut(idx) {
+                                let inten = intensity.unwrap_or(0.5_f32).clamp(0.0_f32, 1.0_f32);
+                                let space_str = space.clone().unwrap_or("room".to_string());
+
+                                let (room_size, damping, pre_delay, mix) = match space_str.as_str() {
+                                    "hall" => (0.8_f32 + inten * 0.2_f32, 0.4_f32, 20.0_f32 + inten * 20.0_f32, 0.15_f32 + inten * 0.15_f32),
+                                    "plate" => (0.6_f32, 0.2_f32, 5.0_f32, 0.1_f32 + inten * 0.15_f32),
+                                    "chamber" => (0.5_f32, 0.5_f32, 10.0_f32, 0.1_f32 + inten * 0.1_f32),
+                                    _ => (0.4_f32 + inten * 0.2_f32, 0.6_f32, 5.0_f32, 0.1_f32 + inten * 0.1_f32),
+                                };
+
+                                let params = crate::effects::reverb::ReverbParams {
+                                    is_active: true, room_size, damping, pre_delay_ms: pre_delay, mix,
+                                    width: 1.0_f32, low_cut_hz: 200.0_f32, high_cut_hz: 6000.0_f32,
+                                };
+                                track.track_reverb.set_params(params);
+                            }
+                        }
+                    }
+                },
                 AiAction::ClearVolumeAutomation { track_id } => {
                     // Note: ai_schema uses usize for track_id, but the backend methods expect u32
                     let _ = self.clear_volume_automation(track_id as u32);
@@ -1245,12 +1329,13 @@ impl AudioRuntime {
                     }
                 },
 
-                AiAction::RideVocalLevel { track_id, target_lufs, max_boost_db, max_cut_db, smoothness, analysis_window_ms, noise_floor_db } => {
+                AiAction::RideVocalLevel { track_id, target_lufs, max_boost_db, max_cut_db, smoothness, analysis_window_ms, noise_floor_db, preserve_dynamics } => {
                     let boost = max_boost_db.unwrap_or(6.0);
                     let cut = max_cut_db.unwrap_or(-4.0);
                     let smooth = smoothness.unwrap_or(0.7);
                     let window = analysis_window_ms.unwrap_or(200);
                     let gate_threshold = noise_floor_db.unwrap_or(-40.0);
+                    let preserve = preserve_dynamics.unwrap_or(false);
 
                     let engine_sample_rate = self.sample_rate();
 
@@ -1313,7 +1398,8 @@ impl AudioRuntime {
                                         cut,
                                         smooth,
                                         window,
-                                        gate_threshold
+                                        gate_threshold,
+                                        preserve
                                     );
 
                                     // Because the clip might be 44.1kHz but the engine is 48kHz,
