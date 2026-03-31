@@ -14,6 +14,7 @@ pub struct AiCommandEnvelope {
     // but they are ignored by DSP.
     pub message: Option<String>,
     pub confidence: Option<f32>,
+    pub error: Option<String>,
 }
 
 /// The Strict Enum of Actions.
@@ -141,7 +142,7 @@ pub enum AiAction {
     },
     RideVocalLevel {               // <--- NEW ACTION ADDED
         track_id: usize,
-        target_lufs: f32,
+        target_lufs: Option<f32>,
         max_boost_db: Option<f32>, 
         max_cut_db: Option<f32>,   
         smoothness: Option<f32>,   

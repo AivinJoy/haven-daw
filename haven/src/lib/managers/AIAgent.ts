@@ -61,6 +61,7 @@ export interface AIBatchRequest {
     commands: AICommand[];
     message: string;
     confidence: number;
+    error?: string;
 }
 
 interface RecordingState {
@@ -139,6 +140,17 @@ class AIAgent {
             const cleanResponse = rawResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
             console.log("🟢 RAW AI RESPONSE STRING:", cleanResponse);
             const data: AIBatchRequest = JSON.parse(cleanResponse);
+
+            // --- 🚨 NEW: HANDLE AI CONFUSION ---
+            if (data.error) {
+                console.warn("AI aborted transaction:", data.error);
+                return {
+                    role: 'assistant',
+                    content: "I couldn't complete that. Please select a specific track or provide more details.",
+                    timestamp: Date.now(),
+                    action: 'error'
+                };
+            }
 
             // --- SAFETY & SORTING INTERCEPTOR ---
             if (data.commands && Array.isArray(data.commands)) {

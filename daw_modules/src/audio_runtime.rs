@@ -950,18 +950,16 @@ impl AudioRuntime {
         Err("Failed to lock engine".to_string())
     }
 
-    pub fn add_volume_automation_node(&self, track_id: u32, time: u64, value: f32) -> Result<(), String> {
+    // CHANGED: time is now f64
+    pub fn add_volume_automation_node(&self, track_id: u32, time: f64, value: f32) -> Result<(), String> {
         if let Ok(mut eng) = self.engine.lock() {
-            let sample_rate = eng.sample_rate as f64; // Grab SR for time calculations
-            
             if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
                 
-                // --- NEW: THE AUTO-ANCHOR FIX ---
                 let is_empty = track.volume_automation.nodes().is_empty();
                 
                 if is_empty {
-                    // 1. Insert Start Anchor (0.0 dB at exactly 0 seconds)
-                    track.volume_automation.insert_node(0, 0.0);
+                    // 1. Insert Start Anchor (0.0 dB at exactly 0.0 seconds)
+                    track.volume_automation.insert_node(0.0, 0.0);
                     
                     // 2. Find the absolute end of the track's audio to place the End Anchor
                     let mut max_time_secs = 600.0; // Fallback: 10 minutes if track is empty
@@ -973,15 +971,13 @@ impl AudioRuntime {
                         max_time_secs = (last_clip.start_time + last_clip.duration).as_secs_f64();
                     }
                     
-                    // Place the end anchor 60 seconds past the last clip to ensure the UI line stays flat to the right
-                    let end_sample = ((max_time_secs + 60.0) * sample_rate).round() as u64;
-                    track.volume_automation.insert_node(end_sample, 0.0);
+                    // Place the end anchor 60 seconds past the last clip
+                    track.volume_automation.insert_node(max_time_secs + 60.0, 0.0);
                 }
 
                 // --- DEBUG LOG ---
-                let time_sec = time as f64 / sample_rate;
-                println!("🎚️ Engine Stored Node -> Track: {} | Time: {:.3}s (Sample: {}) | Value: {:.2} dB", 
-                    track_id, time_sec, time, value
+                println!("🎚️ Engine Stored Node -> Track: {} | Time: {:.3}s | Value: {:.2} dB", 
+                    track_id, time, value
                 );
                 // -----------------
 
@@ -995,7 +991,8 @@ impl AudioRuntime {
         Err("Failed to lock engine".to_string())
     }
 
-    pub fn remove_volume_automation_node(&self, track_id: u32, time: u64) -> Result<(), String> {
+    // CHANGED: time is now f64
+    pub fn remove_volume_automation_node(&self, track_id: u32, time: f64) -> Result<(), String> {
         if let Ok(mut eng) = self.engine.lock() {
             if let Some(track) = eng.tracks_mut().iter_mut().find(|t| t.id.0 == track_id) {
                 track.volume_automation.remove_node_at_time(time);
@@ -1277,28 +1274,21 @@ impl AudioRuntime {
                     let _ = self.clear_volume_automation(track_id as u32);
                 },
                 AiAction::AddVolumeAutomation { track_id, time, value } => {
-                    let sr = self.sample_rate() as f64;
-                    // Safely convert AI seconds to exact hardware samples
-                    let time_samples = (time * sr).round() as u64; 
-                    let _ = self.add_volume_automation_node(track_id as u32, time_samples, value);
+                    // 🚀 No more sample rate math! Pass absolute seconds directly.
+                    let _ = self.add_volume_automation_node(track_id as u32, time, value);
                 },
                 AiAction::DuckVolume { track_id, time, depth_db } => {
-                    let sr = self.sample_rate() as f64;
                     let t_id = track_id as u32;
 
-                    // Let Rust do the math! 50ms attack, 200ms release.
+                    // Let Rust do the math! 50ms attack, 200ms release (in absolute seconds)
                     let anchor_start = (time - 0.05).max(0.0);
                     let duck_time = time;
                     let anchor_end = time + 0.20;
 
-                    let sample_start = (anchor_start * sr).round() as u64;
-                    let sample_duck = (duck_time * sr).round() as u64;
-                    let sample_end = (anchor_end * sr).round() as u64;
-
-                    // Safely insert the 3 nodes
-                    let _ = self.add_volume_automation_node(t_id, sample_start, 0.0);
-                    let _ = self.add_volume_automation_node(t_id, sample_duck, depth_db);
-                    let _ = self.add_volume_automation_node(t_id, sample_end, 0.0);
+                    // 🚀 Safely insert the 3 nodes using pure seconds (f64)
+                    let _ = self.add_volume_automation_node(t_id, anchor_start, 0.0);
+                    let _ = self.add_volume_automation_node(t_id, duck_time, depth_db);
+                    let _ = self.add_volume_automation_node(t_id, anchor_end, 0.0);
                 },
 
                 AiAction::AutoGainStage { track_id, target_lufs } => {
@@ -1330,12 +1320,16 @@ impl AudioRuntime {
                 },
 
                 AiAction::RideVocalLevel { track_id, target_lufs, max_boost_db, max_cut_db, smoothness, analysis_window_ms, noise_floor_db, preserve_dynamics } => {
-                    let boost = max_boost_db.unwrap_or(6.0);
-                    let cut = max_cut_db.unwrap_or(-4.0);
-                    let smooth = smoothness.unwrap_or(0.7);
-                    let window = analysis_window_ms.unwrap_or(200);
-                    let gate_threshold = noise_floor_db.unwrap_or(-40.0);
-                    let preserve = preserve_dynamics.unwrap_or(false);
+                    
+                    // 🚀 THE FIX: Safely unwrap ALL parameters, including target_lufs!
+                    // We apply our safe studio defaults here if the AI didn't provide them.
+                    let target = target_lufs.unwrap_or(-16.0);
+                    let boost = max_boost_db.unwrap_or(4.0);
+                    let cut = max_cut_db.unwrap_or(-12.0);
+                    let smooth = smoothness.unwrap_or(0.85);
+                    let window = analysis_window_ms.unwrap_or(300);
+                    let gate_threshold = noise_floor_db.unwrap_or(-60.0);
+                    let preserve = preserve_dynamics.unwrap_or(true);
 
                     let engine_sample_rate = self.sample_rate();
 
@@ -1354,7 +1348,7 @@ impl AudioRuntime {
                                 )
                             }).collect();
 
-                           for (path, start_time_sec, offset_sec, duration_sec) in clips_meta {
+                            for (path, start_time_sec, offset_sec, duration_sec) in clips_meta {
                                 
                                 // --- AUDIO CACHE CHECK ---
                                 let cache_result = {
@@ -1364,7 +1358,7 @@ impl AudioRuntime {
                                     } else {
                                         // Decode and cache if not found
                                         if let Ok((data, sr, ch)) = crate::bpm::adapter::decode_to_vec(&path) {
-                                            let data_arc = Arc::new(data);
+                                            let data_arc = std::sync::Arc::new(data);
                                             cache.insert(path.clone(), (data_arc.clone(), sr, ch));
                                             Some((data_arc, sr, ch))
                                         } else {
@@ -1376,8 +1370,6 @@ impl AudioRuntime {
                                 if let Some((audio_data, source_sr, source_ch)) = cache_result {
 
                                     // --- THE TIME DOMAIN FIX ---
-                                    // The file starts at 0, but the clip might be trimmed (offset) and cropped (duration).
-                                    // We MUST slice the raw audio buffer so the AI only analyzes what is visible on the timeline!
                                     let start_sample = (offset_sec * source_sr as f64).round() as usize * source_ch;
                                     let len_samples = (duration_sec * source_sr as f64).round() as usize * source_ch;
                                     let end_sample = (start_sample + len_samples).min(audio_data.len());
@@ -1393,7 +1385,7 @@ impl AudioRuntime {
                                         source_ch, 
                                         source_sr, // Process at native sample rate for accurate RMS
                                         start_time_sec,
-                                        target_lufs, 
+                                        target,    // 🚀 THE FIX: Passed the unwrapped `target` here!
                                         boost,
                                         cut,
                                         smooth,
@@ -1402,13 +1394,8 @@ impl AudioRuntime {
                                         preserve
                                     );
 
-                                    // Because the clip might be 44.1kHz but the engine is 48kHz,
-                                    // we align the generated node timestamps to the engine's actual sample rate.
-                                    let sample_rate_ratio = engine_sample_rate as f64 / source_sr as f64;
-                                    for node in clip_nodes.iter_mut() {
-                                        node.time = (node.time as f64 * sample_rate_ratio).round() as u64;
-                                    }
-
+                                    // 🚀 NO MORE SAMPLE RATE RATIO MATH HERE!
+                                    // The nodes generated are already in pure absolute seconds (f64).
                                     all_rider_nodes.append(&mut clip_nodes);
                                 }
                             }
@@ -1419,16 +1406,16 @@ impl AudioRuntime {
                             println!("--- VOCAL RIDER DEBUG ---");
                             println!("Engine Sample Rate: {}", engine_sample_rate);
                             for (i, node) in all_rider_nodes.iter().enumerate().take(10) {
-                                let time_in_seconds = node.time as f64 / engine_sample_rate as f64;
-                                println!("Node {}: Time: {:.3}s | Gain: {:.2} dB", i, time_in_seconds, node.value);
+                                // 🚀 node.time is ALREADY in seconds! No division needed.
+                                println!("Node {}: Time: {:.3}s | Gain: {:.2} dB", i, node.time, node.value);
                             }
                             println!("-------------------------");
                             // ==========================================
 
-                            // FIX 5: Use the safe, public AutomationCurve API. 
-                            // insert_node handles binary-search sorting automatically!
+                            // Use the safe, public AutomationCurve API. 
                             track.volume_automation.clear();
                             for node in all_rider_nodes {
+                                // insert_node now cleanly accepts (f64, f32)
                                 track.volume_automation.insert_node(node.time, node.value);
                             }
                         }

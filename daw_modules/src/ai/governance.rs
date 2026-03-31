@@ -180,15 +180,16 @@ pub fn translate_action(action: AiAction) -> Result<Box<dyn Command>, Governance
         }
 
         AiAction::RideVocalLevel { track_id, target_lufs, max_boost_db, max_cut_db, smoothness, analysis_window_ms, noise_floor_db, preserve_dynamics } => {
-            // 1. Unwrap AI optionals with safe default studio settings
-            // 2. Clamp strictly to DSP engine limits
-            let safe_target = target_lufs.clamp(-36.0, 0.0);
-            let safe_boost = max_boost_db.unwrap_or(6.0).clamp(0.0, 24.0);
+            
+            // 🚀 THE FIX: If the AI omits target_lufs, default to -16.0 LUFS
+            let safe_target = target_lufs.unwrap_or(-16.0).clamp(-36.0, 0.0); 
+            
+            let safe_boost = max_boost_db.unwrap_or(4.0).clamp(0.0, 24.0); 
             let safe_cut = max_cut_db.unwrap_or(-12.0).clamp(-60.0, 0.0);
-            let safe_smooth = smoothness.unwrap_or(0.5).clamp(0.0, 1.0);
+            let safe_smooth = smoothness.unwrap_or(0.85).clamp(0.0, 1.0); 
             let safe_window = analysis_window_ms.unwrap_or(300).clamp(50, 2000);
             let safe_noise = noise_floor_db.unwrap_or(-60.0).clamp(-100.0, 0.0);
-            let safe_preserve = preserve_dynamics.unwrap_or(false);
+            let safe_preserve = preserve_dynamics.unwrap_or(true);
 
             Ok(Box::new(RideVocalLevelCmd {
                 track_id: TrackId(track_id as u32),

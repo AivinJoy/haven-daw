@@ -27,6 +27,10 @@
     let hoveredIndex = $state<number | null>(null);
     let activeIndex = $derived(draggingIndex !== null ? draggingIndex : hoveredIndex);
 
+    // 🚀 NEW: Smart Density Detection
+    // If the AI creates > 20 nodes, we switch to high-density drawing mode
+    let isDense = $derived(nodes.length > 20);
+
     let historyPast = $state<AutomationNode[][]>([]);
     let historyFuture = $state<AutomationNode[][]>([]);
 
@@ -148,10 +152,15 @@
         return pts;
     });
 
-    async function loadNodes() {
+   async function loadNodes() {
         try {
             const fetchedNodes: AutomationNode[] = await invoke('get_volume_automation', { trackId });
-            nodes = fetchedNodes.sort((a, b) => a.time - b.time);
+            
+            // 🚀 THE REACTIVITY FIX: Deep equality check
+            // Only update Svelte state if the backend actually changed (prevents flickering)
+            if (JSON.stringify(fetchedNodes) !== JSON.stringify(nodes)) {
+                nodes = fetchedNodes.sort((a, b) => a.time - b.time);
+            }
         } catch (error) {
             console.error("Failed to load automation:", error);
         }
@@ -272,8 +281,19 @@
     }
 
     onMount(() => {
-        // Always fetch from backend on mount to guarantee perfect precision
+        // Always fetch from backend on mount
         loadNodes();
+        
+        // 🚀 THE BACKGROUND POLL FIX
+        // Quietly checks the Rust engine every 1.5s for AI updates. 
+        // Skips updating if the user is currently holding a node to prevent glitching.
+        const pollInterval = setInterval(() => {
+            if (draggingIndex === null) {
+                loadNodes();
+            }
+        }, 1500);
+
+        return () => clearInterval(pollInterval);
     });
 </script>
 
@@ -303,15 +323,16 @@
         <circle 
             cx={timeToX(node.time)} 
             cy={gainToY(node.value)} 
-            r={draggingIndex === i ? "6" : "4"} 
+            r={draggingIndex === i || hoveredIndex === i ? "6" : (isDense ? "3" : "4.5")} 
             fill="#FFFFFF" 
             stroke="#FFFFFF" 
-            stroke-width="2" 
+            stroke-width={isDense ? "0" : "2"} 
             class="automation-node"
-            onpointerdown={(e) => startDrag(i, e)}
+            style="opacity: {isDense && hoveredIndex !== i && draggingIndex !== i ? 0.85 : 1.0}"
+            onpointerdown={(e: PointerEvent) => startDrag(i, e)}
             onpointerup={endDrag}
-            oncontextmenu={(e) => handleRightClick(i, e)}
-            ondblclick={(e) => handleDoubleClick(i, e)}
+            oncontextmenu={(e: MouseEvent) => handleRightClick(i, e)}
+            ondblclick={(e: MouseEvent) => handleDoubleClick(i, e)}
             onpointerenter={() => hoveredIndex = i}
             onpointerleave={() => hoveredIndex = null}
             role="button"
@@ -361,7 +382,8 @@
 
     .automation-node {
         cursor: grab;
-        transition: r 0.1s ease;
+        /* 🚀 NEW: Added opacity transition for smooth hover effects */
+        transition: r 0.1s ease, opacity 0.2s ease;
     }
 
     .automation-node:active {

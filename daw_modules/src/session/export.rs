@@ -275,17 +275,27 @@ impl ExportVoice {
                 // 3. Automation & Gain 
                 let start_sample = (self.frames_processed + buf_offset) as u64; // accurate global timeline sample
                 let end_sample = start_sample + frames_to_mix as u64;
-                let start_gain_db = self.volume_automation.get_value_at_time(start_sample, 0.0);
-                let end_gain_db = self.volume_automation.get_value_at_time(end_sample, 0.0);
+
+                // 🚀 THE FIX: The export engine is locked to 44100Hz, so we safely use that for our f64 time division!
+                let sr = 44100.0; 
+                let start_secs = start_sample as f64 / sr;
+                let end_secs = end_sample as f64 / sr;
+
+                // Pass the absolute seconds into the automation curve
+                let start_gain_db = self.volume_automation.get_value_at_time(start_secs, 0.0);
+                let end_gain_db = self.volume_automation.get_value_at_time(end_secs, 0.0);
 
                 let start_gain_linear = self.gain * 10.0_f32.powf(start_gain_db / 20.0);
                 let end_gain_linear = self.gain * 10.0_f32.powf(end_gain_db / 20.0);
+                
                 let gain_step = if frames_to_mix > 1 {
                     (end_gain_linear - start_gain_linear) / (frames_to_mix as f32 - 1.0)
                 } else { 0.0 };
 
+                // 🚀 RESTORED THE MISSING VARIABLES HERE!
                 let mut current_gain = start_gain_linear;
                 let pan = self.pan.clamp(-1.0, 1.0);
+                
                 let (pan_l, pan_r) = if self.pan != 0.0 {
                     let angle = (pan + 1.0) * 0.25 * std::f32::consts::PI;
                     (angle.cos(), angle.sin())

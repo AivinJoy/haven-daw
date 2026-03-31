@@ -614,21 +614,19 @@ impl Track {
 
         // 1. Calculate time overlap
         
-        // let current_secs = engine_time.as_secs_f64();
+        // 1. Calculate time overlap
         let buffer_duration = (dst.len() / channels) as f64 / sample_rate as f64;
         let start_secs = engine_time.as_secs_f64();
         let end_secs = start_secs + buffer_duration;
 
         let mut active_clips = 0;
 
-        // --- NEW: Calculate Automation Boundaries in dB ---
         let frames = dst.len() / channels;
-        let start_sample = (start_secs * sample_rate as f64).round() as u64;
-        let end_sample = start_sample + frames as u64;
 
-        // 1. Fetch from automation curve (default to 0.0 dB / unity gain if no automation exists)
-        let start_gain_db = self.volume_automation.get_value_at_time(start_sample, 0.0);
-        let end_gain_db = self.volume_automation.get_value_at_time(end_sample, 0.0);
+        // 🚀 THE FIX: Pass absolute seconds (f64) directly to the automation curve!
+        // No more u64 sample conversion needed here.
+        let start_gain_db = self.volume_automation.get_value_at_time(start_secs, 0.0);
+        let end_gain_db = self.volume_automation.get_value_at_time(end_secs, 0.0);
 
         // 2. Convert dB to Linear Multiplier and combine with the static Track Fader (self.gain)
         let start_gain_linear = self.gain * 10.0_f32.powf(start_gain_db / 20.0);

@@ -419,13 +419,12 @@ pub struct AddVolumeAutomationCmd {
 
 impl Command for AddVolumeAutomationCmd {
     fn execute(&self, engine: &mut Engine) -> Result<()> {
-        // 1. EXTRACT FIRST (Before the mutable borrow)
-        let sr = engine.sample_rate as f64; 
+        // 🚀 No sr extraction needed
         
-        // 2. MUTABLY BORROW TRACKS
+        // MUTABLY BORROW TRACKS
         if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
-            let time_in_samples = (self.time * sr) as u64;
-            track.volume_automation.insert_node(time_in_samples, self.value);
+            // 🚀 Pass pure seconds (f64) directly
+            track.volume_automation.insert_node(self.time, self.value);
         }
         Ok(())
     }
@@ -443,16 +442,15 @@ pub struct DuckVolumeCmd {
 
 impl Command for DuckVolumeCmd {
     fn execute(&self, engine: &mut Engine) -> Result<()> {
-        // 1. EXTRACT FIRST
-        let sr = engine.sample_rate as f64; 
+        // 🚀 No sr extraction needed
         
-        // 2. MUTABLY BORROW TRACKS
+        // MUTABLY BORROW TRACKS
         if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
             
-            // Create a quick "V" shape dip for ducking plosives/peaks
-            let t_start = ((self.time - 0.015).max(0.0) * sr) as u64; // 15ms before peak
-            let t_center = (self.time * sr) as u64;                   // At the peak
-            let t_end = ((self.time + 0.050) * sr) as u64;            // 50ms recovery
+            // 🚀 Create a quick "V" shape dip using pure seconds (f64)
+            let t_start = (self.time - 0.015).max(0.0); // 15ms before peak
+            let t_center = self.time;                   // At the peak
+            let t_end = self.time + 0.050;              // 50ms recovery
 
             // Drop from 0dB, hit the depth, and recover to 0dB
             track.volume_automation.insert_node(t_start, 0.0);
@@ -478,7 +476,7 @@ pub struct RideVocalLevelCmd {
 
 impl Command for RideVocalLevelCmd {
     fn execute(&self, engine: &mut Engine) -> Result<()> {
-        let engine_sr = engine.sample_rate as f64;
+        // 🚀 We don't need engine_sr anymore!
 
         if let Some(track) = engine.tracks_mut().iter_mut().find(|t| t.id == self.track_id) {
             
@@ -523,10 +521,10 @@ impl Command for RideVocalLevelCmd {
                         self.preserve_dynamics
                     );
 
-                    // 5. Insert nodes into the track, translating Source Hz to Engine Hz to prevent drift
+                    // 5. 🚀 Insert nodes into the track. 
+                    // No more Source Hz to Engine Hz translation needed! node.time is already f64 seconds.
                     for node in nodes {
-                        let time_in_engine_samples = (node.time as f64 / source_sr as f64 * engine_sr) as u64;
-                        track.volume_automation.insert_node(time_in_engine_samples, node.value);
+                        track.volume_automation.insert_node(node.time, node.value);
                     }
                 }
             }
