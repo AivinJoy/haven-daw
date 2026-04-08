@@ -39,6 +39,14 @@ pub enum AiAction {
         track_id: usize,
         value: f32,
     },
+    Play,
+    Pause,
+    Record,
+    Rewind,
+    Seek {
+        time: f64,
+    },
+    ToggleMonitor,
     ToggleMute {
         track_id: usize,
     },
@@ -199,4 +207,47 @@ pub fn validate_payload(raw_json: &str) -> Result<AiCommandEnvelope, SchemaError
     }
 
     Ok(payload)
+}
+
+pub fn normalize_actions(actions: Vec<AiAction>) -> Vec<AiAction> {
+    let mut normalized = Vec::new();
+
+    for mut action in actions {
+        match action {
+            // Unmute -> ToggleMute fallback
+            AiAction::Unmute { track_id } => {
+                normalized.push(AiAction::ToggleMute { track_id });
+            }
+            // Unsolo -> ToggleSolo fallback
+            AiAction::Unsolo { track_id } => {
+                normalized.push(AiAction::ToggleSolo { track_id });
+            }
+            // Multi-step Expansion: Riding vocals should always clear old automation first
+            AiAction::RideVocalLevel { track_id, .. } => {
+                normalized.push(AiAction::ClearVolumeAutomation { track_id });
+                // Apply governance to clamp the Rider's values
+                super::governance::enforce_limits(&mut action);
+                normalized.push(action);
+            }
+            _ => {
+                // Pass everything else through our Governance Clamper
+                super::governance::enforce_limits(&mut action);
+                normalized.push(action);
+            }
+        }
+    }
+    
+    // Safety Fallback 1: Deduplicate Solo/Mute contradictions in the same batch
+    let has_solo = normalized.iter().any(|a| matches!(a, AiAction::ToggleSolo { .. }));
+    if has_solo {
+        normalized.retain(|a| !matches!(a, AiAction::ToggleMute { .. }));
+    }
+
+    // Safety Fallback 2: Prevent contradictory transport commands (Pause wins over Play)
+    let has_pause = normalized.iter().any(|a| matches!(a, AiAction::Pause));
+    if has_pause {
+        normalized.retain(|a| !matches!(a, AiAction::Play));
+    }
+
+    normalized
 }

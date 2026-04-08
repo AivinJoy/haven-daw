@@ -1060,7 +1060,51 @@ impl AudioRuntime {
         results
     }
 
-    // --- AI TRANSACTION BATCH EXECUTION ---
+    // --- 🧠 PHASE 3: FREQUENCY MASKING ENGINE ---
+    /// Scans all unmuted tracks to see if a competing track is dominating 
+    /// the target track's primary frequency band.
+    pub fn detect_frequency_masking(&self, target_track_id: u32) -> Option<(usize, f32)> {
+        let engine = if let Ok(eng) = self.engine.lock() { eng } else { return None; };
+        
+        // 1. Get Target Track's Analysis
+        let target_profile = {
+            let t = engine.tracks().iter().find(|t| t.id.0 == target_track_id)?;
+            let guard = t.analysis.lock().ok()?;
+            guard.clone()?
+        };
+
+        // 2. Find the target's most critical frequency band (where its energy peaks)
+        let mut target_main_band = 0;
+        let mut max_energy = 0.0;
+        for i in 0..6 {
+            if target_profile.spectral.avg_band_energy_pct[i] > max_energy {
+                max_energy = target_profile.spectral.avg_band_energy_pct[i];
+                target_main_band = i;
+            }
+        }
+
+        // 3. Scan all OTHER unmuted tracks
+        let mut highest_competing_energy = 0.0;
+        for track in engine.tracks() {
+            if track.id.0 == target_track_id || track.muted { continue; }
+            if let Ok(guard) = track.analysis.lock() {
+                if let Some(profile) = guard.as_ref() {
+                    let competitor_energy = profile.spectral.avg_band_energy_pct[target_main_band];
+                    if competitor_energy > highest_competing_energy {
+                        highest_competing_energy = competitor_energy;
+                    }
+                }
+            }
+        }
+
+        // 4. If a competitor has > 25% energy in our main band, it's masking us!
+        if highest_competing_energy > 0.25 {
+            Some((target_main_band, highest_competing_energy))
+        } else {
+            None
+        }
+    }
+
     // --- AI TRANSACTION BATCH EXECUTION ---
     pub fn apply_ai_batch(&self, commands: Vec<AiAction>) -> anyhow::Result<()> {
         
@@ -1224,20 +1268,37 @@ impl AudioRuntime {
                 },
                 AiAction::AutoEq { track_id, intent, intensity } => {
                     if let Some(idx) = resolve(track_id) {
+                        
+                        // 🧠 INTELLIGENCE: Check for frequency masking before modifying EQ
+                        let masked_band = self.detect_frequency_masking(track_id as u32);
+                        
                         if let Ok(mut engine) = self.engine.lock() {
                             if let Some(track) = engine.tracks_mut().get_mut(idx) {
-                                let centroid = if let Ok(guard) = track.analysis.lock() { guard.as_ref().map(|a| a.spectral_centroid_hz).unwrap_or(2000.0_f32) } else { 2000.0_f32 };
+                                // FIX: Read from the new 6-band spectral struct
+                                let peak_freq = if let Ok(guard) = track.analysis.lock() { guard.as_ref().map(|a| a.spectral.peak_frequency_hz).unwrap_or(2000.0_f32) } else { 2000.0_f32 };
                                 let inten = intensity.unwrap_or(0.5_f32).clamp(0.0_f32, 1.0_f32);
                                 let intent_str = intent.clone().unwrap_or("presence".to_string());
 
                                 let (freq, gain, filter_type, q, band_idx) = match intent_str.as_str() {
-                                    "presence" => (centroid.clamp(1500.0_f32, 5000.0_f32), 2.0_f32 + (inten * 4.0_f32), crate::effects::equalizer::EqFilterType::Peaking, 1.2_f32, 2),
+                                    "clarity" | "unmask" => {
+                                        if let Some((band_idx, comp_energy)) = masked_band {
+                                            // Translate the masked band index back to a center frequency to boost our track
+                                            let boost_freq = match band_idx {
+                                                0 => 50.0, 1 => 150.0, 2 => 350.0, 3 => 1000.0, 4 => 3500.0, _ => 10000.0,
+                                            };
+                                            println!("🧠 INTELLIGENCE: Track {} is masked in Band {} ({}Hz). Unmasking applied!", track_id, band_idx, boost_freq);
+                                            (boost_freq, 2.0_f32 + (comp_energy * 6.0_f32 * inten), crate::effects::equalizer::EqFilterType::Peaking, 1.5_f32, band_idx)
+                                        } else {
+                                            // Fallback to standard high-shelf boost if no masking is detected
+                                            (peak_freq.clamp(3000.0_f32, 8000.0_f32), 2.0_f32 + (inten * 3.0_f32), crate::effects::equalizer::EqFilterType::HighShelf, 0.7_f32, 3)
+                                        }
+                                    },
+                                    "presence" => (peak_freq.clamp(1500.0_f32, 5000.0_f32), 2.0_f32 + (inten * 4.0_f32), crate::effects::equalizer::EqFilterType::Peaking, 1.2_f32, 2),
                                     "warmth" => (250.0_f32, 1.5_f32 + (inten * 3.0_f32), crate::effects::equalizer::EqFilterType::LowShelf, 0.7_f32, 1),
-                                    "clarity" => (centroid.clamp(3000.0_f32, 8000.0_f32), 2.0_f32 + (inten * 3.0_f32), crate::effects::equalizer::EqFilterType::HighShelf, 0.7_f32, 3),
                                     "mud_cut" => (250.0_f32, -(2.0_f32 + (inten * 4.0_f32)), crate::effects::equalizer::EqFilterType::Peaking, 1.5_f32, 1),
                                     "air" => (10000.0_f32, 2.0_f32 + (inten * 3.0_f32), crate::effects::equalizer::EqFilterType::HighShelf, 0.7_f32, 3),
                                     "rumble_cut" => (80.0_f32, 0.0_f32, crate::effects::equalizer::EqFilterType::HighPass, 0.7_f32, 0),
-                                    _ => (centroid, 2.0_f32, crate::effects::equalizer::EqFilterType::Peaking, 1.0_f32, 2),
+                                    _ => (peak_freq, 2.0_f32, crate::effects::equalizer::EqFilterType::Peaking, 1.0_f32, 2),
                                 };
 
                                 let params = crate::effects::equalizer::EqParams { filter_type, freq, q, gain, active: true };
@@ -1426,6 +1487,7 @@ impl AudioRuntime {
                 },
                 AiAction::Undo => self.undo(),
                 AiAction::Redo => self.redo(),
+                _ => {}
             }
         }
 

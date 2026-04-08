@@ -69,8 +69,9 @@ impl AutomationCurve<f32> {
     }
 }
 
+
 /// Generates a sparse, smoothed automation curve for Vocal Riding.
-/// Designed to run offline (non-realtime) when triggered by the AI Agent.
+/// Includes Temporal Breath Detection, Mid-Level Vocal Protection, and Energy Scaling.
 pub fn generate_rider_automation(
     audio_buffer: &[f32],
     channels: usize,
@@ -81,9 +82,10 @@ pub fn generate_rider_automation(
     max_cut_db: f32,
     smoothness: f32,
     analysis_window_ms: u32,
-    _noise_floor_db: f32, // Deprecated in favor of Zone C
+    noise_floor_db: f32,
     preserve_dynamics: bool,
 ) -> Vec<AutomationNode<f32>> {
+
     let mut nodes = Vec::new();
     if audio_buffer.is_empty() || channels == 0 {
         return nodes;
@@ -93,106 +95,152 @@ pub fn generate_rider_automation(
     let window_frames = ((analysis_window_ms as f64 / 1000.0) * sample_rate as f64) as usize;
     if window_frames == 0 { return nodes; }
 
-    // 🚀 REMOVED start_sample_offset u64 calculation here
+    // --- CONSTANTS ---
+    const BREATH_REDUCTION_DB: f32 = -3.0;
+    const LOUD_CUT_MIN_DB: f32 = -1.0;
 
-    let mut prev_smoothed_gain = 0.0;
-    let mut last_emitted_gain = 0.0;
-    let mut is_first_node = true;
+    let lookahead_sec = 0.015;
+    let min_delta_db = 0.12;
+    let min_time_delta = 0.02;
+
+    let attack_alpha = 0.4 + (smoothness * 0.2);
+    let release_alpha = 0.85 + (smoothness * 0.1);
+
+    let mut current_gain_db: f32 = 0.0;
+    let mut last_written_gain: f32 = 999.0;
+    let mut last_written_time: f64 = -1.0;
+
+    let mut prev_env_db: f32 = -60.0;
+
+    let mut breath_timer_ms: f32 = 0.0;
+    let mut silence_timer_ms: f32 = 0.0;
+
+    let step_ms = analysis_window_ms as f32;
 
     for chunk_idx in 0..=(frames / window_frames) {
         let start_idx = chunk_idx * window_frames;
         if start_idx >= frames { break; }
-        
-        let end_idx = std::cmp::min(start_idx + window_frames, frames);
+
+        let end_idx = (start_idx + window_frames).min(frames);
         let actual_frames = end_idx - start_idx;
-        if actual_frames == 0 { break; }
 
-        let mut sum_sq = 0.0;
+        let mut sum_sq = 0.0_f32;
+        let mut peak = 0.0_f32;
         let mut zero_crossings = 0;
-        let mut prev_mono = 0.0;
+        let mut prev_sample = 0.0_f32;
 
-        // 1. Calculate RMS & Zero-Crossing Rate (Spectral proxy)
         for i in start_idx..end_idx {
-            let mut mono_sample = 0.0;
+            let mut mono = 0.0;
             for c in 0..channels {
-                mono_sample += audio_buffer[i * channels + c];
+                mono += audio_buffer[i * channels + c];
             }
-            mono_sample /= channels as f32;
-            sum_sq += mono_sample * mono_sample;
+            mono /= channels as f32;
 
-            // Zero crossing detection for high-frequency breath/noise check
-            if (mono_sample > 0.0 && prev_mono <= 0.0) || (mono_sample < 0.0 && prev_mono >= 0.0) {
+            sum_sq += mono * mono;
+            peak = peak.max(mono.abs());
+
+            if (mono > 0.0 && prev_sample <= 0.0) || (mono < 0.0 && prev_sample >= 0.0) {
                 zero_crossings += 1;
             }
-            prev_mono = mono_sample;
+            prev_sample = mono;
         }
-        
+
         let rms = (sum_sq / actual_frames as f32).sqrt();
-        let rms_db = if rms > 1e-5 { 20.0 * rms.log10() } else { -70.0 };
-        
-        // ZCR > ~0.15 indicates heavily high-frequency dominant signal
-        let zcr_rate = zero_crossings as f32 / actual_frames as f32;
-        let is_breath_or_noise = zcr_rate > 0.15;
+        let raw_db = if rms > 1e-5 { 20.0 * rms.log10() } else { -90.0 };
 
-        // 2. The 3-Zone Logic + Spectral Check
-        let raw_gain: f32;
-        let attack_coeff: f32; // Lower is faster
+        let env_db = 0.6 * prev_env_db + 0.4 * raw_db;
+        prev_env_db = env_db;
 
-        if rms_db <= target_lufs - 18.0 || is_breath_or_noise {
-            // ZONE C: Noise / Breath / Silence -> Return to 0dB, FAST drop
-            raw_gain = 0.0;
-            attack_coeff = 0.1; 
-        } else if rms_db > target_lufs - 18.0 && rms_db <= target_lufs - 8.0 {
-            // ZONE B: Weak Vocal / Transition -> Soft approach (Limited boost)
-            let calculated_boost = (target_lufs - rms_db) * 0.4; 
-            raw_gain = calculated_boost.min(max_boost_db * 0.5); 
-            attack_coeff = smoothness.max(0.85); 
+        let crest = if rms > 1e-5 { peak / rms } else { 0.0 };
+        let zcr = zero_crossings as f32 / actual_frames as f32;
+
+        // --- CLASSIFICATION ---
+        let is_silence = env_db < noise_floor_db;
+        let is_loud = env_db > (target_lufs + 2.0);
+        let is_vocal = env_db > (target_lufs - 8.0);
+
+        let breath_score =
+            ((target_lufs - env_db).max(0.0) / 18.0)
+            + (zcr * 1.5)
+            + ((crest - 1.8).max(0.0) * 0.4);
+
+        let breath_conf = breath_score.clamp(0.0, 1.0);
+
+        if breath_conf > 0.6 && !is_vocal {
+            breath_timer_ms += step_ms;
         } else {
-            // ZONE A: Strong Vocal -> Normal Riding
-            let mut calculated_boost = target_lufs - rms_db;
-            
-            if calculated_boost.abs() < 1.5 {
-                calculated_boost = 0.0;
-            }
-            if preserve_dynamics {
-                calculated_boost *= 0.5; 
-            }
-            raw_gain = calculated_boost.clamp(max_cut_db, max_boost_db);
-            attack_coeff = 0.4; 
+            breath_timer_ms = 0.0;
         }
 
-        // 3. Apply Dynamic EMA Smoothing
-        let smoothed_gain = if is_first_node {
-            raw_gain
+        let is_breath = breath_timer_ms > 80.0;
+
+        if is_silence {
+            silence_timer_ms += step_ms;
         } else {
-            (prev_smoothed_gain * attack_coeff) + (raw_gain * (1.0 - attack_coeff))
+            silence_timer_ms = 0.0;
+        }
+
+        let is_long_silence = silence_timer_ms > 120.0;
+
+        // --- PRIORITY LOGIC ---
+        let target_gain: f32 = if is_long_silence {
+            0.0
+
+        } else if is_breath {
+            BREATH_REDUCTION_DB.min(current_gain_db)
+
+        } else if is_loud {
+            (target_lufs - env_db).min(LOUD_CUT_MIN_DB)
+
+        } else if env_db < (target_lufs - 12.0) {
+            0.0
+
+        } else {
+            let mut g = target_lufs - env_db;
+
+            if is_vocal {
+                g *= if preserve_dynamics { 0.6 } else { 1.0 };
+            }
+
+            g
         };
-        prev_smoothed_gain = smoothed_gain;
 
-        // 4. Time Calculation (🚀 PURE SECONDS `f64`)
-        let chunk_time_sec = start_idx as f64 / sample_rate as f64;
-        let absolute_time_sec = start_time_sec + chunk_time_sec;
+        let target_gain = target_gain.clamp(max_cut_db, max_boost_db);
 
-        // 5. Node Thinning & Emission
-        if is_first_node || (smoothed_gain - last_emitted_gain).abs() >= 0.15 {
-            nodes.push(AutomationNode {
-                time: absolute_time_sec, // 🚀 Now perfectly matches f64
-                value: smoothed_gain,
-            });
-            last_emitted_gain = smoothed_gain;
-            is_first_node = false;
+        // --- SMOOTHING ---
+        if target_gain > current_gain_db {
+            current_gain_db =
+                attack_alpha * current_gain_db + (1.0 - attack_alpha) * target_gain;
+        } else {
+            current_gain_db =
+                release_alpha * current_gain_db + (1.0 - release_alpha) * target_gain;
         }
-    }
-    
-    // Safety Wrap-up: Ensure the automation lane returns to 0 dB at the end
-    if let Some(last) = nodes.last() {
-        if last.value.abs() > 0.01 {
-             // 🚀 Calculate final time in pure seconds
-             let final_time_sec = start_time_sec + (frames as f64 / sample_rate as f64);
-             nodes.push(AutomationNode {
-                 time: final_time_sec, // 🚀 Now perfectly matches f64
-                 value: 0.0,
-             });
+
+        let time_sec = start_idx as f64 / sample_rate as f64;
+        let absolute_time = start_time_sec + (time_sec - lookahead_sec).max(0.0);
+
+        // DEBUG
+        println!(
+            "[RIDER] t={:.2}s env={:.1}dB gain={:.2} | silence={} breath={} vocal={} loud={}",
+            absolute_time,
+            env_db,
+            current_gain_db,
+            is_silence,
+            is_breath,
+            is_vocal,
+            is_loud
+        );
+
+        if (current_gain_db - last_written_gain).abs() >= min_delta_db
+            && (absolute_time - last_written_time) > min_time_delta
+        {
+            nodes.push(AutomationNode {
+                time: absolute_time,
+                value: current_gain_db,
+            });
+
+            last_written_gain = current_gain_db;
+            last_written_time = absolute_time;
         }
     }
 

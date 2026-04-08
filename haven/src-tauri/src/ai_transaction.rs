@@ -4,21 +4,6 @@ use daw_modules::ai::ai_schema::AiAction;
 use crate::AppState;
 use std::collections::HashMap;
 
-
-fn normalize_action(action: &mut AiAction) {
-    match action {
-        // EQ and Compressor don't have is_active in the schema.
-        // audio_runtime.rs automatically forces them to true when parameters are updated!
-        AiAction::UpdateReverb { is_active, .. } => {
-            if is_active.is_none() {
-                *is_active = Some(true);
-            }
-        }
-        // Catch-all for other commands
-        _ => {} 
-    }
-}
-
 // --- SECURITY LIMIT ---
 // Prevents the LLM from hallucinating thousands of nodes and stalling the audio thread.
 const MAX_AUTOMATION_NODES: usize = 200;
@@ -26,20 +11,12 @@ const MAX_AUTOMATION_NODES: usize = 200;
 #[tauri::command]
 pub async fn execute_ai_transaction(
     version: String,
-    mut commands: Vec<AiAction>,
+    commands: Vec<AiAction>, // <--- These are already normalized by the Pipeline!
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
 
-    // 🛠️ DEBUG LOG 4: RUST ENTRY POINT
-    println!("🦀 [AI_TRANSACTION] Received {} commands from Frontend. Version: {}", commands.len(), version);
-    // 0. Normalize Commands BEFORE logging and validation
-    for cmd in &mut commands {
-        normalize_action(cmd);
-    }
-    
-    for (i, cmd) in commands.iter().enumerate() {
-        println!("   👉 NOrmalized Incoming Command {}: {:?}", i, cmd);
-    }
+    // 🛠️ DEBUG LOG
+    println!("🦀 [AI_TRANSACTION] Received {} normalized commands from Frontend. Version: {}", commands.len(), version);
     
     // 1. Version Check
     if version != "1.0" {
@@ -48,7 +25,7 @@ pub async fn execute_ai_transaction(
 
     // 2. The Automation Firewall (Safety Guard)
     let mut automation_counts: HashMap<usize, usize> = HashMap::new();
-    let mut rider_counts: HashMap<usize, usize> = HashMap::new(); // <--- NEW: Track rider calls
+    let mut rider_counts: HashMap<usize, usize> = HashMap::new(); 
     
     for cmd in &commands {
         match cmd {
@@ -62,14 +39,12 @@ pub async fn execute_ai_transaction(
                 *count += 3;
                 if *count > MAX_AUTOMATION_NODES { return Err("Security Block: Too many nodes".into()); }
             }
-            AiAction::RideVocalLevel { track_id, .. } => { // <--- NEW: Rider Firewall Limit
+            AiAction::RideVocalLevel { track_id, .. } => { 
                 let count = rider_counts.entry(*track_id).or_insert(0);
                 *count += 1;
-                // SECURITY: Strictly allow only ONE rider process per track per transaction 
-                // to prevent blocking the audio thread with heavy offline analysis.
                 if *count > 1 { return Err("Security Block: Only one Vocal Rider per track allowed per transaction.".into()); }
             }
-            _ => {} // Ignore other commands for firewall purposes
+            _ => {} 
         }
     }
 

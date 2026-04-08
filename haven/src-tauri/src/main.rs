@@ -1121,6 +1121,17 @@ struct AiErrorResponse {
     message: String,
 }
 
+struct ContextNeeds {
+    needs_clips: bool,
+    needs_dsp: bool,
+    needs_analysis: bool, // Future-proofed for Phase 3
+}
+
+// ✂️ NEW: Decimal Clamper to save tokens
+fn round_f32(value: f32) -> f32 {
+    (value * 100.0).round() / 100.0
+}
+
 #[tauri::command]
 async fn ask_ai(
     user_input: String, 
@@ -1148,7 +1159,7 @@ async fn ask_ai(
     }
 
     // ==========================================
-    // 🧠 2. THE RUST INTENT ENGINE (Scoring)
+    // 🧠 2. THE RUST INTENT ENGINE (Soft Scoring)
     // ==========================================
     let input_lower = user_input.to_lowercase();
     let input_words: Vec<&str> = input_lower
@@ -1156,27 +1167,30 @@ async fn ask_ai(
         .filter(|s| !s.is_empty())
         .collect();
 
-    let mut intent_score = 0;
-    let mut edit_score = 0;
+    let mut needs = ContextNeeds {
+        needs_clips: false,
+        needs_dsp: false,
+        needs_analysis: false,
+    };
 
     for &word in &input_words {
         match word {
+            "cut" | "trim" | "split" | "move" | "delete" | "clip" | "slice" | "time" | "arrange" => needs.needs_clips = true,
             "mix" | "master" | "level" | "ride" | "duck" | "eq" | "compressor" | 
-            "loudness" | "balance" | "automate" | "stage" | "dynamics" | "punchy" | "harsh" => intent_score += 2,
-            "vocal" | "peak" | "plosive" | "gain" | "normalize" => intent_score += 1,
-            "split" | "cut" | "move" | "merge" | "delete" | "clip" | "slice" => edit_score += 2,
-            "timing" | "arrange" | "time" => edit_score += 1,
+            "loudness" | "balance" | "automate" | "stage" | "dynamics" | "punchy" | "harsh" | "bright" | "vocal" => {
+                needs.needs_dsp = true;
+                needs.needs_analysis = true; // Phase 3 prep
+            },
             _ => {}
         }
     }
 
     let is_global_request = input_words.iter().any(|&w| matches!(w, "master" | "mix" | "overall" | "final" | "entire" | "everything" | "all"));
 
-    let mode = if intent_score >= 2 { "MIXING" } else if edit_score >= 2 { "EDITING" } else { "MINIMAL" };
-    println!("🤖 AI Intent Evaluated -> Mode: {}, Global: {}", mode, is_global_request);
+    println!("🤖 AI Intent Evaluated -> Clips: {}, DSP: {}, Global: {}", needs.needs_clips, needs.needs_dsp, is_global_request);
 
     // ==========================================
-    // 🏗️ 3. CONTEXT BUILDER (Lock Audio State)
+    // 🏗️ 3. SMART CONTEXT BUILDER
     // ==========================================
     let track_context_str = {
         let audio_runtime = state.audio.lock().map_err(|_| "Failed to lock audio")?;
@@ -1196,43 +1210,48 @@ async fn ask_ai(
             }
         }
 
-        // Fetch Heavy DSP only if needed
-        let analysis_data = if mode == "MIXING" { audio_runtime.get_all_track_analysis() } else { Vec::new() };
+        // Fetch Heavy Analysis only if needed
+        let analysis_data = if needs.needs_analysis { audio_runtime.get_all_track_analysis() } else { Vec::new() };
 
         // Build Payload
         let mut track_payloads = Vec::new();
         for info in &tracks_info {
             let is_target = is_global_request || target_track_ids.contains(&(info.id as u32));
 
+            // ALWAYS provide basic mix state identity (compression step 1)
             let mut track_obj = serde_json::json!({
                 "id": info.id,
                 "name": info.name.to_lowercase(),
-                "gain": (info.gain * 100.0).round() / 100.0,
-                "pan": (info.pan * 100.0).round() / 100.0,
+                "gain": round_f32(info.gain),
+                "pan": round_f32(info.pan),
                 "muted": info.muted,
                 "solo": info.solo,
             });
 
-            if mode != "MINIMAL" && is_target {
+            // ONLY provide heavy arrays to target tracks if requested (compression step 2)
+            if is_target {
                 let track_idx = resolve_track_index(&tracks_info, info.id as u32).unwrap_or(0);
                 let obj = track_obj.as_object_mut().unwrap();
 
-                // Add Clips
-                let clips_json: Vec<_> = info.clips.iter().map(|c| {
-                    serde_json::json!({
-                        "clip_number": c.clip_number,
-                        "start_time": (c.start_time * 100.0).round() / 100.0,
-                        "duration": (c.duration * 100.0).round() / 100.0
-                    })
-                }).collect();
-                obj.insert("clips".to_string(), serde_json::Value::Array(clips_json));
+                if needs.needs_clips {
+                    let clips_json: Vec<_> = info.clips.iter().map(|c| {
+                        serde_json::json!({
+                            "clip_number": c.clip_number,
+                            "start_time": round_f32(c.start_time as f32) as f64,
+                            "duration": round_f32(c.duration as f32) as f64
+                        })
+                    }).collect();
+                    obj.insert("clips".to_string(), serde_json::Value::Array(clips_json));
+                }
 
-                // Add DSP
-                if mode == "MIXING" {
+                if needs.needs_dsp {
+                    // We must clamp the nested EQ float values too (handled downstream or accepted as is if minor)
                     obj.insert("eq".to_string(), serde_json::to_value(audio_runtime.get_eq_state(track_idx)).unwrap());
                     obj.insert("compressor".to_string(), serde_json::to_value(audio_runtime.get_compressor_state(track_idx)).unwrap());
                     obj.insert("reverb".to_string(), serde_json::to_value(audio_runtime.get_reverb_state(track_idx)).unwrap());
+                }
 
+                if needs.needs_analysis {
                     if let Some(analysis) = analysis_data.iter().find(|a| (a.track_id as u32) == (info.id as u32)) {
                         obj.insert("analysis".to_string(), serde_json::to_value(&analysis.analysis).unwrap());
                     }
@@ -1241,16 +1260,44 @@ async fn ask_ai(
             track_payloads.push(track_obj);
         }
 
-        let context_json = serde_json::json!({
-            "system_directive": format!("MODE: {}. You MUST ONLY apply actions to target_track_ids.", mode),
-            "mode": mode,
+        let mut context_json = serde_json::json!({
+            "system_directive": "You MUST ONLY apply actions to target_track_ids.",
             "target_track_ids": target_track_ids,
-            "project": { "playhead_position_seconds": playhead_time, "bpm": bpm },
+            "project": { "playhead_position_seconds": round_f32(playhead_time as f32) as f64, "bpm": round_f32(bpm) },
             "tracks": track_payloads
         });
 
-        serde_json::to_string(&context_json).map_err(|e| e.to_string())?
-    }; // 🔓 MUTEX LOCK DROPPED HERE! 
+        // 🚨 HARD TOKEN GUARD
+        let mut context_str = serde_json::to_string(&context_json).map_err(|e| e.to_string())?;
+        let mut estimated_tokens = context_str.len() / 4;
+        
+        println!("📊 Context Built: {} tracks | Estimated Tokens: {}", tracks_info.len(), estimated_tokens);
+
+        const MAX_SAFE_TOKENS: usize = 4000;
+        
+        if estimated_tokens > MAX_SAFE_TOKENS {
+            println!("⚠️ TOKEN GUARD TRIGGERED! ({} > {}) - Shrinking payload...", estimated_tokens, MAX_SAFE_TOKENS);
+            
+            // Fallback Strategy: Drop everything except basic IDs for targets
+            let mut emergency_payload = Vec::new();
+            for info in &tracks_info {
+                if is_global_request || target_track_ids.contains(&(info.id as u32)) {
+                    emergency_payload.push(serde_json::json!({
+                        "id": info.id,
+                        "name": info.name.to_lowercase()
+                    }));
+                }
+            }
+            context_json["tracks"] = serde_json::Value::Array(emergency_payload);
+            context_json["system_directive"] = serde_json::Value::String("FALLBACK: Audio limits exceeded. Guess best effort with missing data.".to_string());
+            
+            context_str = serde_json::to_string(&context_json).map_err(|e| e.to_string())?;
+            estimated_tokens = context_str.len() / 4;
+            println!("📉 Shrink Successful. New Estimated Tokens: {}", estimated_tokens);
+        }
+
+        context_str
+    }; // 🔓 MUTEX LOCK DROPPED HERE!
 
     // ==========================================
     // 🌐 4. SYSTEM PROMPT & API CALL
@@ -1351,7 +1398,9 @@ async fn ask_ai(
     let chat_res: GroqApiResponse = res.json().await.map_err(|e| format!("Parse Error: {}", e))?;
     
     if let Some(choice) = chat_res.choices.first() {
-        Ok(choice.message.content.clone())
+        let trace = daw_modules::ai::pipeline::AIPipeline::process_raw_response(&choice.message.content);
+        println!("Ai Execution Trace:\n{:#?}", trace);
+        Ok(serde_json::to_string(&trace).unwrap())
     } else {
          Ok(serde_json::to_string(&AiErrorResponse {
              action: "none".into(),
