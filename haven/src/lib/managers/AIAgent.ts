@@ -8,13 +8,11 @@ export type AIMessage = {
     action?: string;
 };
 
-// 🆕 We can loosen this since Rust does the strict validation now
 export interface AICommand {
     action: string;
     [key: string]: any; 
 }
 
-// 🆕 Matches the Rust AIExecutionTrace struct exactly
 export interface AIExecutionTrace {
     raw_response: string;
     message?: string;
@@ -23,6 +21,20 @@ export interface AIExecutionTrace {
     execution_order: AICommand[];
     errors: string[];
 }
+
+// 🚀 STRICT ROUTING DICTIONARIES
+// If the LLM hallucinates a command not in these lists, we drop it before it crashes the engine.
+const UI_COMMANDS = new Set([
+    'play', 'pause', 'record', 'rewind', 'seek', 
+    'toggle_monitor', 'separate_stems', 'undo', 
+    'redo', 'create_track', 'set_bpm'
+]);
+
+const DSP_COMMANDS = new Set([
+    'auto_eq', 'auto_compress', 'ride_vocal_level', 
+    'auto_reverb', 'clear_volume_automation', 
+    'add_track_plugin', 'remove_plugin', 'split_clip'
+]);
 
 class AIAgent {
     async sendMessage(
@@ -42,7 +54,6 @@ class AIAgent {
         try {
             console.log("📤 Delegating intent and context building to Rust Engine...");
             
-            // 1. Send purely raw UI state to Rust. 
             const rawResponse = await invoke<string>('ask_ai', { 
                 userInput, 
                 activeTrackId: selectedTrackId ?? null, 
@@ -50,7 +61,6 @@ class AIAgent {
                 chatHistory
             });
 
-            // 2. Parse the AIExecutionTrace returned from Rust
             const trace: AIExecutionTrace = JSON.parse(rawResponse);
             console.log("🧠 Received AI Trace from Rust:", trace);
 
@@ -65,15 +75,19 @@ class AIAgent {
                 };
             }
 
-            const commands = trace.execution_order || [];
+            // 🚀 FIX: Strictly use execution_order, fallback to normalized_actions, explicitly ignore parsed_actions
+            const commands = trace.execution_order?.length > 0 
+                ? trace.execution_order 
+                : trace.normalized_actions || [];
+
             const displayMessage = trace.message || "Done.";
 
-            // 3. Simple UI vs DSP Routing
+            // 3. Strict UI vs DSP Routing
             if (commands.length > 0) {
-                const transportCommands = ['play', 'pause', 'record', 'rewind', 'seek', 'toggle_monitor', 'separate_stems', 'undo', 'redo', 'create_track', 'set_bpm'];
                 
-                const uiCommands = commands.filter((c: AICommand) => transportCommands.includes(c.action));
-                const dspCommands = commands.filter((c: AICommand) => !transportCommands.includes(c.action));
+                // Filter out hallucinations and split into UI vs DSP
+                const uiCommands = commands.filter(c => UI_COMMANDS.has(c.action));
+                const dspCommands = commands.filter(c => DSP_COMMANDS.has(c.action));
 
                 console.log(`🔀 Routing: ${uiCommands.length} UI Commands, ${dspCommands.length} DSP Commands.`);
 
@@ -105,7 +119,6 @@ class AIAgent {
                 }
             }
 
-            // Return the message from the LLM back to the chat UI
             return {
                 role: 'assistant',
                 content: displayMessage,

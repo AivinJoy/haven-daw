@@ -1311,7 +1311,7 @@ impl AudioRuntime {
                     if let Some(idx) = resolve(track_id) {
                         if let Ok(mut engine) = self.engine.lock() {
                             if let Some(track) = engine.tracks_mut().get_mut(idx) {
-                                let inten = intensity.unwrap_or(0.5_f32).clamp(0.0_f32, 1.0_f32);
+                                let inten = intensity.unwrap_or(0.3_f32).clamp(0.0_f32, 1.0_f32);
                                 let space_str = space.clone().unwrap_or("room".to_string());
 
                                 let (room_size, damping, pre_delay, mix) = match space_str.as_str() {
