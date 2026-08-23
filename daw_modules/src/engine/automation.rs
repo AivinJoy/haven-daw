@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationNode<T> {
-    pub time: u64, // Position in samples
+    pub time: f64, // Position in seconds
     pub value: T,
 }
 
@@ -14,17 +14,9 @@ pub struct AutomationCurve<T> {
 }
 
 impl<T> AutomationCurve<T> {
-    pub fn new() -> Self {
-        Self { nodes: Vec::new() }
-    }
-
-    pub fn nodes(&self) -> &[AutomationNode<T>] {
-        &self.nodes
-    }
-
-    pub fn clear(&mut self) {
-        self.nodes.clear();
-    }
+    pub fn new() -> Self { Self { nodes: Vec::new() } }
+    pub fn nodes(&self) -> &[AutomationNode<T>] { &self.nodes }
+    pub fn clear(&mut self) { self.nodes.clear(); }
 }
 
 // We specifically implement the math/interpolation for f32 (Gain, Pan, etc.)
@@ -32,17 +24,18 @@ impl<T> AutomationCurve<T> {
 impl AutomationCurve<f32> {
     /// Inserts a node. If a node at the exact sample time exists, it overwrites it.
     /// Uses binary_search_by_key to guarantee O(log n) sorted insertion.
-    pub fn insert_node(&mut self, time: u64, value: f32) {
+    pub fn insert_node(&mut self, time: f64, value: f32) {
         let node = AutomationNode { time, value };
-        match self.nodes.binary_search_by_key(&time, |n| n.time) {
-            Ok(pos) => self.nodes[pos].value = value, // Exact time match, overwrite
-            Err(pos) => self.nodes.insert(pos, node), // Insert in sorted position
+        // Use total_cmp to safely binary search floats
+        match self.nodes.binary_search_by(|n| n.time.total_cmp(&time)) {
+            Ok(pos) => self.nodes[pos].value = value, 
+            Err(pos) => self.nodes.insert(pos, node), 
         }
     }
 
     /// Removes a node at a specific time, returning true if found and removed.
-    pub fn remove_node_at_time(&mut self, time: u64) -> bool {
-        if let Ok(pos) = self.nodes.binary_search_by_key(&time, |n| n.time) {
+    pub fn remove_node_at_time(&mut self, time: f64) -> bool {
+        if let Ok(pos) = self.nodes.binary_search_by(|n| n.time.total_cmp(&time)) {
             self.nodes.remove(pos);
             true
         } else {
@@ -51,45 +44,36 @@ impl AutomationCurve<f32> {
     }
 
     /// Pure math evaluation. Returns the exact interpolated value at a given sample position.
-    pub fn get_value_at_time(&self, time: u64, default_value: f32) -> f32 {
-        if self.nodes.is_empty() {
-            return default_value;
-        }
+    pub fn get_value_at_time(&self, time: f64, default_value: f32) -> f32 {
+        if self.nodes.is_empty() { return default_value; }
 
         let first = &self.nodes[0];
-        if time <= first.time {
-            return first.value;
-        }
+        if time <= first.time { return first.value; }
 
         let last = &self.nodes[self.nodes.len() - 1];
-        if time >= last.time {
-            return last.value;
-        }
+        if time >= last.time { return last.value; }
 
-        // We are somewhere between the first and last node.
-        match self.nodes.binary_search_by_key(&time, |n| n.time) {
-            Ok(pos) => self.nodes[pos].value, // Exact hit on a node
+        match self.nodes.binary_search_by(|n| n.time.total_cmp(&time)) {
+            Ok(pos) => self.nodes[pos].value,
             Err(pos) => {
-                // pos is the insertion index, meaning:
-                // pos - 1 is the previous node
-                // pos is the next node
                 let prev = &self.nodes[pos - 1];
                 let next = &self.nodes[pos];
 
-                let range = (next.time - prev.time) as f64; // Use f64 to prevent overflow in division
-                let progress = (time - prev.time) as f64 / range;
+                // Pure absolute float math! No more u64 overflow risks.
+                let range = next.time - prev.time; 
+                let progress = (time - prev.time) / range;
 
-                // Linear interpolation: v1 + (v2 - v1) * progress
                 prev.value + ((next.value - prev.value) * progress as f32)
             }
         }
     }
 }
 
-// In daw_modules/src/engine/automation.rs (Add to the bottom of the file)
 
 /// Generates a sparse, smoothed automation curve for Vocal Riding.
-/// Designed to run offline (non-realtime) when triggered by the AI Agent.
+/// Includes Temporal Breath Detection, Mid-Level Vocal Protection, and Energy Scaling.
+// [daw_modules/src/engine/automation.rs]
+
 pub fn generate_rider_automation(
     audio_buffer: &[f32],
     channels: usize,
@@ -100,8 +84,10 @@ pub fn generate_rider_automation(
     max_cut_db: f32,
     smoothness: f32,
     analysis_window_ms: u32,
-    noise_floor_db: f32,
+    noise_floor_db: f32, 
+    preserve_dynamics: bool,
 ) -> Vec<AutomationNode<f32>> {
+
     let mut nodes = Vec::new();
     if audio_buffer.is_empty() || channels == 0 {
         return nodes;
@@ -110,90 +96,228 @@ pub fn generate_rider_automation(
     let frames = audio_buffer.len() / channels;
     let window_frames = ((analysis_window_ms as f64 / 1000.0) * sample_rate as f64) as usize;
     if window_frames == 0 { return nodes; }
+// --- PRO SETTINGS ---
+    let step_ms = analysis_window_ms as f32;
+    
+    let lookahead_sec = 0.050; 
+    let lookahead_frames = (lookahead_sec * sample_rate as f64) as usize;
+    
+    // 🚀 FIX 4: Pro Tuning Node Density
+    let min_delta_db = 0.35; 
+    let min_time_delta = 0.06; 
 
-    let start_sample_offset = (start_time_sec * sample_rate as f64) as u64;
+    let base_attack_alpha = 0.4 + (smoothness * 0.2);
+    let base_release_alpha = 0.85 + (smoothness * 0.1);
 
-    let mut prev_smoothed_gain = 0.0;
-    let mut last_emitted_gain = 0.0;
-    let mut is_first_node = true;
+    // 🚀 FIX 1: Raise effective noise floor to catch real-world room tone/mic bleed
+    let effective_noise_floor = noise_floor_db.max(-45.0);
 
-    // We process the buffer in chunks (windows)
+    let mut current_gain_db: f32 = 0.0;
+    let mut last_written_gain: f32 = 999.0;
+    let mut last_written_time: f64 = -1.0;
+
+    let mut prev_env_db: f32 = -60.0;
+
+    let mut breath_timer_ms: f32 = 0.0;
+    let mut silence_timer_ms: f32 = 0.0;
+
     for chunk_idx in 0..=(frames / window_frames) {
         let start_idx = chunk_idx * window_frames;
         if start_idx >= frames { break; }
-        
-        let end_idx = std::cmp::min(start_idx + window_frames, frames);
+
+        let end_idx = (start_idx + window_frames).min(frames);
         let actual_frames = end_idx - start_idx;
-        if actual_frames == 0 { break; }
 
-        // 1 & 2. Calculate RMS for the window (Mixdown to mono for analysis)
-        let mut sum_sq = 0.0;
+        let mut sum_sq = 0.0_f32;
+        let mut peak = 0.0_f32;
+        let mut zero_crossings = 0;
+        let mut prev_sample = 0.0_f32;
+
+        // 🚀 FIX 3: True Lookahead Buffer reading
         for i in start_idx..end_idx {
-            let mut mono_sample = 0.0;
+            // Read ahead into the future!
+            let read_idx = (i + lookahead_frames).min(frames - 1);
+            
+            let mut mono = 0.0;
             for c in 0..channels {
-                mono_sample += audio_buffer[i * channels + c];
+                mono += audio_buffer[read_idx * channels + c];
             }
-            mono_sample /= channels as f32;
-            sum_sq += mono_sample * mono_sample;
+            mono /= channels as f32;
+
+            sum_sq += mono * mono;
+            peak = peak.max(mono.abs());
+
+            if (mono > 0.0 && prev_sample <= 0.0) || (mono < 0.0 && prev_sample >= 0.0) {
+                zero_crossings += 1;
+            }
+            prev_sample = mono;
         }
-        
+
         let rms = (sum_sq / actual_frames as f32).sqrt();
-        let rms_db = if rms > 1e-5 { 20.0 * rms.log10() } else { -70.0 };
+        let raw_db = if rms > 1e-5 { 20.0 * rms.log10() } else { -90.0 };
 
-        // 3. Silence Gate (-45 dB threshold)
-        // If it's silence, we want the rider to gracefully return to 0.0 dB (Unity)
-        let mut raw_gain = 0.0; 
-        if rms_db > noise_floor_db {
-            // 4. Compute Raw Gain
-            raw_gain = target_lufs - rms_db;
+        let env_db = 0.6 * prev_env_db + 0.4 * raw_db;
+        prev_env_db = env_db;
+
+        let crest = if rms > 1e-5 { peak / rms } else { 0.0 };
+        let zcr = zero_crossings as f32 / actual_frames as f32;
+
+       // --- CLASSIFICATION ---
+        let is_silence = env_db < (effective_noise_floor - 5.0);
+        
+        // 🚀 FIX 4: Faster loud detection (+0.5 LUFS)
+        let is_loud = env_db > (target_lufs + 0.5);
+        let is_vocal = env_db > (target_lufs - 8.0);
+        
+        let vocal_strength = ((env_db - (target_lufs - 20.0)) / 20.0).clamp(0.0, 1.0);
+
+        let breath_score =
+            ((target_lufs - env_db).max(0.0) / 18.0)
+            + (zcr * 1.5)
+            + ((crest - 1.8).max(0.0) * 0.4);
+
+        let breath_conf = breath_score.clamp(0.0, 1.0);
+
+        if breath_conf > 0.6 && !is_vocal {
+            breath_timer_ms += step_ms;
+        } else {
+            breath_timer_ms = 0.0;
         }
 
-        // 5. Clamp Gain Limits
-        raw_gain = raw_gain.clamp(max_cut_db, max_boost_db);
+        let is_breath = breath_timer_ms > 80.0 && env_db > effective_noise_floor;
 
-        // 6. Apply EMA Smoothing (V2: Asymmetric Attack/Release)
-        let smoothed_gain = if is_first_node {
-            raw_gain
+        if is_silence {
+            silence_timer_ms += step_ms;
         } else {
-            // Determine if the fader is moving DOWN (cutting peaks/closing gate) 
-            // or moving UP (boosting quiet words/opening gate)
-            let is_moving_down = raw_gain < prev_smoothed_gain;
+            silence_timer_ms = 0.0;
+        }
 
-            // Attack (Fast): ~0.3 multiplier allows the fader to move quickly.
-            // Release (Slow): We use the user's `smoothness` (e.g., 0.7 to 0.9) to glide smoothly.
-            let current_coeff = if is_moving_down {
-                0.3 // Fast reaction to loud peaks
+        let is_long_silence = silence_timer_ms > 120.0;
+
+       // --- PRIORITY LOGIC & TARGET GAIN ---
+        // 🚀 FIX 6: Dynamic Silence Floor
+        let silence_floor = if preserve_dynamics { -6.0 } else { -10.0 };
+
+        let mut target_gain: f32 = if is_long_silence {
+            silence_floor 
+
+        } else if is_breath {
+            // 🚀 FIX 2: Breath Boosting Bug (Hard clamp below 0.0)
+            let breath_target = (-4.0_f32 * breath_conf).min(0.0); 
+            breath_target.min(current_gain_db) 
+
+        } else if is_loud {
+            (target_lufs - env_db) * 0.5 
+
+        } else if env_db < (target_lufs - 12.0) {
+            let diff = target_lufs - env_db;
+            let scaled = diff / (1.0 + diff.abs() * 0.10);
+            scaled.min(max_boost_db)
+
+        } else {
+            let mut diff = target_lufs - env_db;
+            let softness = if preserve_dynamics { 0.45 } else { 0.65 };
+            diff *= softness; 
+            diff
+        };
+
+        if !is_long_silence && !is_breath {
+            target_gain *= 0.5 + (vocal_strength * 0.5);
+        }
+
+        target_gain = target_gain.clamp(max_cut_db, max_boost_db);
+
+        // Calculate time before the silence bypass
+       let time_sec = start_idx as f64 / sample_rate as f64;
+        let absolute_time = start_time_sec + time_sec; 
+
+        if is_long_silence {
+            if (current_gain_db - silence_floor).abs() > 0.1 {
+                current_gain_db = silence_floor;
+                
+                // 🚀 FIX 6: First Node Bias (0.7)
+                let output_value = if nodes.is_empty() { current_gain_db * 0.7 } else { current_gain_db };
+                
+                nodes.push(AutomationNode {
+                    time: absolute_time,
+                    value: output_value,
+                });
+                last_written_gain = output_value;
+                last_written_time = absolute_time;
+            }
+            continue; 
+        }
+
+        // --- ADAPTIVE SMOOTHING ---
+        let (current_attack, current_release) = if is_loud || is_breath {
+            // 🚀 FIX 2: Faster attack (0.3) to catch peaks before they overshoot
+            (0.3, 0.5) 
+        } else {
+            (base_attack_alpha, base_release_alpha) 
+        };
+
+       if target_gain > current_gain_db {
+            current_gain_db = current_attack * current_gain_db + (1.0 - current_attack) * target_gain;
+        } else {
+            current_gain_db = current_release * current_gain_db + (1.0 - current_release) * target_gain;
+        }
+
+        // --- MAX DELTA CLAMP (Slew Rate Limiter) ---
+        // 🚀 FIX 5: Adaptive Slew Rate
+        let max_step = if is_loud { 0.8 } else { 1.2 }; 
+        
+        if (current_gain_db - last_written_gain).abs() > max_step && last_written_gain != 999.0 {
+            if current_gain_db > last_written_gain {
+                current_gain_db = last_written_gain + max_step;
             } else {
-                smoothness // Slow, natural recovery for quiet words
+                current_gain_db = last_written_gain - max_step;
+            }
+        }
+
+        // DEBUG
+        println!(
+            "[RIDER] t={:.2}s env={:.1}dB gain={:.2} | silence={} breath={} vocal={} loud={}",
+            absolute_time,
+            env_db,
+            current_gain_db,
+            is_silence,
+            is_breath,
+            is_vocal,
+            is_loud
+        );
+
+        // --- NODE OUTPUT ---
+        if (current_gain_db - last_written_gain).abs() >= min_delta_db
+            && (absolute_time - last_written_time) > min_time_delta
+        {
+            // 🚀 FIX 6: First Node Bias (0.7)
+            let output_value = if nodes.is_empty() {
+                current_gain_db * 0.7 
+            } else {
+                current_gain_db
             };
 
-            (prev_smoothed_gain * current_coeff) + (raw_gain * (1.0 - current_coeff))
-        };
-        prev_smoothed_gain = smoothed_gain;
-
-        // 7. Node Thinning & 8. Generation
-        // Only emit a node if it's the first one, or if it deviates by >= 0.15 dB
-        let time_in_samples = start_sample_offset + start_idx as u64;
-
-        if is_first_node || (smoothed_gain - last_emitted_gain).abs() >= 0.15 {
             nodes.push(AutomationNode {
-                time: time_in_samples,
-                value: smoothed_gain,
+                time: absolute_time,
+                value: output_value,
             });
-            last_emitted_gain = smoothed_gain;
-            is_first_node = false;
+
+            last_written_gain = output_value;
+            last_written_time = absolute_time;
         }
-    }
-    
-    // Safety Wrap-up: Ensure the automation lane returns to 0 dB at the end of the clip
-    if let Some(last) = nodes.last() {
-        if last.value.abs() > 0.01 {
-             let final_time = start_sample_offset + frames as u64;
-             nodes.push(AutomationNode {
-                 time: final_time,
-                 value: 0.0,
-             });
-        }
+    } // <-- End of chunk_idx loop
+
+    // 🚀 FIX: Smooth 300ms exit fade
+    let final_audio_sec = start_time_sec + (frames as f64 / sample_rate as f64);
+    if last_written_gain.abs() > 0.01 {
+         nodes.push(AutomationNode {
+             time: final_audio_sec, 
+             value: current_gain_db,
+         });
+         nodes.push(AutomationNode {
+             time: final_audio_sec + 0.300, 
+             value: 0.0,
+         });
     }
 
     nodes

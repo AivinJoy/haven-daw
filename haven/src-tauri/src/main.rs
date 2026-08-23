@@ -1121,21 +1121,32 @@ struct AiErrorResponse {
     message: String,
 }
 
+struct ContextNeeds {
+    needs_clips: bool,
+    needs_dsp: bool,
+    needs_analysis: bool, // Future-proofed for Phase 3
+}
+
+// ✂️ NEW: Decimal Clamper to save tokens
+fn round_f32(value: f32) -> f32 {
+    (value * 100.0).round() / 100.0
+}
+
 #[tauri::command]
 async fn ask_ai(
     user_input: String, 
-    track_context: String,
-    chat_history: Vec<GroqMessage>
+    active_track_id: Option<u32>, // <--- NEW: UI state directly passed
+    playhead_time: f64,           // <--- NEW: Playhead context
+    chat_history: Vec<GroqMessage>,
+    state: tauri::State<'_, AppState> // <--- NEW: Access native audio engine!
 ) -> Result<String, String> {
-    // 1. Setup Client with Strict Timeout (Prevent UI Freeze)
+    
+    // 1. Setup Client with Strict Timeout
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8)) // 8-second hard limit
+        .timeout(Duration::from_secs(8)) 
         .build()
         .map_err(|e| e.to_string())?;
 
-    // 2. Get API Key from Environment
-    // NOTE: In production, you might want to load this from a user config file
-    // This checks for the key at BUILD time, and falls back to runtime if needed.
     let api_key = option_env!("GROQ_API_KEY")
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("GROQ_API_KEY").unwrap_or_default());
@@ -1147,87 +1158,226 @@ async fn ask_ai(
          }).unwrap());
     }
 
-    // 3. System Prompt (Strict JSON-Only API Aligned with Layer 1 Contract)
+    // ==========================================
+    // 🧠 2. THE RUST INTENT ENGINE (Soft Scoring)
+    // ==========================================
+    let input_lower = user_input.to_lowercase();
+    let input_words: Vec<&str> = input_lower
+        .split(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut needs = ContextNeeds {
+        needs_clips: false,
+        needs_dsp: false,
+        needs_analysis: false,
+    };
+
+    for &word in &input_words {
+        match word {
+            "cut" | "trim" | "split" | "move" | "delete" | "clip" | "slice" | "time" | "arrange" => needs.needs_clips = true,
+            "mix" | "master" | "level" | "ride" | "duck" | "eq" | "compressor" | 
+            "loudness" | "balance" | "automate" | "stage" | "dynamics" | "punchy" | "harsh" | "bright" | "vocal" => {
+                needs.needs_dsp = true;
+                needs.needs_analysis = true; // Phase 3 prep
+            },
+            _ => {}
+        }
+    }
+
+    let is_global_request = input_words.iter().any(|&w| matches!(w, "master" | "mix" | "overall" | "final" | "entire" | "everything" | "all"));
+
+    println!("🤖 AI Intent Evaluated -> Clips: {}, DSP: {}, Global: {}", needs.needs_clips, needs.needs_dsp, is_global_request);
+
+    // ==========================================
+    // 🏗️ 3. SMART CONTEXT BUILDER
+    // ==========================================
+    let track_context_str = {
+        let audio_runtime = state.audio.lock().map_err(|_| "Failed to lock audio")?;
+        let tracks_info = audio_runtime.get_tracks_list();
+        let bpm = audio_runtime.bpm();
+
+        // Target Resolution
+        let mut target_track_ids = Vec::new();
+        if let Some(id) = active_track_id {
+            target_track_ids.push(id);
+        } else if !is_global_request {
+            if let Some(track) = tracks_info.iter().find(|t| {
+                input_words.contains(&t.id.to_string().as_str()) ||
+                t.name.to_lowercase().split(|c: char| !c.is_alphanumeric()).any(|token| input_words.contains(&token))
+            }) {
+                target_track_ids.push(track.id as u32);
+            }
+        }
+
+        // Fetch Heavy Analysis only if needed
+        let analysis_data = if needs.needs_analysis { audio_runtime.get_all_track_analysis() } else { Vec::new() };
+
+        // Build Payload
+        let mut track_payloads = Vec::new();
+        for info in &tracks_info {
+            let is_target = is_global_request || target_track_ids.contains(&(info.id as u32));
+
+            // ALWAYS provide basic mix state identity (compression step 1)
+            let mut track_obj = serde_json::json!({
+                "id": info.id,
+                "name": info.name.to_lowercase(),
+                "gain": round_f32(info.gain),
+                "pan": round_f32(info.pan),
+                "muted": info.muted,
+                "solo": info.solo,
+            });
+
+            // ONLY provide heavy arrays to target tracks if requested (compression step 2)
+            if is_target {
+                let track_idx = resolve_track_index(&tracks_info, info.id as u32).unwrap_or(0);
+                let obj = track_obj.as_object_mut().unwrap();
+
+                if needs.needs_clips {
+                    let clips_json: Vec<_> = info.clips.iter().map(|c| {
+                        serde_json::json!({
+                            "clip_number": c.clip_number,
+                            "start_time": round_f32(c.start_time as f32) as f64,
+                            "duration": round_f32(c.duration as f32) as f64
+                        })
+                    }).collect();
+                    obj.insert("clips".to_string(), serde_json::Value::Array(clips_json));
+                }
+
+                if needs.needs_dsp {
+                    // We must clamp the nested EQ float values too (handled downstream or accepted as is if minor)
+                    obj.insert("eq".to_string(), serde_json::to_value(audio_runtime.get_eq_state(track_idx)).unwrap());
+                    obj.insert("compressor".to_string(), serde_json::to_value(audio_runtime.get_compressor_state(track_idx)).unwrap());
+                    obj.insert("reverb".to_string(), serde_json::to_value(audio_runtime.get_reverb_state(track_idx)).unwrap());
+                }
+
+                if needs.needs_analysis {
+                    if let Some(analysis) = analysis_data.iter().find(|a| (a.track_id as u32) == (info.id as u32)) {
+                        obj.insert("analysis".to_string(), serde_json::to_value(&analysis.analysis).unwrap());
+                    }
+                }
+            }
+            track_payloads.push(track_obj);
+        }
+
+        let mut context_json = serde_json::json!({
+            "system_directive": "You MUST ONLY apply actions to target_track_ids.",
+            "target_track_ids": target_track_ids,
+            "project": { "playhead_position_seconds": round_f32(playhead_time as f32) as f64, "bpm": round_f32(bpm) },
+            "tracks": track_payloads
+        });
+
+        // 🚨 HARD TOKEN GUARD
+        let mut context_str = serde_json::to_string(&context_json).map_err(|e| e.to_string())?;
+        let mut estimated_tokens = context_str.len() / 4;
+        
+        println!("📊 Context Built: {} tracks | Estimated Tokens: {}", tracks_info.len(), estimated_tokens);
+
+        const MAX_SAFE_TOKENS: usize = 4000;
+        
+        if estimated_tokens > MAX_SAFE_TOKENS {
+            println!("⚠️ TOKEN GUARD TRIGGERED! ({} > {}) - Shrinking payload...", estimated_tokens, MAX_SAFE_TOKENS);
+            
+            // Fallback Strategy: Drop everything except basic IDs for targets
+            let mut emergency_payload = Vec::new();
+            for info in &tracks_info {
+                if is_global_request || target_track_ids.contains(&(info.id as u32)) {
+                    emergency_payload.push(serde_json::json!({
+                        "id": info.id,
+                        "name": info.name.to_lowercase()
+                    }));
+                }
+            }
+            context_json["tracks"] = serde_json::Value::Array(emergency_payload);
+            context_json["system_directive"] = serde_json::Value::String("FALLBACK: Audio limits exceeded. Guess best effort with missing data.".to_string());
+            
+            context_str = serde_json::to_string(&context_json).map_err(|e| e.to_string())?;
+            estimated_tokens = context_str.len() / 4;
+            println!("📉 Shrink Successful. New Estimated Tokens: {}", estimated_tokens);
+        }
+
+        context_str
+    }; // 🔓 MUTEX LOCK DROPPED HERE!
+
+    // ==========================================
+    // 🌐 4. SYSTEM PROMPT & API CALL
+    // ==========================================
     let system_prompt = format!(
-        "You are an elite Audio DSP Engineer and a strict JSON API for a DAW. You speak ONLY JSON.\n\
-        \n\
-        CONTEXT:\n{}\n\
-        \n\
-        CRITICAL RULES:\n\
-        1. STRICT JSON: Output a valid JSON object with 'version': '1.0' and a 'commands' array. NO markdown blocks. Output raw, parsable JSON.\n\
-        2. FLATTEN PARAMETERS (CRITICAL): ALL parameters MUST be at the root of the command object. Put 'track_id', 'band_index', 'filter_type', 'freq', 'q', 'gain', 'is_active', 'threshold_db', 'ratio' DIRECTLY inside the command object. NEVER nest them inside an 'eq', 'compressor', or 'reverb' sub-object.\n\
-        3. ALLOWED ACTIONS: play, pause, record, rewind, seek, set_bpm, set_gain, set_master_gain, set_pan, toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor, split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track, undo, redo, update_eq, update_compressor, update_reverb, separate_stems, ride_vocal_level, duck_volume, auto_gain_stage, clear_volume_automation, none.\n\
-        4. TRACK LOCKING (HIGHEST PRIORITY): Look at 'project.target_track_id'. If provided, use this EXACT 'track_id' for all DSP commands unless explicitly named otherwise. Do NOT hallucinate track IDs. If a name is given, map it to the correct 'id' from the context tracks array. Do NOT default to \"track_id\": 0.\n\
-        5. EFFECT ACTIVATION: When applying 'update_compressor', 'update_eq', or 'update_reverb', you MUST include \"is_active\": true. Otherwise, the effect remains bypassed.\n\
-        6. DSP MATH & GAIN: 'set_gain' and 'set_pan' strictly use LINEAR values (0.0 is silence, 1.0 is unity, 2.0 is +6dB). All other volume params ('depth_db', 'target_lufs', 'threshold_db') MUST be in standard audio decibels (dB) or LUFS.\n\
-        7. MERGE CLIPS: You MUST ONLY provide the 'clip_number' of the left-most clip. Do NOT invent a 'next_clip_number'.\n\
-        8. RELATIVE TIMING: 1 Quarter Note = 60 / BPM seconds. Calculate 'time' or 'new_time' parameters in exact SECONDS. If the user says 'here' or 'current position', use 'playhead_position_seconds'.\n\
-        9. EXACT PARAMETER NAMES: \n\
-           - 'update_compressor': MUST use 'makeup_gain_db'. Allowed: 'threshold_db', 'ratio', 'attack_ms', 'release_ms', 'makeup_gain_db', 'is_active'.\n\
-           - 'update_reverb': Allowed: 'room_size', 'damping', 'mix', 'width', 'pre_delay_ms', 'low_cut_hz', 'high_cut_hz', 'is_active'.\n\
-        10. STUDIO MIXING & MASTERING PROTOCOL:\n\
-           - If the user asks for 'studio quality' or 'mastering', apply this exact chain via multiple commands:\n\
-             1st: 'update_eq' (Cut muddy lows below 100Hz. You MUST include 'band_index': 0)\n\
-             2nd: 'update_compressor' (Control dynamics, gentle ratio 2:1 for master, 4:1 for vocals. MUST use 'makeup_gain_db')\n\
-             3rd: 'update_reverb' (Add subtle space, set is_active: true, keep mix low e.g., 0.15)\n\
-             4th: 'ride_vocal_level' and apply 'auto_gain_stage' only if its required (Final leveling)\n\
-        \n\
-        AUTOMATION & VOLUME GUIDELINES:\n\
-        Choose the correct tool based on the user's request. Do not guess dB values; use the analysis arrays provided in the context.\n\
-        - TOOL A: Peak Protection (duck_volume) - Use ONLY to \"fix clipping\" or \"remove plosives\". Look at the 'peak_events' array in the analysis. Generate a 'duck_volume' command for each peak using its 't' (time) and a calculated 'depth_db'.\n\
-        - TOOL B: Dynamic Automation / Riding (ride_vocal_level) - Use when the user asks for \"automation\", \"automate the gain/volume\", \"ride the fader\", \"level the vocals\", or \"balance the track\". This draws dynamic volume curves over time. You MUST use 'loudness_p10_db' (from context) for 'noise_floor_db'. Default 'target_lufs' is -16.0.\n\
-        - TOOL C: Static Auto-Gain (auto_gain_stage) - Use ONLY when the user asks to \"gain stage\" or \"normalize\". This is a single, static volume change, NOT automation. Target 'target_lufs' is -18.0 if unspecified.\n\
-        SCHEMA EXAMPLES:\n\
-        User: \"Master my track\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"update_eq\", \"track_id\": 1, \"band_index\": 0, \"filter_type\": \"HighPass\", \"freq\": 100.0, \"q\": 0.7, \"gain\": 0.0, \"is_active\": true}}, {{\"action\": \"update_compressor\", \"track_id\": 1, \"threshold_db\": -18.0, \"ratio\": 2.0, \"attack_ms\": 10.0, \"release_ms\": 100.0, \"makeup_gain_db\": 2.0, \"is_active\": true}}, {{\"action\": \"update_reverb\", \"track_id\": 1, \"room_size\": 0.6, \"mix\": 0.15, \"is_active\": true}}], \"message\": \"Applied studio master chain.\", \"confidence\": 0.98}}\n\
-        \n\
-        User: \"Level my vocals and add some space\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"ride_vocal_level\", \"track_id\": 1, \"target_lufs\": -16.0, \"noise_floor_db\": -40.0}}, {{\"action\": \"update_reverb\", \"track_id\": 1, \"is_active\": true, \"room_size\": 0.6, \"mix\": 0.2}}], \"message\": \"Applied vocal rider and reverb.\", \"confidence\": 0.95}}\n\
-        \n\
-        User: \"undo that\"\n\
-        Assistant: {{\"version\": \"1.0\", \"commands\": [{{\"action\": \"undo\"}}], \"message\": \"Undoing last action.\", \"confidence\": 1.0}}\n\
-        ",
-        track_context
+    "You are a strict Natural Language to JSON transducer for a DAW.
+
+    OUTPUT RULES:
+    - Return ONLY valid JSON.
+    - Root keys: 'version' (MUST be '1.0'), 'commands', optional 'message', 'confidence', 'error'.
+    - 'commands' is an array of OBJECTS. Do NOT output raw strings.
+    - Every command object MUST have an 'action' key.
+    - ALL parameters must be flat (no nesting).
+    - NEVER explain your reasoning.
+
+    CONTEXT:
+    {}
+
+    MISSING DATA FALLBACK (CRITICAL):
+    - You MUST ONLY use 'target_track_ids' provided in the context.
+    - If the user request requires a track ID or context not present, DO NOT GUESS.
+    - Output EXACTLY: {{\"version\": \"1.0\", \"commands\": [], \"error\": \"missing_data\"}}
+
+    ACTIONS:
+    play, pause, record, rewind, seek, set_bpm, set_gain, set_master_gain, set_pan,
+    toggle_mute, unmute, toggle_solo, unsolo, toggle_monitor,
+    split_clip, move_clip, merge_clips, delete_clip, delete_track, create_track,
+    undo, redo, update_eq, update_compressor, update_reverb, separate_stems,
+    ride_vocal_level, duck_volume, auto_gain_stage, clear_volume_automation,
+    auto_compress, auto_eq, auto_reverb, none.
+
+    RULES:
+    - Use 'playhead_position_seconds' for relative timing ('here').
+    - split_clip → use 'time'.
+    - merge_clips → use 'clip_number'.
+    - Let the backend handle math and defaults. Provide ONLY the requested intent.
+
+    SEMANTIC ACTIONS (Do not invent parameters, use exactly these):
+    - auto_compress(style, intensity)
+    - auto_eq(intent, intensity)
+    - auto_reverb(space, intensity)
+    - ride_vocal_level(target_lufs)
+    - auto_gain_stage(target_lufs)
+
+    MIX/MASTER CHAIN (If user asks for studio quality, output these exact OBJECTS):
+    1. {{\"action\": \"auto_eq\", \"track_id\": <id>, \"intent\": \"clarity\", \"intensity\": 0.6}}
+    2. {{\"action\": \"auto_compress\", \"track_id\": <id>, \"style\": \"vocal\", \"intensity\": 0.5}}
+    3. {{\"action\": \"ride_vocal_level\", \"track_id\": <id>}}
+    4. {{\"action\": \"auto_reverb\", \"track_id\": <id>, \"space\": \"room\"}}
+
+    Respond strictly as JSON.",
+    track_context_str
     );
 
-
-    // 4. Construct Message Chain (System -> History -> User)
     let mut messages_payload = Vec::new();
-    
-    // A. System Prompt
     messages_payload.push(serde_json::json!({ "role": "system", "content": system_prompt }));
 
-    // B. Chat History (The Memory)
-    // We limit history to last 6 messages to save tokens/speed
     let history_limit = 6;
     let start_index = if chat_history.len() > history_limit { chat_history.len() - history_limit } else { 0 };
     
     for msg in &chat_history[start_index..] {
-        // Map 'ai' or anything else to strict 'assistant' just in case
         let clean_role = match msg.role.as_str() {
             "user" => "user",
             "system" => "system",
-            _ => "assistant", // Fallback for 'ai' or invalid roles
+            _ => "assistant",
         };
         messages_payload.push(serde_json::json!({ "role": clean_role, "content": msg.content }));
     }
 
-    // C. Current User Input
     messages_payload.push(serde_json::json!({ "role": "user", "content": user_input }));
 
-    // 4. Construct Request Payload
     let payload = serde_json::json!({
-        "model":   "llama-3.3-70b-versatile",  //"qwen/qwen3-32b", //"qwen-2.5-72b-instruct",  //"llama3-70b-8192", // Fast & Good at JSON
+        "model": "llama-3.3-70b-versatile",
         "messages": messages_payload,
         "response_format": { "type": "json_object" },
-
-        "temperature" : 0.0, // Low creativity = High accuracy for code
-        "max_tokens" : 600, // Prevent rambling
-        "top_p": 1.0,   // Standard sampling
-        "stream": false // We need full JSON to execute
+        "temperature" : 0.0,
+        "max_tokens" : 600,
+        "stream": false
     });
 
-    // 5. Send Request
     let res = client.post("https://api.groq.com/openai/v1/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
@@ -1236,23 +1386,21 @@ async fn ask_ai(
         .await
         .map_err(|e| format!("Network Error: {}", e))?;
 
-    // FIX 3: Capture the ACTUAL error message from Groq
     if !res.status().is_success() {
         let error_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-        println!("❌ AI Error Body: {}", error_text); // Prints to your terminal
-        
+        println!("❌ AI Error Body: {}", error_text); 
         return Ok(serde_json::to_string(&AiErrorResponse {
             action: "none".into(),
-            // Send a sanitized message to UI, but you see full error in terminal
             message: "I'm having trouble thinking right now (API Error).".into() 
         }).unwrap());
     }
 
-    // 6. Parse Response
     let chat_res: GroqApiResponse = res.json().await.map_err(|e| format!("Parse Error: {}", e))?;
     
     if let Some(choice) = chat_res.choices.first() {
-        Ok(choice.message.content.clone())
+        let trace = daw_modules::ai::pipeline::AIPipeline::process_raw_response(&choice.message.content);
+        println!("Ai Execution Trace:\n{:#?}", trace);
+        Ok(serde_json::to_string(&trace).unwrap())
     } else {
          Ok(serde_json::to_string(&AiErrorResponse {
              action: "none".into(),

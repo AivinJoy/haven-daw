@@ -160,7 +160,6 @@
             // 2. FIXED: Pass globalState correctly, AND pass activeTrackId as the 5th argument
             const response = await aiAgent.sendMessage(
                 currentInput, 
-                tracks, 
                 globalState, 
                 historyToSend, 
                 activeTrackId 

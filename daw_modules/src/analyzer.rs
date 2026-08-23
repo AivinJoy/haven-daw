@@ -23,6 +23,26 @@ pub struct LoudnessWindow {
     pub rms_db: f32,
 }
 
+// 🧠 NEW: Future-Proof Explanations Enum
+#[derive(Debug, Clone, Serialize)]
+pub enum FrequencyBand {
+    Sub,     // 20 - 60 Hz
+    Bass,    // 60 - 250 Hz
+    LowMid,  // 250 - 500 Hz
+    Mid,     // 500 - 2000 Hz
+    HighMid, // 2000 - 6000 Hz
+    Air,     // 6000 - 20000 Hz
+}
+
+// 🧠 NEW: Hybrid Analysis Structure
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SpectralAnalysis {
+    pub avg_band_energy_pct: [f32; 6],  // Normalized average energy per band
+    pub peak_band_energy_pct: [f32; 6], // Normalized peak energy per band (transients/dynamics)
+    pub peak_frequency_hz: f32,         // The single strongest resonant frequency
+    pub peak_magnitude: f32,            // The raw magnitude of that peak
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AnalysisProfile {
     // Macro Dynamics
@@ -40,11 +60,8 @@ pub struct AnalysisProfile {
     pub loud_windows: Vec<LoudnessWindow>,
     pub quiet_windows: Vec<LoudnessWindow>,
 
-    // Spectral Analysis (From Original)
-    pub spectral_centroid_hz: f32,
-    pub energy_lows_pct: f32,
-    pub energy_mids_pct: f32,
-    pub energy_highs_pct: f32,
+    // 🧠 NEW: Advanced Hybrid Spectral Data
+    pub spectral: SpectralAnalysis,
 }
 
 // -------------------------------------------------------------------------
@@ -119,35 +136,29 @@ pub fn analyze_audio_buffer(buffer: &[f32], channels: usize, sample_rate: u32) -
         current_window_sum_sq += mono_sq;
         window_frame_count += 1;
 
-        // --- Peak Event Extraction ---
         // --- Peak Event Extraction (Dynamic Clustering) ---
         if frame_peak > 0.0 {
             let peak_db = 20.0 * frame_peak.log10();
             if peak_db > peak_threshold_db {
                 if !in_cluster {
-                    // Start a new cluster
                     in_cluster = true;
                     cluster_max_db = peak_db;
                     cluster_max_frame = frame_idx;
                     cluster_last_frame = frame_idx;
                 } else {
-                    // Are we within 120ms of the LAST peak in this cluster?
                     if frame_idx - cluster_last_frame <= merge_window_frames {
-                        // Extend cluster and track the absolute loudest moment
                         if peak_db > cluster_max_db {
                             cluster_max_db = peak_db;
                             cluster_max_frame = frame_idx;
                         }
-                        cluster_last_frame = frame_idx; // Push the window forward
+                        cluster_last_frame = frame_idx;
                     } else {
-                        // We passed the 120ms window. Close the previous cluster!
                         if peak_events.len() < max_peak_events {
                             peak_events.push(PeakEvent {
                                 time_sec: round_2(cluster_max_frame as f32 / sample_rate_f),
                                 peak_db: round_1(cluster_max_db),
                             });
                         }
-                        // Start a new cluster with the current peak
                         cluster_max_db = peak_db;
                         cluster_max_frame = frame_idx;
                         cluster_last_frame = frame_idx;
@@ -171,7 +182,6 @@ pub fn analyze_audio_buffer(buffer: &[f32], channels: usize, sample_rate: u32) -
         }
     }
 
-    // Push the final cluster if the audio ended while we were still inside one
     if in_cluster && peak_events.len() < max_peak_events {
         peak_events.push(PeakEvent {
             time_sec: round_2(cluster_max_frame as f32 / sample_rate_f),
@@ -184,37 +194,31 @@ pub fn analyze_audio_buffer(buffer: &[f32], channels: usize, sample_rate: u32) -
     // ==========================================
     // 2. EBU R128 Style Gating & Percentiles
     // ==========================================
-    // Absolute Gate: -70 LUFS (dB)
     let mut gated_windows: Vec<LoudnessWindow> = all_windows.into_iter()
         .filter(|w| w.rms_db > -70.0)
         .collect();
 
-    // Calculate preliminary integrated loudness to apply Relative Gate
     let (integrated_loudness_db, p95, p50, p10) = if gated_windows.is_empty() {
         (-70.0, -70.0, -70.0, -70.0)
     } else {
-        // Average Power (Linear) -> dB
         let mut power_sum = 0.0;
         for w in &gated_windows {
             power_sum += 10.0_f32.powf(w.rms_db / 10.0);
         }
         let prelim_integrated = 10.0 * (power_sum / gated_windows.len() as f32).log10();
 
-        // Relative Gate: -10 LU from preliminary
         let relative_threshold = prelim_integrated - 10.0;
         gated_windows.retain(|w| w.rms_db >= relative_threshold);
 
         if gated_windows.is_empty() {
             (-70.0, -70.0, -70.0, -70.0)
         } else {
-            // Final Integrated
             let mut final_power_sum = 0.0;
             for w in &gated_windows {
                 final_power_sum += 10.0_f32.powf(w.rms_db / 10.0);
             }
             let final_integrated = 10.0 * (final_power_sum / gated_windows.len() as f32).log10();
 
-            // Sort for Percentiles
             gated_windows.sort_by(|a, b| a.rms_db.partial_cmp(&b.rms_db).unwrap());
             
             let len = gated_windows.len();
@@ -228,39 +232,28 @@ pub fn analyze_audio_buffer(buffer: &[f32], channels: usize, sample_rate: u32) -
 
     let crest_factor_db = round_1((max_sample_peak_db - integrated_loudness_db).max(0.0));
 
-    // Extract Extremes (from the sorted gated windows)
     let mut quiet_windows = Vec::new();
     let mut loud_windows = Vec::new();
     
     if !gated_windows.is_empty() {
-        // Top 20 Quietest (First 20 in sorted list)
-        quiet_windows = gated_windows.iter()
-            .take(extreme_window_count)
-            .cloned()
-            .collect();
-        
-        // Top 20 Loudest (Last 20 in sorted list, reversed)
-        loud_windows = gated_windows.iter()
-            .rev()
-            .take(extreme_window_count)
-            .cloned()
-            .collect();
+        quiet_windows = gated_windows.iter().take(extreme_window_count).cloned().collect();
+        loud_windows = gated_windows.iter().rev().take(extreme_window_count).cloned().collect();
     }
 
     // ==========================================
-    // 3. Frequency-Domain Pass (Spectral Centroid)
+    // 3. 🧠 HYBRID SPECTRAL ANALYSIS
     // ==========================================
     let fft_size = 4096;
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
 
-    let mut total_lows = 0.0_f32;
-    let mut total_mids = 0.0_f32;
-    let mut total_highs = 0.0_f32;
-    let mut weighted_freq_sum = 0.0_f32;
-    let mut total_magnitude = 0.0_f32;
-
     let mut complex_buffer = vec![Complex { re: 0.0, im: 0.0 }; fft_size];
+
+    let mut total_band_energy = [0.0_f32; 6];
+    let mut peak_band_energy = [0.0_f32; 6];
+    let mut global_peak_freq = 0.0_f32;
+    let mut global_peak_mag = 0.0_f32;
+    let mut total_magnitude = 0.0_f32;
 
     for chunk_start in (0..frames).step_by(fft_size) {
         if chunk_start + fft_size > frames { break; }
@@ -268,9 +261,7 @@ pub fn analyze_audio_buffer(buffer: &[f32], channels: usize, sample_rate: u32) -
         for i in 0..fft_size {
             let frame_idx = chunk_start + i;
             let mut mono_sample = 0.0;
-            for c in 0..channels {
-                mono_sample += buffer[frame_idx * channels + c];
-            }
+            for c in 0..channels { mono_sample += buffer[frame_idx * channels + c]; }
             mono_sample /= channels as f32;
 
             let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32).cos());
@@ -279,28 +270,51 @@ pub fn analyze_audio_buffer(buffer: &[f32], channels: usize, sample_rate: u32) -
 
         fft.process(&mut complex_buffer);
 
+        let mut chunk_band_energy = [0.0_f32; 6];
+
         for i in 0..=fft_size / 2 {
             let mag = complex_buffer[i].norm();
             let freq = (i as f32 * sample_rate_f) / fft_size as f32;
 
+            if mag > global_peak_mag {
+                global_peak_mag = mag;
+                global_peak_freq = freq;
+            }
+            
             total_magnitude += mag;
-            weighted_freq_sum += freq * mag;
 
-            if freq >= 20.0 && freq < 250.0 { total_lows += mag; } 
-            else if freq >= 250.0 && freq < 4000.0 { total_mids += mag; } 
-            else if freq >= 4000.0 && freq <= 20000.0 { total_highs += mag; }
+            let band_idx = if freq < 20.0 { continue; } 
+                else if freq < 60.0 { 0 }
+                else if freq < 250.0 { 1 }
+                else if freq < 500.0 { 2 }
+                else if freq < 2000.0 { 3 }
+                else if freq < 6000.0 { 4 }
+                else if freq <= 20000.0 { 5 }
+                else { continue; };
+
+            chunk_band_energy[band_idx] += mag;
+            total_band_energy[band_idx] += mag;
+        }
+
+        // Track local peaks per band to understand dynamics
+        for b in 0..6 {
+            if chunk_band_energy[b] > peak_band_energy[b] {
+                peak_band_energy[b] = chunk_band_energy[b];
+            }
         }
     }
 
-    let spectral_centroid_hz = if total_magnitude > 0.0 { weighted_freq_sum / total_magnitude } else { 0.0 };
-    let energy_total = total_lows + total_mids + total_highs;
-    let (energy_lows_pct, energy_mids_pct, energy_highs_pct) = if energy_total > 0.0 {
-        (
-            round_2(total_lows / energy_total), 
-            round_2(total_mids / energy_total), 
-            round_2(total_highs / energy_total)
-        )
-    } else { (0.0, 0.0, 0.0) };
+    // 🧠 ENERGY NORMALIZATION
+    let mut avg_band_energy_pct = [0.0_f32; 6];
+    let mut peak_band_energy_pct = [0.0_f32; 6];
+    let peak_total = peak_band_energy.iter().sum::<f32>();
+
+    if total_magnitude > 0.0 {
+        for b in 0..6 { avg_band_energy_pct[b] = round_2(total_band_energy[b] / total_magnitude); }
+    }
+    if peak_total > 0.0 {
+        for b in 0..6 { peak_band_energy_pct[b] = round_2(peak_band_energy[b] / peak_total); }
+    }
 
     AnalysisProfile {
         integrated_loudness_db,
@@ -312,9 +326,11 @@ pub fn analyze_audio_buffer(buffer: &[f32], channels: usize, sample_rate: u32) -
         peak_events,
         loud_windows,
         quiet_windows,
-        spectral_centroid_hz: spectral_centroid_hz.round(),
-        energy_lows_pct,
-        energy_mids_pct,
-        energy_highs_pct,
+        spectral: SpectralAnalysis {
+            avg_band_energy_pct,
+            peak_band_energy_pct,
+            peak_frequency_hz: global_peak_freq.round(),
+            peak_magnitude: round_2(global_peak_mag),
+        }
     }
 }
